@@ -7,6 +7,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -76,6 +77,30 @@ func TestRealProvisionRoundTrip(t *testing.T) {
 		t.Errorf("expected distinct UIDs, got login=%q shim=%q", st.UID, st.ShimUID)
 	}
 
+	// The freshly-provisioned account must have NO sudo rights (the CLOSE-AT-ADD
+	// no-sudo invariant) and status must POSITIVELY report it.
+	if !st.SudoChecked {
+		t.Errorf("status must probe sudo for an existing account")
+	}
+	if st.SudoAllowed {
+		t.Errorf("a freshly-provisioned account must have no sudo rights; status reported SudoAllowed=true")
+	}
+
+	// The minimal login PATH must have been written to the account's home and be
+	// owned by the account (the real writeLoginEnv path).
+	home := passwdHome(ctx, r, account)
+	if home == "" {
+		t.Fatalf("could not resolve home for %q", account)
+	}
+	profile := filepath.Join(home, ".profile")
+	data, rerr := os.ReadFile(profile)
+	if rerr != nil {
+		t.Fatalf("read %q: %v", profile, rerr)
+	}
+	if !strings.Contains(string(data), "PATH="+provision.LoginPATH) {
+		t.Errorf("%q must pin the minimal login PATH %q; got:\n%s", profile, provision.LoginPATH, data)
+	}
+
 	// Idempotent re-add: a clean no-op, not an error, and no second account.
 	res2, err := provision.Add(ctx, r, account)
 	if err != nil {
@@ -84,6 +109,16 @@ func TestRealProvisionRoundTrip(t *testing.T) {
 	if res2.Created {
 		t.Errorf("re-Add.Created = true, want false (idempotent)")
 	}
+}
+
+// passwdHome returns the account's home directory from its passwd entry.
+func passwdHome(ctx context.Context, r provision.Runner, account string) string {
+	out, _, _ := r.Run(ctx, "getent", "passwd", account)
+	fields := strings.Split(strings.TrimSpace(out), ":")
+	if len(fields) < 6 {
+		return ""
+	}
+	return fields[5]
 }
 
 func present(ctx context.Context, r provision.Runner, account string) bool {

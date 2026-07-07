@@ -54,10 +54,32 @@ anonctl's one **guarantee** is **per-UID fail-closed anonymized egress**: every 
 Per-UID forcing binds the policy to the **UID**. That is precisely what makes these three out of scope: the policy is only as strong as the UID boundary and the kernel enforcing it.
 
 - **Root on the box.** Root can undo the nftables rules, stop the shim, or read anything. anonctl's rules protect against a compromised or careless *tool running as the anon account*, not against an adversary who already has root. If root is compromised, so is everything.
-- **A process changing its own UID away from the forced one.** The forcing matches the anon UID; a process that legitimately leaves that UID (for example via a setuid path root granted it) leaves the policy with it. anonctl binds egress to a UID, it does not prevent a privileged transition off that UID.
+- **A process changing its own UID away from the forced one (the UID-transition escape).** The forcing matches the anon UID; a socket owned by a DIFFERENT uid (a setuid binary, `sudo`, or a triggerable daemon acting on the account's behalf) does not match `meta skuid == anon`, so it egresses in the clear. anonctl binds egress to a UID; it hardens what it can at `add`-time and proves the enumerable vectors, but the per-UID model cannot close an arbitrary differently-owned daemon. This is anonctl's sharpest structural boundary versus a whole-OS model like Tails, so it gets [its own subsection below](#the-uid-transition-escape-what-anonctl-does-and-does-not-close).
 - **Kernel compromise.** The redirect and the drop are enforced by the kernel; a compromised kernel can lie about all of it. anonctl trusts the kernel it runs on.
 
 Defending against this last category is explicitly out of scope for anonctl (it would need a different isolation model, a VM or a sandboxed kernel). Being **honest** about it is in scope; that is what this section is.
+
+### The UID-transition escape: what anonctl does and does NOT close
+
+This is the one residual worth spelling out concretely, because it is where "one account, not the whole OS" is structurally weaker than a whole-OS transparent-Tor system.
+
+**The mechanism.** anonctl forces egress with a kernel rule keyed on the socket-OWNING uid. The literal first rule of each account's `filter_out` chain is:
+
+```
+meta skuid != <anonUID> meta skuid != <shimUID> accept
+```
+
+That is correct for anonctl's scope: it governs only the two anonctl UIDs and must not break the rest of a shared host, so every OTHER uid egresses freely. But it means that if the anon account can cause a socket to be owned by a **different** uid, that socket does not match `skuid == anonUID` and egresses **in the clear**, bypassing all the forcing. The vectors are a **setuid** binary the account can run (its socket is owned by the target uid), **`sudo`** (if the account has any sudo rights), and a **triggerable system daemon** (a dbus-activatable service, a print/scan/avahi/MTA daemon, a local service that fetches a URL) that makes an outbound connection on the account's behalf under its own non-anon uid.
+
+**What anonctl DOES about it (harden-what-we-can + prove-the-enumerable).**
+
+- **No sudo at `add`-time.** `anonctl add` provisions the account with **no sudoers entry and no `sudo`/`wheel` group membership**, so it has no sudo path. `anonctl status` **positively reports** this (a `sudo: none` line, backed by a `sudo -l -U <account>` probe and a `sudoAllowed:false` field in `status --json`), so the invariant is a checkable fact, not a silent assumption. If the box ever grants the account sudo, `status` warns instead of staying quiet.
+- **A minimal login PATH.** The account is provisioned with a minimal login `PATH` (`/usr/local/bin:/usr/bin:/bin`) that **omits the `sbin` directories** carrying the setuid network binaries an audit of a real host flagged (`exim4`, `pppd`, `mount.nfs`). This shrinks what the account can gratuitously *name*; it does **not** remove those binaries from disk (they are system-wide and still reachable by absolute path), so it is a partial hardening, not a barrier.
+- **A best-effort `verify` probe.** `verify` re-asserts the concretely enumerable transition vectors do not yield an off-box socket owned by a non-anon, non-shim uid (sudo is not permitted, and the common privileged network paths tested on a real host do not transition uid). It is reported **honestly as best-effort, not exhaustive**: it cannot enumerate every daemon on every host.
+
+**What anonctl does NOT do (the honest residual).** anonctl deliberately does **not** grow a second, namespace-based confinement layer to chase this. The per-UID model cannot force an arbitrary triggerable daemon: if the anon account can make any of the dozens of system daemons (each running as its own non-anon uid) open one outbound connection on its behalf, that connection matches the `accept` first rule and leaves in the clear. On a busy shared host this class of escape is real and remains open. Closing it requires **network-namespace-strength confinement**, which is a different tool: **[netcage](https://github.com/wighawag/netcage)** confines by network namespace, not by uid, so a differently-owned process inside the jail is still on the namespace's forced network path and the whole "a daemon owned by another uid egresses for me" class does not apply. If you need that, run netcage (inside the anon account, or directly); do not expect anonctl's per-UID forcing to substitute for it.
+
+**Recommended host hardening: mount reachable filesystems `nosuid`.** anonctl cannot own the host's mount policy (remounting a shared host's `/` `nosuid` would break the machine and is out of scope), but where the account's reachable filesystem CAN be `nosuid` (a dedicated mount, or a `nosuid` `/home`), mount it so: **a setuid binary on a `nosuid` mount does not gain its owner's uid**, which closes the whole "setuid transition" half of this escape for anything under that mount. On a typical host the scratch mounts (`/tmp`, `/dev/shm`, `/run`) are already `nosuid`; the win is making the account's own reachable filesystems `nosuid` too where practical.
 
 ### Precision: "kernel-forced" but userspace-relayed
 

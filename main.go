@@ -200,6 +200,16 @@ func runStatus(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	} else {
 		fmt.Printf("  shim %s: MISSING\n", st.Shim)
 	}
+	// Positively surface the sudo-absence invariant (a UID-transition escape closed
+	// at add-time): no sudo is the hardened, expected state; sudo present is a WARN
+	// because a sudo'd socket carries a different uid and escapes the forcing.
+	if st.SudoChecked {
+		if st.SudoAllowed {
+			fmt.Printf("  sudo: PRESENT (warning: a uid-transition escape; the account should have no sudo)\n")
+		} else {
+			fmt.Printf("  sudo: none (no uid-transition escape via sudo)\n")
+		}
+	}
 	if st.Forced && st.Marker != nil {
 		fmt.Printf("  forced: yes (endpoint class %s, marked %s)\n", st.Marker.EndpointClass, st.Marker.CreatedAt)
 	} else {
