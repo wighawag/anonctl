@@ -222,6 +222,60 @@ func Run(ctx context.Context, checks []Check) Report {
 	return rep
 }
 
+// LiveParams is everything the LIVE assertion set needs to stand up its real
+// probes against a provisioned account on this host: the account and its
+// endpoint (for the report header + the anonymized-exit / dns-remote checks), the
+// anon+shim UIDs and the shim's loopback ports (for the leak/closure probes run
+// AS the anon UID), and the exempted destination for the split-tunnel-tight check
+// (empty when no LAN exemption is active, which SKIPS that assertion cleanly).
+//
+// It is the seam between the runtime command (main wiring, which discovers these
+// from the provisioned account) and the build-tag-split LiveChecks: the default
+// build cannot stand up the real probes (they need root + setpriv + a live
+// endpoint), so LiveChecks is compiled per build tag (checks_default.go returns a
+// single honest fail; checks_integration.go returns the real set). The pure
+// assertion decisions in this file are shared by BOTH and are what the unit suite
+// proves against the fixture with no privilege.
+type LiveParams struct {
+	// Account is the anon account being verified (`anon` / `anon-<name>`).
+	Account string
+	// Endpoint is the credential-free socks5h URL the account is forced through
+	// (endpoint.URL()); it is the report header and is NEVER credentialed.
+	Endpoint string
+	// Class is the endpoint's share-class; the anonymized-exit assertion additionally
+	// requires a Tor exit for ClassTorShared.
+	Class endpoint.ShareClass
+	// AnonUID / ShimUID are the account's forced UID and its dedicated shim UID; the
+	// live probes run AS AnonUID (the nft rules key on `meta skuid`).
+	AnonUID int
+	ShimUID int
+	// RelayPort / DNSPort are the shim's loopback ports (the ONLY loopback the anon
+	// UID may reach); the closure probes dial NON-shim loopback to prove the drop.
+	RelayPort int
+	DNSPort   int
+	// EndpointHost / EndpointPort is the upstream endpoint the shim dials; the
+	// direct-endpoint bypass closure (b) probes it AS the anon UID to prove the drop.
+	EndpointHost string
+	EndpointPort int
+	// Exempt is the LAN-exempted host:port (story 25), empty when no exemption is
+	// active; when empty the split-tunnel-tight assertion is not run.
+	Exempt string
+}
+
+// RunVerify is the runtime orchestrator behind `anonctl verify`: it composes the
+// account+endpoint header and runs the LIVE assertion set (LiveChecks, which is
+// build-tag-split) with no short-circuit, so the report is complete and the exit
+// code is the CI-gating verdict. It is the single entry point main wires to; the
+// header states which account/endpoint was proven, and every assertion the build
+// provides runs. The default build's LiveChecks fails honestly (a binary built
+// without the live probes cannot silently "pass" verification).
+func RunVerify(ctx context.Context, p LiveParams) Report {
+	rep := Run(ctx, LiveChecks(ctx, p))
+	rep.Account = p.Account
+	rep.Endpoint = p.Endpoint
+	return rep
+}
+
 // AnonymizedExitAssertion is the PURE decision for the anonymized-exit assertion.
 // Given the host's own direct exit IP (hostIP), the exit IP observed through the
 // forced path (exitIP), whether the Tor-check reported a Tor exit (isTorExit), and

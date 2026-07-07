@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wighawag/anonctl/internal/endpoint"
 	"github.com/wighawag/anonctl/internal/nftables"
 	"github.com/wighawag/anonctl/internal/provision"
 	"github.com/wighawag/anonctl/internal/shim"
@@ -296,6 +297,46 @@ func TestLiveLeakAndClosuresAgainstRealRuleset(t *testing.T) {
 		t.Fatalf("the anon UID must reach its OWN shim relay port (else the DROP assertions are vacuous)")
 	}
 
+	// --- The RUNTIME ORCHESTRATOR (verify.RunVerify) against the SAME live ruleset.
+	// The inline probes above prove the closures directly; this proves the PRODUCTION
+	// path `anonctl verify` takes wires those same closures through LiveChecks and
+	// renders a report. We assert the load-bearing DROP assertions (the leak drops +
+	// both bypass closures) come back Ok through the orchestrator. The anonymized-
+	// exit and dns-remote checks reach the public internet through the fixture, which
+	// is offline in CI, so we do not require THEIR pass here (that is the inline /
+	// unit coverage's job); we require the closures the ruleset enforces to hold.
+	lp := verify.LiveParams{
+		Account:      account,
+		Endpoint:     "socks5h://127.0.0.1:" + endpointPortStr,
+		Class:        endpoint.ClassSocksPeruser,
+		AnonUID:      anonUID,
+		ShimUID:      shimUID,
+		RelayPort:    relayPort,
+		DNSPort:      dnsPort,
+		EndpointHost: "127.0.0.1",
+		EndpointPort: endpointPort,
+	}
+	rep := verify.RunVerify(ctx, lp)
+	if rep.Account != account {
+		t.Fatalf("RunVerify report must carry the account header; got %q", rep.Account)
+	}
+	byName := map[string]verify.Assertion{}
+	for _, a := range rep.Assertions {
+		byName[a.Name] = a
+	}
+	for _, name := range []string{
+		verify.AssertLeakDropV4, verify.AssertLeakDropV6,
+		verify.AssertBypassLoopbackClosure, verify.AssertBypassEndpointClosure,
+	} {
+		a, ok := byName[name]
+		if !ok {
+			t.Fatalf("RunVerify must include the %s assertion; got %+v", name, rep.Assertions)
+		}
+		if !a.Ok {
+			t.Fatalf("RunVerify %s must pass against the live ruleset; got %+v", name, a)
+		}
+	}
+
 	// The sentinel stayed untouched throughout (host isolation).
 	if !tableExists(t, nr, sentinel) {
 		t.Fatalf("the ruleset clobbered the sentinel table (host not isolated)")
@@ -312,4 +353,3 @@ func tableExists(t *testing.T, r nftRunner, table string) bool {
 	}
 	return strings.Contains(out, "table inet "+table)
 }
-
