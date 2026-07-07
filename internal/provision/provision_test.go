@@ -3,9 +3,13 @@ package provision_test
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/wighawag/anonctl/internal/endpoint"
+	"github.com/wighawag/anonctl/internal/marker"
 	"github.com/wighawag/anonctl/internal/provision"
 )
 
@@ -225,5 +229,55 @@ func TestStatusAbsent(t *testing.T) {
 	}
 	if st.Exists {
 		t.Errorf("Exists = true on an absent account, want false")
+	}
+}
+
+// WithMarker on an account WITH a marker reports Forced + the marker record (the
+// share-class the status view carries, story 20). The marker Store is pointed at
+// a scratch dir, so the real /etc is never read/written.
+func TestStatus_WithMarker_ReportsForced(t *testing.T) {
+	store := marker.Store{BaseDir: filepath.Join(t.TempDir(), "anonctl")}
+	m := marker.New("anon", "30034", endpoint.ClassTorShared, "1.0.0", time.Now())
+	if err := store.Write(m); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	r := &fakeRunner{present: map[string]bool{"anon": true, "anon-shim": true}}
+	st, err := provision.Status(context.Background(), r, "anon")
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	st, err = st.WithMarker(store)
+	if err != nil {
+		t.Fatalf("WithMarker: %v", err)
+	}
+	if !st.Forced || st.Marker == nil {
+		t.Fatalf("a present marker must set Forced+Marker; got Forced=%v Marker=%v", st.Forced, st.Marker)
+	}
+	if st.Marker.EndpointClass != endpoint.ClassTorShared {
+		t.Errorf("status must carry the endpoint share-class; got %q", st.Marker.EndpointClass)
+	}
+}
+
+// WithMarker on an account with NO marker is a clean "not forced" (Forced=false,
+// Marker=nil), never an error, so status/CI can branch on absence.
+func TestStatus_WithMarker_MissingIsCleanNotForced(t *testing.T) {
+	store := marker.Store{BaseDir: filepath.Join(t.TempDir(), "anonctl")}
+	r := &fakeRunner{present: map[string]bool{"anon": true, "anon-shim": true}}
+	st, err := provision.Status(context.Background(), r, "anon")
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	st, err = st.WithMarker(store)
+	if err != nil {
+		t.Fatalf("WithMarker (missing) must not error; got %v", err)
+	}
+	if st.Forced || st.Marker != nil {
+		t.Fatalf("a missing marker must be a clean not-forced; got Forced=%v Marker=%v", st.Forced, st.Marker)
+	}
+	// And it must appear in status --json as forced:false.
+	b, _ := json.Marshal(st)
+	if !strings.Contains(string(b), `"forced":false`) {
+		t.Errorf("status --json must report forced:false for a missing marker; got %s", b)
 	}
 }

@@ -22,9 +22,11 @@ import (
 	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/wighawag/anonctl/internal/cli"
 	"github.com/wighawag/anonctl/internal/endpoint"
+	"github.com/wighawag/anonctl/internal/marker"
 	"github.com/wighawag/anonctl/internal/provision"
 	"github.com/wighawag/anonctl/internal/verify"
 )
@@ -93,11 +95,19 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 }
 
 // runRm removes the account's forcing hooks and, only under --purge-account,
-// deletes the account + its shim. A bare rm leaves the home intact.
+// deletes the account + its shim. A bare rm leaves the home intact. It ALSO
+// removes the marker (the double-anonymization claim): teardown must not leave a
+// stale `/etc/anonctl/<account>.json` asserting an account is still forced.
 func runRm(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	res, err := provision.Rm(ctx, r, cmd.Account, cmd.PurgeAccount)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "anonctl: rm: %v\n", err)
+		return 1
+	}
+	// Remove the marker (idempotent: a missing marker is a clean no-op), so a
+	// torn-down account never leaves a stale "already forced" claim behind.
+	if err := marker.DefaultStore().Remove(cmd.Account); err != nil {
+		fmt.Fprintf(os.Stderr, "anonctl: rm: removing marker: %v\n", err)
 		return 1
 	}
 	switch {
@@ -143,6 +153,13 @@ func runStatus(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		fmt.Fprintf(os.Stderr, "anonctl: status: %v\n", err)
 		return 1
 	}
+	// Read the marker (the same dependency-free truth a sibling tool reads). A
+	// missing marker is a clean "not forced", not an error.
+	st, err = st.WithMarker(marker.DefaultStore())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "anonctl: status: reading marker: %v\n", err)
+		return 1
+	}
 	if cmd.JSON {
 		return emitJSON(st)
 	}
@@ -155,6 +172,11 @@ func runStatus(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		fmt.Printf("  shim %s: present (uid %s)\n", st.Shim, st.ShimUID)
 	} else {
 		fmt.Printf("  shim %s: MISSING\n", st.Shim)
+	}
+	if st.Forced && st.Marker != nil {
+		fmt.Printf("  forced: yes (endpoint class %s, marked %s)\n", st.Marker.EndpointClass, st.Marker.CreatedAt)
+	} else {
+		fmt.Printf("  forced: no (no marker)\n")
 	}
 	return 0
 }
@@ -191,6 +213,20 @@ func runVerify(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		EndpointPort: atoiOr(ep.Port, 0),
 	}
 	rep := verify.RunVerify(ctx, p)
+
+	// WRITE-AFTER-VERIFY: the marker is a coordination CLAIM written strictly AFTER
+	// verify proves the account forced. On a passing report we write it (via the
+	// gate, so an unverified account can never be claimed); a failing verify writes
+	// nothing and leaves any prior claim to be cleared by `rm`. A marker-write
+	// failure does NOT flip a passing verify to a failure (the account IS proven
+	// forced); it is surfaced on stderr so the operator can retry.
+	if rep.Ok() {
+		m := marker.New(cmd.Account, st.UID, ep.Class, resolveVersion(), time.Now())
+		if werr := marker.DefaultStore().WriteVerified(m, true); werr != nil {
+			fmt.Fprintf(os.Stderr, "anonctl: verify: writing marker: %v\n", werr)
+		}
+	}
+
 	if cmd.JSON {
 		blob, jerr := rep.JSON()
 		if jerr != nil {

@@ -16,10 +16,12 @@ package provision
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/wighawag/anonctl/internal/cli"
+	"github.com/wighawag/anonctl/internal/marker"
 )
 
 // Runner abstracts command execution so provisioning is unit-testable without a
@@ -60,6 +62,38 @@ type AccountStatus struct {
 	ShimExists bool   `json:"shimExists"`
 	UID        string `json:"uid,omitempty"`
 	ShimUID    string `json:"shimUid,omitempty"`
+
+	// Forced reports whether the account has a marker (`/etc/anonctl/<account>.json`):
+	// anonctl's own convenience view of the SAME dependency-free truth a sibling
+	// tool reads directly. A missing marker is a clean `false` ("not forced"), never
+	// an error. The marker FILE is authoritative; this field is a reader of it.
+	Forced bool `json:"forced"`
+	// Marker is the account's marker record when present (Forced), else nil. It
+	// carries the endpoint SHARE-CLASS (story 20) but no endpoint URL/creds.
+	Marker *marker.Marker `json:"marker,omitempty"`
+}
+
+// WithMarker returns a copy of the status with its marker fields populated from
+// the given Store: Forced+Marker when a marker is present, a clean not-forced
+// (Forced=false, Marker=nil) when it is absent (marker.ErrNotFound). A real read
+// error (a corrupt marker) is returned so it is not silently swallowed. This is
+// the READER side of the marker precedence: `status` reports the same file a
+// sibling tool reads directly; it is a convenience view, not a second source of
+// truth. Kept separate from Status so the account-table read stays free of any
+// /etc dependency (and its unit tests need no marker Store).
+func (s AccountStatus) WithMarker(store marker.Store) (AccountStatus, error) {
+	m, err := store.Read(s.Account)
+	if err != nil {
+		if errors.Is(err, marker.ErrNotFound) {
+			s.Forced = false
+			s.Marker = nil
+			return s, nil
+		}
+		return s, err
+	}
+	s.Forced = true
+	s.Marker = &m
+	return s, nil
 }
 
 // Add provisions the anon login account and its distinct dedicated shim service
