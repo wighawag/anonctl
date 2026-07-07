@@ -101,6 +101,14 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 			quic := udpSendAsAnon(ctx, p, quicUDP)
 			return NonTCPUDPDropAssertion(raw, quic)
 		}},
+		{Name: AssertNoUIDTransitionEgress, Run: func(ctx context.Context) Assertion {
+			// Tails leak-catalogue row 7 (best-effort): probe the CONCRETELY ENUMERABLE
+			// UID-transition escape vectors from the hand-audited finding (sudo, and the
+			// documented setuid network wrappers) and assert none yields an off-box socket
+			// owned by a non-anon, non-shim uid. The pure decision frames it honestly as
+			// best-effort / not exhaustive; this only gathers the real per-vector outcomes.
+			return NoUIDTransitionEgressAssertion(uidTransitionVectors(ctx, p))
+		}},
 	}
 	if p.Exempt != "" {
 		checks = append(checks, Check{Name: AssertSplitTunnelTight, Run: func(ctx context.Context) Assertion {

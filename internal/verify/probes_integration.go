@@ -334,3 +334,116 @@ func nonExemptLANOf(exempt string) string {
 	ip[3] = other
 	return net.JoinHostPort(ip.String(), port)
 }
+
+// setuidNetworkWrappers is the small, DOCUMENTED set of setuid "run a command as
+// another uid" network-adjacent wrappers the audit
+// (work/notes/findings/uid-transition-escape-surface.md) tested by hand and found
+// do NOT hand the anon account a non-anon-owned egress on this class of host:
+// pkexec (exits non-zero with no polkit agent in the realistic no-seat case) and
+// mullvad-exclude (runs the target as the CALLER, so the socket stays anon-owned).
+// The no-uid-transition-egress probe re-asserts that empirically: it runs each
+// present wrapper AS the anon UID to execute `id -u` and reads whether the
+// resulting euid TRANSITIONED to a uid that is neither the anon nor the shim uid.
+// It is a documented list, NOT an invented one; extend it only from a fresh audit.
+//
+// ping and pppd from the finding are deliberately NOT in this run-a-command list:
+// ping is not a uid-changing wrapper (its socket is anon-owned/forced, already
+// covered by icmp-drop) and pppd is denied by group membership (it opens no PPP
+// link for `id`). Both are recorded in the finding, not re-probed here.
+var setuidNetworkWrappers = []string{"pkexec", "mullvad-exclude"}
+
+// uidTransitionVectors runs the CONCRETELY ENUMERABLE UID-transition escape probes
+// from the audit finding AS the anon account and returns one UIDTransitionVector
+// per checked vector (Escaped == it yielded an off-box-capable process/socket
+// owned by a non-anon, non-shim uid, i.e. it bypassed `meta skuid`). It always
+// includes the sudo vector, then one entry per PRESENT setuid network wrapper. The
+// caller feeds these to NoUIDTransitionEgressAssertion, which frames the result
+// honestly as best-effort / not exhaustive. Every probe fails SAFE toward
+// non-escape only when that genuinely reflects no transition; a probe that could
+// not run at all is simply not reported (the assertion still passes on the vectors
+// it did check, and the honest "not exhaustive" framing carries the rest).
+func uidTransitionVectors(ctx context.Context, p LiveParams) []UIDTransitionVector {
+	vectors := []UIDTransitionVector{sudoVector(ctx, p)}
+	for _, bin := range setuidNetworkWrappers {
+		if _, err := exec.LookPath(bin); err != nil {
+			continue // not on this host: nothing to probe (the finding's list is per-host)
+		}
+		vectors = append(vectors, setuidWrapperVector(ctx, p, bin))
+	}
+	return vectors
+}
+
+// sudoVector probes the sudo escape: whether the anon account has ANY sudo rights
+// (a sudo'd command runs as a DIFFERENT, typically root, uid and its socket
+// escapes the `meta skuid` forcing). It runs `sudo -l -U <account>` (list the
+// account's permitted sudo commands): sudo exits non-zero ("not allowed to run
+// sudo") when the account has none, so a zero exit means it CAN sudo (an escape).
+// A missing `sudo` binary means the vector is closed for this account too
+// (reported as checked-and-not-escaped). This mirrors provision's sudoAllowed
+// probe (the same `sudo -l -U` truth), read here as the verify-side escape signal.
+func sudoVector(ctx context.Context, p LiveParams) UIDTransitionVector {
+	v := UIDTransitionVector{Name: "sudo"}
+	if _, err := exec.LookPath("sudo"); err != nil {
+		return v // no sudo binary: no sudo transition path here
+	}
+	cctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	if err := exec.CommandContext(cctx, "sudo", "-l", "-U", p.Account).Run(); err == nil {
+		v.Escaped = true
+		v.Detail = "the account is permitted sudo (`sudo -l -U` listed rights): a sudo'd socket carries a non-anon uid"
+	}
+	return v
+}
+
+// setuidWrapperVector probes one setuid "run a command as another uid" wrapper
+// (e.g. pkexec, mullvad-exclude): it runs the wrapper AS the anon UID to execute
+// `id -u` and reads whether the reported euid TRANSITIONED to a uid that is
+// neither the anon nor the shim uid. A non-anon (and non-shim) euid means the
+// wrapper handed the account a process running as a different uid, whose sockets
+// would escape the `meta skuid` forcing (Escaped=true). A run that stays anon
+// (mullvad-exclude), that fails to authorize (pkexec with no agent -> non-zero,
+// no euid line), or that cannot run at all reads as NOT escaped (the audited safe
+// outcome). It runs under setpriv --reuid so the wrapper is invoked exactly as the
+// anon account would invoke it.
+func setuidWrapperVector(ctx context.Context, p LiveParams, bin string) UIDTransitionVector {
+	v := UIDTransitionVector{Name: "setuid:" + bin}
+	if _, err := exec.LookPath("setpriv"); err != nil {
+		return v // cannot invoke as the anon UID: report checked-not-escaped (safe)
+	}
+	cctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	// `<wrapper> id -u` under setpriv --reuid <anon>: if the wrapper transitions uid,
+	// `id -u` prints the TARGET euid; if it runs the target as the caller (or fails
+	// to authorize), it prints the anon uid or nothing.
+	cmd := exec.CommandContext(cctx, "setpriv",
+		"--reuid", strconv.Itoa(p.AnonUID), "--clear-groups",
+		bin, "id", "-u")
+	out, _ := cmd.CombinedOutput()
+	euid, ok := parseFirstUID(string(out))
+	if !ok {
+		return v // no euid line (the wrapper did not run the target): not an escape
+	}
+	if euid != p.AnonUID && euid != p.ShimUID {
+		v.Escaped = true
+		v.Detail = bin + " ran `id -u` as uid " + strconv.Itoa(euid) + " (a non-anon, non-shim uid): its sockets would escape the forcing"
+	}
+	return v
+}
+
+// parseFirstUID reads the first all-digit token from the wrapper's output (the
+// `id -u` line) and returns it as an int. A miss (no numeric line, e.g. pkexec's
+// "No authentication agent found") returns ok=false, which the caller reads as
+// "the wrapper did not hand back a transitioned uid": the safe, non-escaping
+// outcome.
+func parseFirstUID(out string) (int, bool) {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if n, err := strconv.Atoi(line); err == nil {
+			return n, true
+		}
+	}
+	return 0, false
+}

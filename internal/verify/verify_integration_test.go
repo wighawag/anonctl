@@ -389,6 +389,7 @@ func TestLiveLeakAndClosuresAgainstRealRuleset(t *testing.T) {
 		verify.AssertLeakDropV4, verify.AssertLeakDropV6,
 		verify.AssertBypassLoopbackClosure, verify.AssertBypassEndpointClosure,
 		verify.AssertICMPDrop, verify.AssertNonTCPUDPDrop,
+		verify.AssertNoUIDTransitionEgress,
 	} {
 		a, ok := byName[name]
 		if !ok {
@@ -521,6 +522,65 @@ func TestLiveLANExemptionNotADNSHole(t *testing.T) {
 		if !a.Ok {
 			t.Fatalf("%s must PASS for a reachable, tight, non-DNS exemption; got %+v", name, a)
 		}
+	}
+}
+
+// TestLiveNoUIDTransitionEgress is the integration proof of Tails leak-catalogue
+// row 7 (best-effort): a FRESHLY-provisioned throwaway anon account (hardened at
+// add-time: no sudoers entry, no sudo/wheel group) does NOT let the concretely
+// enumerable UID-transition vectors (sudo, the documented setuid network wrappers)
+// hand it an off-box socket owned by a non-anon, non-shim uid. It runs the SAME
+// live probe (uidTransitionVectors) `anonctl verify` uses, feeding the pure
+// assertion, against a real account on the box, isolated to a throwaway. It proves
+// the best-effort posture holds; it does NOT (and cannot) claim exhaustive absence.
+func TestLiveNoUIDTransitionEgress(t *testing.T) {
+	requireLiveHost(t)
+	ctx := context.Background()
+	r := execRunner{}
+
+	account := "anon-vitest-uidtx-" + strconv.Itoa(os.Getpid())
+	shimAccount := account + "-shim"
+
+	if _, err := provision.Add(ctx, r, account); err != nil {
+		t.Fatalf("provision.Add(%s): %v", account, err)
+	}
+	defer func() { _, _ = provision.Rm(ctx, r, account, true) }()
+
+	anonUID := uidOf(t, account)
+	shimUID := uidOf(t, shimAccount)
+
+	// A freshly-provisioned account is provisioned with NO sudo (the CLOSE-AT-ADD
+	// invariant); sanity-check that so the row-7 assertion is not vacuously green on
+	// a mis-provisioned box.
+	if _, _, err := run(ctx, "", "sudo", "-l", "-U", account); err == nil {
+		t.Fatalf("freshly-provisioned %s must have NO sudo rights (else the hardening regressed)", account)
+	}
+
+	lp := verify.LiveParams{
+		Account: account,
+		AnonUID: anonUID,
+		ShimUID: shimUID,
+	}
+	rep := verify.RunVerify(ctx, lp)
+	var got *verify.Assertion
+	for i := range rep.Assertions {
+		if rep.Assertions[i].Name == verify.AssertNoUIDTransitionEgress {
+			got = &rep.Assertions[i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("RunVerify must include the %s assertion; got %+v", verify.AssertNoUIDTransitionEgress, rep.Assertions)
+	}
+	if !got.Ok {
+		t.Fatalf("%s must PASS for a freshly-provisioned hardened account; got %+v", verify.AssertNoUIDTransitionEgress, *got)
+	}
+	// The evidence must be honestly framed as best-effort / not exhaustive (never a
+	// total guarantee), and must name at least the sudo vector it checked.
+	if !strings.Contains(got.Detail, "best-effort") || !strings.Contains(got.Detail, "not exhaustive") {
+		t.Fatalf("%s detail must be honestly framed as best-effort / not exhaustive; got %q", verify.AssertNoUIDTransitionEgress, got.Detail)
+	}
+	if !strings.Contains(got.Detail, "sudo") {
+		t.Fatalf("%s detail must name the checked sudo vector; got %q", verify.AssertNoUIDTransitionEgress, got.Detail)
 	}
 }
 

@@ -350,6 +350,66 @@ func TestLANExemptionNotADNSHoleAssertion(t *testing.T) {
 	}
 }
 
+// --- no-uid-transition-egress (best-effort, Tails leak-catalogue row 7, pure decision) ---
+
+// TestNoUIDTransitionEgressAssertion_PassesWhenNoCheckedVectorEscapes: the
+// best-effort probe over the CONCRETELY ENUMERABLE UID-transition vectors (the
+// audit finding: sudo, and the documented setuid network paths). It passes IFF
+// none of the checked vectors yielded an off-box socket owned by a non-anon,
+// non-shim uid. The evidence line must name the checked vectors AND state plainly
+// that it is best-effort / not exhaustive (an arbitrary triggerable daemon may
+// still escape), so the pass never reads as a total guarantee.
+func TestNoUIDTransitionEgressAssertion_PassesWhenNoCheckedVectorEscapes(t *testing.T) {
+	vectors := []UIDTransitionVector{
+		{Name: "sudo", Escaped: false},
+		{Name: "setuid:ping", Escaped: false},
+		{Name: "setuid:pkexec", Escaped: false},
+	}
+	a := NoUIDTransitionEgressAssertion(vectors)
+	if !a.Ok {
+		t.Fatalf("no escaping checked vector must PASS; got %+v", a)
+	}
+	if a.Name != AssertNoUIDTransitionEgress {
+		t.Fatalf("assertion name = %q, want %s", a.Name, AssertNoUIDTransitionEgress)
+	}
+	// The detail must name the checked vectors and be honestly non-exhaustive.
+	if !strings.Contains(a.Detail, "sudo") || !strings.Contains(a.Detail, "setuid:ping") {
+		t.Fatalf("detail must name the checked vectors; got %q", a.Detail)
+	}
+	if !strings.Contains(a.Detail, "best-effort") || !strings.Contains(a.Detail, "not exhaustive") {
+		t.Fatalf("detail must honestly frame the probe as best-effort / not exhaustive; got %q", a.Detail)
+	}
+}
+
+// TestNoUIDTransitionEgressAssertion_FailsWhenAnyVectorEscapes: if ANY checked
+// vector yielded an off-box socket owned by a non-anon, non-shim uid (an escape),
+// the assertion FAILS and its detail names the offending vector (a real leak the
+// per-UID forcing did not catch).
+func TestNoUIDTransitionEgressAssertion_FailsWhenAnyVectorEscapes(t *testing.T) {
+	vectors := []UIDTransitionVector{
+		{Name: "sudo", Escaped: false},
+		{Name: "setuid:exim-submit", Escaped: true, Detail: "submitted mail carried off-box by uid Debian-exim"},
+	}
+	a := NoUIDTransitionEgressAssertion(vectors)
+	if a.Ok {
+		t.Fatalf("an escaping vector must FAIL (a uid-transition leak); got %+v", a)
+	}
+	if !strings.Contains(a.Detail, "setuid:exim-submit") {
+		t.Fatalf("detail must name the offending vector; got %q", a.Detail)
+	}
+}
+
+// TestNoUIDTransitionEgressAssertion_FailsWhenNoVectorsChecked: an EMPTY probe set
+// is not a pass. "Nothing was checked" is never proof the vectors do not escape
+// (mirrors the report-level "nothing asserted is not a pass" contract); it must
+// FAIL rather than silently green.
+func TestNoUIDTransitionEgressAssertion_FailsWhenNoVectorsChecked(t *testing.T) {
+	a := NoUIDTransitionEgressAssertion(nil)
+	if a.Ok {
+		t.Fatalf("an empty probe set must FAIL (nothing checked is not a pass); got %+v", a)
+	}
+}
+
 // --- fixture-backed end-to-end of the anonymized-exit evidence path ---
 
 // TestAnonymizedExit_AgainstFixture proves the anonymized-exit assertion can be

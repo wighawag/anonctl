@@ -97,6 +97,13 @@ const (
 	// DROPPED, since SOCKS carries TCP only and UDP/443 is unrelayable (Tails
 	// leak-catalogue row 5).
 	AssertNonTCPUDPDrop = "non-tcp-udp-drop"
+	// AssertNoUIDTransitionEgress: the CONCRETELY ENUMERABLE UID-transition escape
+	// vectors (sudo, and the documented setuid network paths from the audit finding)
+	// do NOT yield an off-box socket owned by a non-anon, non-shim uid that bypasses
+	// the `meta skuid` forcing (Tails leak-catalogue row 7). It is BEST-EFFORT and
+	// explicitly NOT exhaustive: verify cannot enumerate every daemon on every host,
+	// so it proves only that the CHECKED vectors do not escape, never total absence.
+	AssertNoUIDTransitionEgress = "no-uid-transition-egress"
 )
 
 // Assertion is one named verify result. Ok is the pass/fail; Detail is the
@@ -460,6 +467,63 @@ func SplitTunnelTightAssertion(exempt string, exemptReached, nonExemptReached bo
 		a.Ok = true
 		a.Detail = "exempted " + exempt + " reachable, but the rest of the LAN / loopback stays redirected-or-dropped (tight)"
 	}
+	return a
+}
+
+// UIDTransitionVector is one CONCRETELY ENUMERABLE UID-transition escape vector the
+// no-uid-transition-egress probe checked, and whether it ESCAPED. Escaped is true
+// iff the vector yielded an off-box socket owned by a non-anon, non-shim uid (it
+// does NOT match `skuid == anonUID`, so it egresses in the clear, bypassing the
+// forcing): a real leak. Name identifies the vector for the evidence line (e.g.
+// "sudo", "setuid:ping"); Detail is optional extra context for an escaping vector.
+// The vectors come from the hand-audited finding
+// (work/notes/findings/uid-transition-escape-surface.md), NOT a guessed list.
+type UIDTransitionVector struct {
+	Name    string
+	Escaped bool
+	Detail  string
+}
+
+// NoUIDTransitionEgressAssertion is the BEST-EFFORT row-7 decision (Tails
+// leak-catalogue): the concretely enumerable UID-transition escape vectors (sudo,
+// and the documented setuid network paths the audit found) must NOT yield an
+// off-box socket owned by a non-anon, non-shim uid. It PASSES iff at least one
+// vector was checked AND none escaped; ANY escaping vector fails (a real leak the
+// per-UID forcing did not catch), and an EMPTY probe set fails (nothing checked is
+// not a pass, mirroring the report-level contract).
+//
+// It is HONESTLY framed: the detail always names the checked vectors AND states
+// plainly that the probe is best-effort and NOT exhaustive (an arbitrary
+// triggerable daemon on a busy host may still escape; the per-UID model cannot
+// close that, only netns can). A false total-guarantee here would be worse than an
+// honest partial one, so the honesty framing is load-bearing, not decoration. It
+// is pure so the verdict is unit-tested with no privilege; the live check feeds it
+// the real per-vector probe outcomes.
+func NoUIDTransitionEgressAssertion(vectors []UIDTransitionVector) Assertion {
+	a := Assertion{Name: AssertNoUIDTransitionEgress}
+	if len(vectors) == 0 {
+		a.Detail = "no UID-transition vectors were checked: nothing was proved (a probe that could not run is not a pass)"
+		return a
+	}
+	names := make([]string, 0, len(vectors))
+	var escaped []string
+	for _, v := range vectors {
+		names = append(names, v.Name)
+		if v.Escaped {
+			if v.Detail != "" {
+				escaped = append(escaped, v.Name+" ("+v.Detail+")")
+			} else {
+				escaped = append(escaped, v.Name)
+			}
+		}
+	}
+	checked := strings.Join(names, ", ")
+	if len(escaped) > 0 {
+		a.Detail = "a checked UID-transition vector ESCAPED forcing (an off-box socket owned by a non-anon, non-shim uid egressed in the clear): " + strings.Join(escaped, "; ") + ". Checked: " + checked
+		return a
+	}
+	a.Ok = true
+	a.Detail = "the checked UID-transition vectors did not yield an off-box socket owned by a non-anon, non-shim uid (checked: " + checked + "). This is best-effort, not exhaustive: verify cannot enumerate every daemon on every host, so an arbitrary triggerable daemon may still escape the per-UID forcing (only netns-strength confinement closes that class)"
 	return a
 }
 
