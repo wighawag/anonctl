@@ -22,9 +22,9 @@ On a real Linux host with a freshly-provisioned anon account, enumerate and reco
 
 ## Acceptance criteria
 
-- [ ] A `work/notes/findings/uid-transition-escape-surface.md` is written with a `source:` line (hand-audited on a real host: OS + kernel + date), recording: the sudo situation, the reachable setuid/setgid binaries and which can egress, the triggerable daemons/services, and the nosuid-vs-suid mount picture.
-- [ ] For each vector found, a note on whether anonctl can close it at `add`-time (feeds `harden-anon-account-against-uid-transition`), prove-absent in `verify` (feeds `verify-no-uid-transition-egress`), or must be documented as residual.
-- [ ] The finding is HONEST about the boundary: it names what the per-UID model cannot close (an arbitrary triggerable daemon on a busy host) and points at netcage's netns model for namespace-strength confinement.
+- [x] A `work/notes/findings/uid-transition-escape-surface.md` is written with a `source:` line (hand-audited on a real host: OS + kernel + date), recording: the sudo situation, the reachable setuid/setgid binaries and which can egress, the triggerable daemons/services, and the nosuid-vs-suid mount picture.
+- [x] For each vector found, a note on whether anonctl can close it at `add`-time (feeds `harden-anon-account-against-uid-transition`), prove-absent in `verify` (feeds `verify-no-uid-transition-egress`), or must be documented as residual.
+- [x] The finding is HONEST about the boundary: it names what the per-UID model cannot close (an arbitrary triggerable daemon on a busy host) and points at netcage's netns model for namespace-strength confinement.
 
 ## Blocked by
 
