@@ -125,6 +125,40 @@ func probeAsAnon(t *testing.T, anonUID, anonGID int, network, addr string) bool 
 	return strings.Contains(out, "REACHED")
 }
 
+// udpSendAsAnon sends a UDP datagram to addr AS THE ANON UID and reports whether
+// it REACHED (the kernel let it out) vs DROPPED (an EPERM on the sendto, the
+// recipe row-5 "Operation not permitted" signal). The probe helper WRITES a
+// datagram for a udp network so a connectionless Dial cannot false-pass a dropped
+// path. A dropped datagram (fail-closed) reads as reached=false, the PASS.
+func udpSendAsAnon(t *testing.T, anonUID, anonGID int, addr string) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	out, _, _ := run(ctx, "",
+		"setpriv", "--reuid", strconv.Itoa(anonUID), "--regid", strconv.Itoa(anonGID), "--clear-groups",
+		probeHelperBin, "udp4", addr)
+	return strings.Contains(out, "REACHED")
+}
+
+// pingAsAnon sends one ICMP echo AS THE ANON UID to an off-box target and reports
+// whether it REACHED (got a reply, so a real-source-IP ICMP packet left and came
+// back, a leak) vs DROPPED (no reply, the PASS: it fell through to the policy
+// DROP). A missing `ping` binary skips-as-dropped (reached=false), the safe
+// reading. It runs the system `ping` under setpriv so the ICMP socket is owned by
+// the anon UID (the nft rules key on meta skuid).
+func pingAsAnon(t *testing.T, anonUID, anonGID int, target string) bool {
+	t.Helper()
+	if _, err := exec.LookPath("ping"); err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	out, _, _ := run(ctx, "",
+		"setpriv", "--reuid", strconv.Itoa(anonUID), "--regid", strconv.Itoa(anonGID), "--clear-groups",
+		"ping", "-c", "1", "-W", "3", "-n", target)
+	return strings.Contains(out, "bytes from") || strings.Contains(out, "1 received") || strings.Contains(out, "1 packets received")
+}
+
 // probeHelperBin is a tiny compiled dialer (built in TestMain) that connects to
 // its argv target and prints REACHED / DROPPED. It is run UNDER setpriv so the
 // dial egresses from the anon UID, exercising the real nft `meta skuid` rules.
@@ -153,11 +187,17 @@ func TestMain(m *testing.M) {
 
 // probeSource is the dialer helper: connect with a timeout, print the outcome.
 const probeSource = `package main
-import ("fmt";"net";"os";"time")
+import ("fmt";"net";"os";"strings";"time")
 func main(){
 	if len(os.Args)<3 { fmt.Print("DROPPED:usage"); return }
 	c,e:=(&net.Dialer{Timeout:3*time.Second}).Dial(os.Args[1],os.Args[2])
 	if e!=nil { fmt.Print("DROPPED:",e); return }
+	if strings.HasPrefix(os.Args[1],"udp"){
+		_,we:=c.Write([]byte("x"))
+		c.Close()
+		if we!=nil { fmt.Print("DROPPED:",we); return }
+		fmt.Print("REACHED"); return
+	}
 	c.Close(); fmt.Print("REACHED")
 }`
 
@@ -290,6 +330,26 @@ func TestLiveLeakAndClosuresAgainstRealRuleset(t *testing.T) {
 		t.Fatalf("bypass-endpoint-closure (b) must hold; got %+v", a)
 	}
 
+	// --- icmp-drop (Tails leak-catalogue row 4): an ICMP echo from the anon UID to
+	// an off-box address must be DROPPED (it falls through to the policy DROP). A
+	// dropped ping gets no reply => reached=false => PASS. We assert the DROP feeds
+	// ICMPDropAssertion; the probe reads whether the anon UID could EMIT ICMP.
+	reachedICMP := pingAsAnon(t, anonUID, anonGID, "192.0.2.1")
+	if a := verify.ICMPDropAssertion(reachedICMP); !a.Ok {
+		t.Fatalf("icmp-drop must hold (a ping from the anon UID must be DROPPED); got %+v", a)
+	}
+
+	// --- non-tcp-udp-drop (Tails leak-catalogue row 5): raw non-53 UDP AND
+	// specifically UDP/443 (QUIC) from the anon UID must be DROPPED (SOCKS carries
+	// TCP only; both fall through to the policy DROP). A dropped datagram surfaces as
+	// an EPERM on the sendto (the recipe's `socat UDP4:...:9999` -> "Operation not
+	// permitted") => reached=false => PASS.
+	reachedRawUDP := udpSendAsAnon(t, anonUID, anonGID, "1.1.1.1:9999")
+	reachedQUIC := udpSendAsAnon(t, anonUID, anonGID, "1.1.1.1:443")
+	if a := verify.NonTCPUDPDropAssertion(reachedRawUDP, reachedQUIC); !a.Ok {
+		t.Fatalf("non-tcp-udp-drop must hold (raw UDP + UDP/443 from the anon UID must be DROPPED); got %+v", a)
+	}
+
 	// Sanity: the anon UID CAN reach its OWN shim relay port (closure (a) is a
 	// closure, not a lockout). This proves the ruleset is not simply dropping
 	// everything (which would make the DROP assertions vacuously pass).
@@ -328,6 +388,7 @@ func TestLiveLeakAndClosuresAgainstRealRuleset(t *testing.T) {
 	for _, name := range []string{
 		verify.AssertLeakDropV4, verify.AssertLeakDropV6,
 		verify.AssertBypassLoopbackClosure, verify.AssertBypassEndpointClosure,
+		verify.AssertICMPDrop, verify.AssertNonTCPUDPDrop,
 	} {
 		a, ok := byName[name]
 		if !ok {

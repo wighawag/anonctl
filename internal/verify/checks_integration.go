@@ -13,6 +13,23 @@ import (
 	"github.com/wighawag/anonctl/internal/lanexempt"
 )
 
+// icmpProbeTarget is the off-box address the icmp-drop probe pings AS the anon
+// UID: a TEST-NET-1 (RFC 5737) documentation address that is safe to name and
+// never a real host. The probe never depends on it replying: a dropped ping (the
+// PASS) and an unreachable-but-not-dropped host both yield no reply, so the probe
+// reads whether the anon UID could EMIT ICMP at all, which the policy DROP forbids.
+const icmpProbeTarget = "192.0.2.1"
+
+// udpProbeHost / udpRawProbePort are the off-box UDP destination the non-tcp-udp-drop
+// probe dials AS the anon UID: a public resolver IP on a raw high port (row 5's
+// hand-verified `socat UDP4:1.1.1.1:9999` shape) plus, separately, UDP/443 (QUIC).
+// SOCKS carries TCP only, so any UDP that is not the redirected 53 falls through to
+// the anon UID's policy DROP; the probe proves the drop.
+const (
+	udpProbeHost    = "1.1.1.1"
+	udpRawProbePort = 9999
+)
+
 // LiveChecks (integration build) is the REAL assertion set: it stands up live
 // probes AS the anon UID against the fail-closed ruleset the nftables task
 // installed, and feeds their outcomes to the PURE assertion decisions in
@@ -64,6 +81,26 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 			endpointAddr := net.JoinHostPort(p.EndpointHost, strconv.Itoa(p.EndpointPort))
 			return BypassEndpointClosureAssertion(probeAsAnon(ctx, p, "tcp4", endpointAddr))
 		}},
+		{Name: AssertICMPDrop, Run: func(ctx context.Context) Assertion {
+			// Tails leak-catalogue row 4: an ICMP echo from the anon UID to an off-box
+			// address must be DROPPED. It falls through to the policy DROP, so a ping
+			// gets no reply => reached=false => PASS. The off-box target is a
+			// documentation/TEST-NET address; the probe never depends on it being up
+			// (a dropped ping and an unreachable host both read as reached=false, the
+			// safe outcome), it reads whether the anon UID could EMIT ICMP at all.
+			return ICMPDropAssertion(pingAsAnon(ctx, p, icmpProbeTarget))
+		}},
+		{Name: AssertNonTCPUDPDrop, Run: func(ctx context.Context) Assertion {
+			// Tails leak-catalogue row 5: raw non-53 UDP AND specifically UDP/443 (QUIC)
+			// from the anon UID must be DROPPED (SOCKS carries TCP only). Both dial an
+			// off-box UDP destination AS the anon UID; a dropped datagram is refused /
+			// times out => reached=false => PASS.
+			rawUDP := net.JoinHostPort(udpProbeHost, strconv.Itoa(udpRawProbePort))
+			quicUDP := net.JoinHostPort(udpProbeHost, "443")
+			raw := udpSendAsAnon(ctx, p, rawUDP)
+			quic := udpSendAsAnon(ctx, p, quicUDP)
+			return NonTCPUDPDropAssertion(raw, quic)
+		}},
 	}
 	if p.Exempt != "" {
 		checks = append(checks, Check{Name: AssertSplitTunnelTight, Run: func(ctx context.Context) Assertion {
@@ -107,6 +144,15 @@ func exemptHost(exempt string) string {
 		return ""
 	}
 	return host
+}
+
+// udpSendAsAnon sends a UDP datagram to addr AS the anon UID and reports whether
+// it REACHED (the kernel let it out) vs DROPPED (an EPERM on the sendto, the
+// recipe row-5 signal). It is a thin twin of probeAsAnon: the shared probe helper
+// WRITES a datagram for a udp network so a connectionless Dial cannot false-pass a
+// dropped path. A dropped datagram (fail-closed) reads as reached=false, the PASS.
+func udpSendAsAnon(ctx context.Context, p LiveParams, addr string) bool {
+	return probeAsAnon(ctx, p, "udp4", addr)
 }
 
 // probeAsAnon dials addr AS the anon UID (setpriv drops to it) with a short
