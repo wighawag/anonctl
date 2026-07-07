@@ -20,6 +20,12 @@
 //   - bypass-endpoint-closure: the anon UID dialling the upstream endpoint
 //     directly is DROPPED (recipe closure b) so it can never skip the shim or its
 //     `<account>@` isolation username.
+//   - icmp-drop: an ICMP echo (`ping`) from the anon UID to an off-box address is
+//     DROPPED (it does not emit an ICMP packet carrying the real source IP). Tails
+//     leak-catalogue row 4; it falls through to the anon UID's policy DROP.
+//   - non-tcp-udp-drop: raw non-53 UDP from the anon UID, specifically including
+//     UDP/443 (QUIC / HTTP-3), is DROPPED. SOCKS carries TCP only, so UDP/443 is
+//     unrelayable; Tails leak-catalogue row 5, it falls through to the policy DROP.
 //   - split-tunnel-tight (with a LAN exemption active): the exempted host:port is
 //     reachable directly, but the rest of that /24, other loopback, and everything
 //     else stay redirected-or-dropped.
@@ -83,6 +89,14 @@ const (
 	// (redirected-or-dropped), so the LAN hole is never a clear-DNS hole (Tails
 	// leak-catalogue row 2).
 	AssertLANExemptionNotADNSHole = "lan-exemption-not-a-dns-hole"
+	// AssertICMPDrop: an ICMP echo (ping) from the anon UID to an off-box address is
+	// DROPPED, so no ICMP packet carrying the real source IP leaves (Tails
+	// leak-catalogue row 4).
+	AssertICMPDrop = "icmp-drop"
+	// AssertNonTCPUDPDrop: raw non-53 UDP from the anon UID (incl. UDP/443 QUIC) is
+	// DROPPED, since SOCKS carries TCP only and UDP/443 is unrelayable (Tails
+	// leak-catalogue row 5).
+	AssertNonTCPUDPDrop = "non-tcp-udp-drop"
 )
 
 // Assertion is one named verify result. Ok is the pass/fail; Detail is the
@@ -391,6 +405,42 @@ func BypassLoopbackClosureAssertion(reached bool) Assertion {
 // endpoint egressed (true == the closure is broken == fail).
 func BypassEndpointClosureAssertion(reached bool) Assertion {
 	return dropAssertion(AssertBypassEndpointClosure, "the anon UID dialling the upstream endpoint directly", reached)
+}
+
+// ICMPDropAssertion is the Tails leak-catalogue row-4 decision: an ICMP echo
+// (`ping`) from the anon UID to an off-box address must be DROPPED, so no ICMP
+// packet carrying the real source IP ever leaves the box. It falls through to the
+// anon UID's policy DROP in the shipped ruleset (there is no ICMP accept for the
+// anon UID), so this assertion PROVES the drop rather than assuming it. reached is
+// whether the ping egressed / got a reply (true == a leak == fail); a dropped ping
+// (no ICMP left, no reply) is reached=false and PASSES. anonctl drops ICMP for the
+// anon UID ONLY (not OS-wide), so unlike Tails it does NOT tune PMTU / set
+// `tcp_mtu_probing` (recorded as a threat-model caveat, not a mutation).
+func ICMPDropAssertion(reached bool) Assertion {
+	return dropAssertion(AssertICMPDrop, "an ICMP echo (ping) from the anon UID to an off-box address", reached)
+}
+
+// NonTCPUDPDropAssertion is the Tails leak-catalogue row-5 decision: raw non-53
+// UDP from the anon UID must be DROPPED, specifically INCLUDING UDP/443 (QUIC /
+// HTTP-3). SOCKS carries TCP only, so any UDP that is not the redirected 53 is
+// unrelayable and falls through to the anon UID's policy DROP; this assertion
+// PROVES the drop. rawReached / quic443Reached are whether a raw non-53 UDP
+// datagram and, specifically, a UDP/443 datagram egressed from the anon UID (true
+// == a leak == fail); both must be dropped for a PASS. A real client is expected
+// to degrade UDP/443 to TCP rather than leak (client behaviour, a docs note, not a
+// tested assertion here).
+func NonTCPUDPDropAssertion(rawReached, quic443Reached bool) Assertion {
+	a := Assertion{Name: AssertNonTCPUDPDrop}
+	switch {
+	case rawReached:
+		a.Detail = "raw non-53 UDP from the anon UID REACHED its target: fail-closed is broken (a leak)"
+	case quic443Reached:
+		a.Detail = "UDP/443 (QUIC) from the anon UID REACHED its target: fail-closed is broken (a leak)"
+	default:
+		a.Ok = true
+		a.Detail = "raw non-53 UDP and UDP/443 (QUIC) from the anon UID were DROPPED (fail-closed holds; a real client degrades to TCP)"
+	}
+	return a
 }
 
 // SplitTunnelTightAssertion is the split-tunnel-tight decision (story 25), only

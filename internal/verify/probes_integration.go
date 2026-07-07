@@ -140,11 +140,22 @@ var (
 
 // probeSource is the dialer helper: connect with a timeout, print the outcome.
 const probeSource = `package main
-import ("fmt";"net";"os";"time")
+import ("fmt";"net";"os";"strings";"time")
 func main(){
 	if len(os.Args)<3 { fmt.Print("DROPPED:usage"); return }
 	c,e:=(&net.Dialer{Timeout:3*time.Second}).Dial(os.Args[1],os.Args[2])
 	if e!=nil { fmt.Print("DROPPED:",e); return }
+	// For UDP the Dial is connectionless and never proves reachability; the nft
+	// meta-skuid DROP surfaces as an EPERM on the actual sendto, so WRITE a
+	// datagram and read whether the kernel let it out (recipe row 5: a dropped
+	// UDP write returns "operation not permitted"). For TCP the Dial establishing
+	// already proves REACHED.
+	if strings.HasPrefix(os.Args[1],"udp"){
+		_,we:=c.Write([]byte("x"))
+		c.Close()
+		if we!=nil { fmt.Print("DROPPED:",we); return }
+		fmt.Print("REACHED"); return
+	}
 	c.Close(); fmt.Print("REACHED")
 }`
 
@@ -186,6 +197,35 @@ func runSetprivProbe(ctx context.Context, uid int, network, addr string) (reache
 		probeHelperBin, network, addr)
 	out, _ := cmd.CombinedOutput()
 	return strings.Contains(string(out), "REACHED"), string(out), nil
+}
+
+// pingAsAnon sends a single ICMP echo AS the anon UID (setpriv drops to it) to an
+// off-box target and reports whether it REACHED (got a reply): a reply means an
+// ICMP packet carrying the real source IP left the box and came back (a leak); a
+// dropped ping gets no reply => reached=false (the PASS, Tails leak-catalogue row
+// 4). It runs the system `ping` with a short deadline and a single packet; a
+// missing `ping` binary or any error yields reached=false (the fail-closed
+// reading: no observed ICMP egress), never a false leak.
+//
+// anonctl drops ICMP for the anon UID ONLY, so `ping` for every OTHER uid on the
+// box (and the machine's own PMTU discovery) is untouched; this is why anonctl
+// does NOT set `net.ipv4.tcp_mtu_probing` the way Tails (OS-wide ICMP drop) does.
+func pingAsAnon(ctx context.Context, p LiveParams, target string) bool {
+	if _, err := exec.LookPath("ping"); err != nil {
+		return false
+	}
+	pctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	// -c 1 one packet, -W 3 three-second reply wait, -n numeric. Run under setpriv
+	// so the ICMP socket is owned by the anon UID (the nft rules key on meta skuid).
+	cmd := exec.CommandContext(pctx, "setpriv",
+		"--reuid", strconv.Itoa(p.AnonUID), "--clear-groups",
+		"ping", "-c", "1", "-W", "3", "-n", target)
+	out, _ := cmd.CombinedOutput()
+	// A reply ("1 received" / "bytes from") means ICMP egressed and came back (a
+	// leak). No reply / an error / an EPERM on the raw socket => reached=false.
+	s := string(out)
+	return strings.Contains(s, "bytes from") || strings.Contains(s, "1 received") || strings.Contains(s, "1 packets received")
 }
 
 // hostExitIP fetches the host's OWN direct exit IP (no shim) as the baseline the

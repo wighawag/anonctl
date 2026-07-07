@@ -273,6 +273,43 @@ func TestBypassClosureAssertions_PassWhenDropped(t *testing.T) {
 	}
 }
 
+// --- icmp-drop (Tails leak-catalogue row 4, pure decision) ---
+
+// TestICMPDropAssertion_PassesWhenDropped: an ICMP echo (ping) from the anon UID
+// to an off-box address that was DROPPED (no ICMP left, no reply) passes; one that
+// REACHED (a reply came back, so a real-source-IP ICMP packet left) is a leak and
+// fails. It mirrors the leak-drop polarity.
+func TestICMPDropAssertion_PassesWhenDropped(t *testing.T) {
+	dropped := ICMPDropAssertion(false)
+	if !dropped.Ok || dropped.Name != AssertICMPDrop {
+		t.Fatalf("a dropped ping must PASS with name %s; got %+v", AssertICMPDrop, dropped)
+	}
+	leaked := ICMPDropAssertion(true)
+	if leaked.Ok {
+		t.Fatalf("a ping that REACHED (real-source-IP ICMP left) is a leak and must FAIL; got %+v", leaked)
+	}
+}
+
+// --- non-tcp-udp-drop (Tails leak-catalogue row 5, pure decision) ---
+
+// TestNonTCPUDPDropAssertion covers raw non-53 UDP AND specifically UDP/443
+// (QUIC): both must be dropped from the anon UID for a PASS; either reaching its
+// target is a leak and must FAIL.
+func TestNonTCPUDPDropAssertion(t *testing.T) {
+	// Neither raw UDP nor UDP/443 leaves => dropped (pass).
+	if a := NonTCPUDPDropAssertion(false, false); !a.Ok || a.Name != AssertNonTCPUDPDrop {
+		t.Fatalf("raw + UDP/443 both dropped must PASS with name %s; got %+v", AssertNonTCPUDPDrop, a)
+	}
+	// Raw non-53 UDP reached => a leak (fail).
+	if a := NonTCPUDPDropAssertion(true, false); a.Ok {
+		t.Fatalf("a reached raw non-53 UDP must FAIL (leak); got %+v", a)
+	}
+	// UDP/443 (QUIC) reached => a leak (fail), even if raw did not.
+	if a := NonTCPUDPDropAssertion(false, true); a.Ok {
+		t.Fatalf("a reached UDP/443 (QUIC) must FAIL (leak); got %+v", a)
+	}
+}
+
 // --- split-tunnel-tight (story 25, pure decision) ---
 
 func TestSplitTunnelTightAssertion(t *testing.T) {
