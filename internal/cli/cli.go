@@ -38,6 +38,13 @@ type Command struct {
 	// (and its home) rather than only removing forcing hooks. A bare `rm` leaves
 	// it false, so it never silently deletes a user's home.
 	PurgeAccount bool
+
+	// Endpoint is the socks5h endpoint the account is forced through, as typed by
+	// the operator (`--endpoint socks5h://host:port` or a bare `host:port`). It is
+	// the RAW value; internal/endpoint parses + classifies it. Empty means the
+	// default Tor SocksPort for `add`. Meaningful only for the forcing verbs
+	// (add/update/reconfigure); ignored by list/status/rm/verify.
+	Endpoint string
 }
 
 // verbs is the recognised verb set. add/rm/list/status are live in this task;
@@ -76,17 +83,31 @@ func Parse(args []string) (*Command, error) {
 	// Flags may appear before OR after the name (`rm --purge-account work` and
 	// `rm work --purge-account` both work) so flag order never swallows the name.
 	var positionals []string
+	// wantEndpointValue is set when `--endpoint` was seen and its value (the next
+	// token) is still pending, so `--endpoint socks5h://h:p` (space form) works
+	// alongside `--endpoint=socks5h://h:p`.
+	var wantEndpointValue bool
 	for _, a := range args[1:] {
 		switch {
+		case wantEndpointValue:
+			cmd.Endpoint = a
+			wantEndpointValue = false
 		case a == "--json":
 			cmd.JSON = true
 		case a == "--purge-account":
 			cmd.PurgeAccount = true
+		case a == "--endpoint":
+			wantEndpointValue = true
+		case strings.HasPrefix(a, "--endpoint="):
+			cmd.Endpoint = strings.TrimPrefix(a, "--endpoint=")
 		case strings.HasPrefix(a, "-"):
 			return nil, fmt.Errorf("%s: unknown flag %q", verb, a)
 		default:
 			positionals = append(positionals, a)
 		}
+	}
+	if wantEndpointValue {
+		return nil, fmt.Errorf("%s: --endpoint needs a value (socks5h://host:port)", verb)
 	}
 
 	if !takesName(verb) {

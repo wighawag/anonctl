@@ -25,12 +25,18 @@ func TestNoArgsExit(t *testing.T) {
 	}
 }
 
-// update/reconfigure remain later-task stubs: they dispatch but are not
-// implemented, so they exit 3 (fail loud, never a silent success).
-func TestStubVerbExit(t *testing.T) {
+// update/reconfigure are now IMPLEMENTED (persistence task): they change an
+// account's endpoint and re-apply fail-closed. A bare `update` (no --endpoint) is a
+// usage error (exit 2, the required flag is missing), NOT the old not-implemented
+// stub (exit 3): the verb is implemented, so it must never exit 3.
+func TestUpdateRequiresEndpoint(t *testing.T) {
 	for _, v := range []string{"update", "reconfigure"} {
-		if code := run([]string{v}); code != 3 {
-			t.Errorf("run(%q) = %d, want 3 (not-implemented)", v, code)
+		code := run([]string{v})
+		if code != 2 {
+			t.Errorf("run(%q) = %d, want 2 (missing required --endpoint)", v, code)
+		}
+		if code == 3 {
+			t.Errorf("run(%q) = 3 (not-implemented stub); the verb must be implemented", v)
 		}
 	}
 }

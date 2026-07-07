@@ -24,10 +24,14 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/wighawag/anonctl/internal/accountconfig"
 	"github.com/wighawag/anonctl/internal/cli"
 	"github.com/wighawag/anonctl/internal/endpoint"
+	"github.com/wighawag/anonctl/internal/forcing"
 	"github.com/wighawag/anonctl/internal/marker"
+	"github.com/wighawag/anonctl/internal/nftables"
 	"github.com/wighawag/anonctl/internal/provision"
+	"github.com/wighawag/anonctl/internal/systemd"
 	"github.com/wighawag/anonctl/internal/verify"
 )
 
@@ -67,30 +71,45 @@ func run(args []string) int {
 	case "verify":
 		return runVerify(ctx, runner, cmd)
 	case "update", "reconfigure":
-		// Stubs: the verb DISPATCHES (the surface is end-to-end) but the behaviour
-		// is filled by later tasks (persistence/reconfigure). Fail loud so it is
-		// never mistaken for a silent success.
-		fmt.Fprintf(os.Stderr, "anonctl: %s is not implemented yet (a later task fills it)\n", cmd.Verb)
-		return 3
+		return runUpdate(ctx, runner, cmd)
 	default:
 		fmt.Fprintf(os.Stderr, "anonctl: unknown verb %q\n%s\n", cmd.Verb, usage)
 		return 2
 	}
 }
 
-// runAdd provisions the account + its dedicated shim UID, idempotently. It must
-// run as root (useradd); a non-root run surfaces useradd's own permission error.
+// runAdd provisions the account + its dedicated shim UID, then INSTALLS the forcing
+// (nft rules + the persisted systemd shim unit + the nftables.service drop-in), so
+// the account is anonymized live AND across a reboot fail-closed. It must run as
+// root (useradd/nft/systemctl); a non-root run surfaces the underlying command's
+// own permission error. Provisioning is idempotent and the forcing install is an
+// atomic replace, so re-running `add` cleanly re-applies.
 func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	res, err := provision.Add(ctx, r, cmd.Account)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "anonctl: add: %v\n", err)
 		return 1
 	}
-	if res.Created {
-		fmt.Printf("provisioned %s (shim %s)\n", res.Account, res.Shim)
-	} else {
-		fmt.Printf("%s already exists (shim %s); nothing to do\n", res.Account, res.Shim)
+
+	// Build the at-rest config from the just-provisioned UIDs and the chosen
+	// endpoint (default Tor SocksPort when none named), then install the forcing.
+	cfg, err := buildConfig(ctx, r, cmd.Account, cmd.Endpoint)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "anonctl: add: %v\n", err)
+		return 1
 	}
+	if err := forcing.Install(ctx, forcingDeps(), cfg, nil); err != nil {
+		fmt.Fprintf(os.Stderr, "anonctl: add: installing forcing: %v\n", err)
+		return 1
+	}
+
+	if res.Created {
+		fmt.Printf("provisioned + forced %s (shim %s, endpoint %s)\n", res.Account, res.Shim, cfg.Endpoint().URL())
+	} else {
+		fmt.Printf("%s already existed; re-applied forcing (shim %s, endpoint %s)\n", res.Account, res.Shim, cfg.Endpoint().URL())
+	}
+	fmt.Printf("note: anonctl does NOT manage the endpoint's own service; enable your endpoint (e.g. `systemctl enable --now tor.service`) so it is up at boot\n")
+	fmt.Printf("run `anonctl verify %s` to prove the account is anonymized\n", accountArg(cmd.Account))
 	return 0
 }
 
@@ -102,6 +121,13 @@ func runRm(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	res, err := provision.Rm(ctx, r, cmd.Account, cmd.PurgeAccount)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "anonctl: rm: %v\n", err)
+		return 1
+	}
+	// Remove the forcing (disable the shim, delete the account's nft table, and the
+	// persisted env/rule files + at-rest config) BEFORE the marker, so a torn-down
+	// account leaves no live forcing and no stale persisted state.
+	if err := forcing.Remove(ctx, forcingDeps(), cmd.Account); err != nil {
+		fmt.Fprintf(os.Stderr, "anonctl: rm: removing forcing: %v\n", err)
 		return 1
 	}
 	// Remove the marker (idempotent: a missing marker is a clean no-op), so a
@@ -191,27 +217,19 @@ func runStatus(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 // fails-closed (it cannot PROVE anonymization, so it must not exit 0).
 //
 // It reads the account's UIDs from the box (the same read-only truth `status`
-// uses). The endpoint host:port/relay/DNS ports come from the persisted account
-// config once the persistence task lands; until then verify passes the account's
-// default endpoint for the report header and the discovered UIDs, which is enough
-// for the default build's fail-closed report and for the integration harness,
-// which supplies the live params directly.
+// uses) and the endpoint + shim loopback ports from the PERSISTED account config
+// (written by `add`/`update`), so the live probes dial the account's real endpoint
+// and shim ports. When there is no persisted config (an account never forced), it
+// falls back to the default Tor endpoint + the default ports, which is enough for
+// the default build's fail-closed report and for the integration harness (which
+// supplies the live params directly).
 func runVerify(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	st, err := provision.Status(ctx, r, cmd.Account)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "anonctl: verify: %v\n", err)
 		return 1
 	}
-	ep := endpoint.Default()
-	p := verify.LiveParams{
-		Account:      cmd.Account,
-		Endpoint:     ep.URL(),
-		Class:        ep.Class,
-		AnonUID:      atoiOr(st.UID, 0),
-		ShimUID:      atoiOr(st.ShimUID, 0),
-		EndpointHost: ep.Host,
-		EndpointPort: atoiOr(ep.Port, 0),
-	}
+	p := verifyParams(cmd.Account, st)
 	rep := verify.RunVerify(ctx, p)
 
 	// WRITE-AFTER-VERIFY: the marker is a coordination CLAIM written strictly AFTER
@@ -221,7 +239,7 @@ func runVerify(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	// failure does NOT flip a passing verify to a failure (the account IS proven
 	// forced); it is surfaced on stderr so the operator can retry.
 	if rep.Ok() {
-		m := marker.New(cmd.Account, st.UID, ep.Class, resolveVersion(), time.Now())
+		m := marker.New(cmd.Account, st.UID, p.Class, resolveVersion(), time.Now())
 		if werr := marker.DefaultStore().WriteVerified(m, true); werr != nil {
 			fmt.Fprintf(os.Stderr, "anonctl: verify: writing marker: %v\n", werr)
 		}
@@ -238,6 +256,132 @@ func runVerify(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		fmt.Print(rep.Human())
 	}
 	return rep.ExitCode()
+}
+
+// verifyParams assembles the LIVE verify params for an account: the endpoint +
+// shim loopback ports from the PERSISTED account config (written by add/update)
+// when present, else the default Tor endpoint + default ports (an account never
+// forced). The UIDs always come from the box (the same read-only truth status
+// uses). This is the seam that lets the default build's fail-closed report and the
+// integration probes target the account's real endpoint/ports.
+func verifyParams(account string, st provision.AccountStatus) verify.LiveParams {
+	ep := endpoint.Default()
+	relay, dns := accountconfig.DefaultRelayPort, accountconfig.DefaultDNSPort
+	if cfg, err := accountconfig.DefaultStore().Read(account); err == nil {
+		ep = cfg.Endpoint()
+		relay, dns = cfg.RelayPort, cfg.DNSPort
+	}
+	return verify.LiveParams{
+		Account:      account,
+		Endpoint:     ep.URL(),
+		Class:        ep.Class,
+		AnonUID:      atoiOr(st.UID, 0),
+		ShimUID:      atoiOr(st.ShimUID, 0),
+		RelayPort:    relay,
+		DNSPort:      dns,
+		EndpointHost: ep.Host,
+		EndpointPort: atoiOr(ep.Port, 0),
+	}
+}
+
+// runUpdate is `update`/`reconfigure`: it changes an already-forced account's
+// endpoint and RE-APPLIES the rules fail-closed, with no un-anonymized window
+// (story 21). It reads the account's persisted config (it must already be
+// provisioned + forced), overlays the new endpoint (required for update), and calls
+// forcing.Reconfigure, which re-applies the nft rules (atomic table replace, the
+// default-DROP never absent) BEFORE restarting the shim, so egress is
+// dropped-or-forced throughout. It runs as root (nft/systemctl).
+func runUpdate(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
+	if cmd.Endpoint == "" {
+		fmt.Fprintf(os.Stderr, "anonctl: %s: --endpoint is required (the new socks5h endpoint to point the account at)\n", cmd.Verb)
+		return 2
+	}
+	cfg, err := accountconfig.DefaultStore().Read(cmd.Account)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "anonctl: %s: %s is not provisioned/forced (run `anonctl add %s` first): %v\n", cmd.Verb, cmd.Account, accountArg(cmd.Account), err)
+		return 1
+	}
+	ep, err := resolveEndpoint(cmd.Endpoint)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "anonctl: %s: %v\n", cmd.Verb, err)
+		return 1
+	}
+	cfg.EndpointHost = ep.Host
+	cfg.EndpointPort = atoiOr(ep.Port, 0)
+	cfg.EndpointClass = ep.Class
+	if err := forcing.Reconfigure(ctx, forcingDeps(), cfg, nil); err != nil {
+		fmt.Fprintf(os.Stderr, "anonctl: %s: %v\n", cmd.Verb, err)
+		return 1
+	}
+	fmt.Printf("reconfigured %s -> endpoint %s (re-applied fail-closed, no leak window)\n", cfg.Account, cfg.Endpoint().URL())
+	fmt.Printf("run `anonctl verify %s` to re-prove the account is anonymized\n", accountArg(cmd.Account))
+	return 0
+}
+
+// forcingDeps wires the real runners + stores for the forcing orchestration (the
+// production seam; tests build fakes). It is the ONE place the ExecRunners + the
+// default Stores are assembled.
+func forcingDeps() forcing.Deps {
+	return forcing.Deps{
+		NftRunner:     nftables.ExecRunner{},
+		SystemdRunner: systemd.ExecRunner{},
+		ConfigStore:   accountconfig.DefaultStore(),
+		SystemdStore:  systemd.DefaultStore(),
+	}
+}
+
+// buildConfig assembles an account's at-rest config from its just-provisioned UIDs
+// (read from the box) and the chosen endpoint (the raw --endpoint value, or the
+// default Tor SocksPort when empty). It fails loud if the account's UIDs cannot be
+// read (a provisioning that did not land) rather than emit a config that would
+// mis-force.
+func buildConfig(ctx context.Context, r provision.Runner, account, rawEndpoint string) (accountconfig.Config, error) {
+	st, err := provision.Status(ctx, r, account)
+	if err != nil {
+		return accountconfig.Config{}, fmt.Errorf("reading provisioned account: %w", err)
+	}
+	anonUID := atoiOr(st.UID, 0)
+	shimUID := atoiOr(st.ShimUID, 0)
+	if anonUID <= 0 || shimUID <= 0 {
+		return accountconfig.Config{}, fmt.Errorf("account %q is missing its UID (%q) or shim UID (%q); provisioning did not complete", account, st.UID, st.ShimUID)
+	}
+	ep, err := resolveEndpoint(rawEndpoint)
+	if err != nil {
+		return accountconfig.Config{}, err
+	}
+	return accountconfig.Config{
+		Account:       account,
+		AnonUID:       anonUID,
+		ShimUID:       shimUID,
+		EndpointHost:  ep.Host,
+		EndpointPort:  atoiOr(ep.Port, 0),
+		EndpointClass: ep.Class,
+	}, nil
+}
+
+// resolveEndpoint turns the raw --endpoint value into a validated, credential-free
+// endpoint with its share-class. An empty value is the default Tor SocksPort
+// (story 4). A named value is parsed with the heuristic class (Classify), which the
+// operator's future --endpoint-class override could refine (out of scope here).
+func resolveEndpoint(raw string) (endpoint.Endpoint, error) {
+	if raw == "" {
+		return endpoint.Default(), nil
+	}
+	ep, err := endpoint.Parse(raw, endpoint.Classify(raw))
+	if err != nil {
+		return endpoint.Endpoint{}, fmt.Errorf("endpoint: %w", err)
+	}
+	return ep, nil
+}
+
+// accountArg renders an account name as the CLI argument that targets it: the
+// default `anon` is a BARE verb (no name), a named `anon-<name>` is `<name>`. So a
+// follow-up hint prints the shortest form the operator would type.
+func accountArg(account string) string {
+	if account == cli.DefaultAccount {
+		return ""
+	}
+	return strings.TrimPrefix(account, cli.DefaultAccount+"-")
 }
 
 // atoiOr parses s as an int, returning def on any error (an empty/absent UID for a
@@ -263,17 +407,19 @@ func emitJSON(v any) int {
 }
 
 const usage = `usage:
-  anonctl add    [<name>]            provision the anon / anon-<name> account + its shim UID (root)
+  anonctl add    [--endpoint <socks5h://host:port>] [<name>]
+                                     provision the account + shim UID, install fail-closed forcing that
+                                     survives reboot (default endpoint: the local Tor SocksPort) (root)
   anonctl rm     [--purge-account] [<name>]
                                      remove forcing; --purge-account also deletes the account (root)
   anonctl list   [--json]           list the anon accounts that exist on the box
   anonctl status [<name>] [--json]  show one account's state (machine-readable with --json)
   anonctl verify [<name>] [--json]  prove the account is anonymized (named assertions, non-zero exit on failure)
-  anonctl update|reconfigure [<name>]
-                                     (later task) change an account's endpoint, re-apply fail-closed
+  anonctl update|reconfigure --endpoint <socks5h://host:port> [<name>]
+                                     change the account's endpoint and re-apply fail-closed (no leak window) (root)
   anonctl --version | version       print the anonctl version
 
 A bare verb targets the default account ` + "`anon`" + `; ` + "`<name>`" + ` targets ` + "`anon-<name>`" + `.
 Each account gets its OWN dedicated shim service account (` + "`<account>-shim`" + `), the
-only UID a later task lets reach the upstream endpoint. This build provisions the
-account + shim lifecycle only; it installs NO egress forcing yet.`
+only UID allowed to reach the upstream endpoint. anonctl does NOT manage the
+endpoint's own service: enable your endpoint (e.g. ` + "`tor.service`" + `) at boot yourself.`

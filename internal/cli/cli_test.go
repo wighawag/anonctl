@@ -134,6 +134,43 @@ func TestShimAccount(t *testing.T) {
 	}
 }
 
+// The forcing verbs accept `--endpoint`, in both the `=value` and the space
+// forms, and it must not swallow the account name; a dangling `--endpoint` with no
+// value is a loud parse error. Empty endpoint (the default) is left empty (the
+// caller substitutes the default Tor SocksPort).
+func TestEndpointFlag(t *testing.T) {
+	space, err := cli.Parse([]string{"add", "--endpoint", "socks5h://127.0.0.1:9050", "work"})
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if space.Endpoint != "socks5h://127.0.0.1:9050" {
+		t.Errorf("Endpoint = %q, want the socks5h URL", space.Endpoint)
+	}
+	if space.Account != "anon-work" {
+		t.Errorf("account = %q, want anon-work (--endpoint value must not swallow the name)", space.Account)
+	}
+
+	eq, err := cli.Parse([]string{"update", "--endpoint=socks5h://127.0.0.1:1080", "work"})
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if eq.Endpoint != "socks5h://127.0.0.1:1080" || eq.Account != "anon-work" {
+		t.Errorf("update --endpoint=... work => Endpoint=%q account=%q", eq.Endpoint, eq.Account)
+	}
+
+	bare, err := cli.Parse([]string{"add"})
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if bare.Endpoint != "" {
+		t.Errorf("bare add Endpoint = %q, want empty (default applied by the caller)", bare.Endpoint)
+	}
+
+	if _, err := cli.Parse([]string{"update", "--endpoint"}); err == nil {
+		t.Error("dangling --endpoint (no value) must be a parse error")
+	}
+}
+
 // `status` and `list` accept `--json` for machine-readable output; the other
 // verbs need not.
 func TestJSONFlag(t *testing.T) {
