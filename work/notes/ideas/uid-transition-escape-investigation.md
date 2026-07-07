@@ -5,6 +5,8 @@ slug: uid-transition-escape-investigation
 status: proposed
 ---
 
+> TASKED 2026-07-07: the three spawn tasks now exist in `work/tasks/backlog/` (`empirical-uid-transition-escape-audit` [humanOnly, the root], `harden-anon-account-against-uid-transition`, `verify-no-uid-transition-egress`). They are STAGED (not the pool) because the audit root is a human-run host inspection; promote them when ready to run the audit. This idea remains the design record; do not re-task it.
+
 ## The idea
 
 Row 7 of the Tails leak catalogue (`work/notes/findings/tails-network-filter-lessons.md`) is anonctl's single most important NOVEL weakness, and it is a genuine design question, not a straight build, which is why it is an idea and not a task yet.
