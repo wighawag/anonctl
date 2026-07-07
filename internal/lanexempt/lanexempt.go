@@ -53,6 +53,25 @@ const DNSPort = 53
 
 const dnsPort = DNSPort
 
+// HostPort renders the exemption as a dialable `host:port` for a live verify
+// probe (the split-tunnel probe dials the exempted destination and expects it
+// reachable, so it needs a concrete host+port). The host is the network's base
+// address (the exact host for a bare-IP /32 or /128). The port is the exemption's
+// own TCP port when it named one; for a port-omitted (all-TCP) exemption it falls
+// back to defaultPort, since the probe must pick ONE concrete TCP port to dial and
+// every non-53 TCP port is exempted. It never renders 53 (un-exemptable), so the
+// caller's defaultPort is expected to be a real non-DNS TCP port.
+func (e Exempt) HostPort(defaultPort int) string {
+	if e.Network == nil {
+		return ""
+	}
+	port := e.Port
+	if port == 0 {
+		port = defaultPort
+	}
+	return net.JoinHostPort(e.Network.IP.String(), strconv.Itoa(port))
+}
+
 // IsV4 reports whether the exemption is an IPv4 destination, so the nft layer can
 // pick the matching `ip`/`ip6` family (a v6 exemption must not emit a v4-family
 // rule and vice versa).

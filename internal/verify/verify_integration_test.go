@@ -435,12 +435,39 @@ func TestLiveLANExemptionNotADNSHole(t *testing.T) {
 	}()
 
 	anonUID := uidOf(t, account)
+	anonGID := gidOf(t, account)
 	shimUID := uidOf(t, shimAccount)
 
 	const relayPort, dnsPort = 49050, 49053
-	const exempt = "192.168.1.150:8080" // all-except-53 hole for the whole host is the row-2 case
 
-	exemptAll, err := lanexempt.Parse("192.168.1.150") // port-omitted: all TCP except 53
+	// The exempted host is a REACHABLE link-local address (an exemptable range) on a
+	// throwaway `lo` alias, so the split-tunnel probe can prove the hole actually
+	// opens (exemptReached==true) AND that a NON-exempt sibling in the same /24 stays
+	// dropped: a real reachable target is what makes split-tunnel-tight non-vacuous.
+	// Link-local is used (not RFC1918) so the alias cannot collide with a real LAN
+	// the box is on. It is torn down with the accounts (host isolation).
+	const exemptHost = "169.254.99.7"
+	const exempt = exemptHost + ":8080"
+	if _, _, err := run(ctx, "", "ip", "addr", "add", exemptHost+"/24", "dev", "lo"); err != nil {
+		t.Skipf("could not add throwaway link-local alias (%v); skipping split-tunnel proof", err)
+	}
+	defer func() { _, _, _ = run(ctx, "", "ip", "addr", "del", exemptHost+"/24", "dev", "lo") }()
+	ln, err := net.Listen("tcp", exempt)
+	if err != nil {
+		t.Skipf("could not listen on the exempt target (%v); skipping split-tunnel proof", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	exemptAll, err := lanexempt.Parse(exemptHost) // port-omitted: all TCP except 53
 	if err != nil {
 		t.Fatalf("lanexempt.Parse: %v", err)
 	}
@@ -458,8 +485,14 @@ func TestLiveLANExemptionNotADNSHole(t *testing.T) {
 		t.Fatalf("apply ruleset with exemption: %v", err)
 	}
 
-	// Run the live DNS-hole probe through the runtime orchestrator, with the
-	// exemption active so the assertion is included.
+	// Sanity: the anon UID CAN reach the exempted target directly (the accept-before-
+	// drop hole is open), else split-tunnel-tight would pass VACUOUSLY.
+	if !probeAsAnon(t, anonUID, anonGID, "tcp4", exempt) {
+		t.Fatalf("the anon UID must reach the EXEMPTED target %s directly (else split-tunnel-tight is vacuous)", exempt)
+	}
+
+	// Run BOTH exemption probes through the runtime orchestrator, with the exemption
+	// active so both assertions are included.
 	lp := verify.LiveParams{
 		Account:      account,
 		Endpoint:     "socks5h://127.0.0.1:9050",
@@ -473,18 +506,21 @@ func TestLiveLANExemptionNotADNSHole(t *testing.T) {
 		Exempt:       exempt,
 	}
 	rep := verify.RunVerify(ctx, lp)
-	var found bool
+	byName := map[string]verify.Assertion{}
 	for _, a := range rep.Assertions {
-		if a.Name != verify.AssertLANExemptionNotADNSHole {
-			continue
-		}
-		found = true
-		if !a.Ok {
-			t.Fatalf("lan-exemption-not-a-dns-hole must PASS (53 is excluded, redirected to the shim); got %+v", a)
-		}
+		byName[a.Name] = a
 	}
-	if !found {
-		t.Fatalf("RunVerify must include the %s assertion with an exemption active; got %+v", verify.AssertLANExemptionNotADNSHole, rep.Assertions)
+	// BOTH exemption assertions must FIRE (they run only with an exemption active)
+	// and PASS: split-tunnel-tight (the hole opens but does not widen) and
+	// lan-exemption-not-a-dns-hole (53 is excluded, redirected to the shim).
+	for _, name := range []string{verify.AssertSplitTunnelTight, verify.AssertLANExemptionNotADNSHole} {
+		a, ok := byName[name]
+		if !ok {
+			t.Fatalf("RunVerify must include the %s assertion with an exemption active; got %+v", name, rep.Assertions)
+		}
+		if !a.Ok {
+			t.Fatalf("%s must PASS for a reachable, tight, non-DNS exemption; got %+v", name, a)
+		}
 	}
 }
 

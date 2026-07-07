@@ -28,6 +28,7 @@ import (
 	"github.com/wighawag/anonctl/internal/cli"
 	"github.com/wighawag/anonctl/internal/endpoint"
 	"github.com/wighawag/anonctl/internal/forcing"
+	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anonctl/internal/marker"
 	"github.com/wighawag/anonctl/internal/nftables"
 	"github.com/wighawag/anonctl/internal/provision"
@@ -93,12 +94,12 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 
 	// Build the at-rest config from the just-provisioned UIDs and the chosen
 	// endpoint (default Tor SocksPort when none named), then install the forcing.
-	cfg, err := buildConfig(ctx, r, cmd.Account, cmd.Endpoint)
+	cfg, err := buildConfig(ctx, r, cmd.Account, cmd.Endpoint, cmd.Exemptions)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "anonctl: add: %v\n", err)
 		return 1
 	}
-	if err := forcing.Install(ctx, forcingDeps(), cfg, nil); err != nil {
+	if err := forcing.Install(ctx, forcingDeps(), cfg, cmd.Exemptions); err != nil {
 		fmt.Fprintf(os.Stderr, "anonctl: add: installing forcing: %v\n", err)
 		return 1
 	}
@@ -229,7 +230,7 @@ func runVerify(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		fmt.Fprintf(os.Stderr, "anonctl: verify: %v\n", err)
 		return 1
 	}
-	p := verifyParams(cmd.Account, st)
+	p := verifyParams(accountconfig.DefaultStore(), cmd.Account, st)
 	rep := verify.RunVerify(ctx, p)
 
 	// WRITE-AFTER-VERIFY: the marker is a coordination CLAIM written strictly AFTER
@@ -264,12 +265,14 @@ func runVerify(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 // forced). The UIDs always come from the box (the same read-only truth status
 // uses). This is the seam that lets the default build's fail-closed report and the
 // integration probes target the account's real endpoint/ports.
-func verifyParams(account string, st provision.AccountStatus) verify.LiveParams {
+func verifyParams(store accountconfig.Store, account string, st provision.AccountStatus) verify.LiveParams {
 	ep := endpoint.Default()
 	relay, dns := accountconfig.DefaultRelayPort, accountconfig.DefaultDNSPort
-	if cfg, err := accountconfig.DefaultStore().Read(account); err == nil {
+	var exempt string
+	if cfg, err := store.Read(account); err == nil {
 		ep = cfg.Endpoint()
 		relay, dns = cfg.RelayPort, cfg.DNSPort
+		exempt = firstExemptHostPort(cfg.Exemptions)
 	}
 	return verify.LiveParams{
 		Account:      account,
@@ -281,7 +284,33 @@ func verifyParams(account string, st provision.AccountStatus) verify.LiveParams 
 		DNSPort:      dns,
 		EndpointHost: ep.Host,
 		EndpointPort: atoiOr(ep.Port, 0),
+		Exempt:       exempt,
 	}
+}
+
+// exemptProbePort is the concrete non-53 TCP port the split-tunnel verify probe
+// dials for a port-omitted (all-TCP) exemption: it must pick ONE port, and every
+// non-53 TCP port on the host is exempted, so any plausible one proves the hole.
+// 8080 is the local-service port the feature exists for (a LAN LLM/proxy).
+const exemptProbePort = 8080
+
+// firstExemptHostPort renders the FIRST persisted exemption (raw IP|CIDR[:port])
+// into the dialable host:port string verify.LiveParams.Exempt expects, so the
+// split-tunnel-tight + lan-exemption-not-a-dns-hole assertions fire for an
+// exempted account (they run only when Exempt != ""). It verifies ONE exemption as
+// the representative proof that exemptions are wired end-to-end; an account with no
+// exemptions yields "" (the assertions are cleanly skipped, as today). A raw value
+// that no longer parses is skipped (it was validated at config time; a corrupt
+// record must not crash verify), falling through to the next.
+func firstExemptHostPort(raw []string) string {
+	for _, r := range raw {
+		e, err := lanexempt.Parse(r)
+		if err != nil {
+			continue
+		}
+		return e.HostPort(exemptProbePort)
+	}
+	return ""
 }
 
 // runUpdate is `update`/`reconfigure`: it changes an already-forced account's
@@ -309,7 +338,17 @@ func runUpdate(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	cfg.EndpointHost = ep.Host
 	cfg.EndpointPort = atoiOr(ep.Port, 0)
 	cfg.EndpointClass = ep.Class
-	if err := forcing.Reconfigure(ctx, forcingDeps(), cfg, nil); err != nil {
+	// Overlay the exemptions the operator passed on THIS update: an update that
+	// names --allow-direct sets the account's exemptions, an update that names none
+	// leaves the persisted set intact (re-applying the same holes), so a plain
+	// endpoint change never silently drops a configured exemption.
+	exemptions, err := exemptionsForUpdate(cmd, cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "anonctl: %s: %v\n", cmd.Verb, err)
+		return 1
+	}
+	cfg.Exemptions = rawExemptions(exemptions)
+	if err := forcing.Reconfigure(ctx, forcingDeps(), cfg, exemptions); err != nil {
 		fmt.Fprintf(os.Stderr, "anonctl: %s: %v\n", cmd.Verb, err)
 		return 1
 	}
@@ -335,7 +374,41 @@ func forcingDeps() forcing.Deps {
 // default Tor SocksPort when empty). It fails loud if the account's UIDs cannot be
 // read (a provisioning that did not land) rather than emit a config that would
 // mis-force.
-func buildConfig(ctx context.Context, r provision.Runner, account, rawEndpoint string) (accountconfig.Config, error) {
+// exemptionsForUpdate resolves which exemptions an update should apply: the ones
+// the operator named on THIS invocation when any were given, else the account's
+// already-persisted exemptions (re-parsed from their raw form). This keeps a plain
+// `update --endpoint` from silently dropping configured holes while letting an
+// `update --allow-direct ...` replace the set.
+func exemptionsForUpdate(cmd *cli.Command, cfg accountconfig.Config) ([]lanexempt.Exempt, error) {
+	if len(cmd.Exemptions) > 0 {
+		return cmd.Exemptions, nil
+	}
+	out := make([]lanexempt.Exempt, 0, len(cfg.Exemptions))
+	for _, raw := range cfg.Exemptions {
+		e, err := lanexempt.Parse(raw)
+		if err != nil {
+			return nil, fmt.Errorf("persisted exemption %q is invalid: %w", raw, err)
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// rawExemptions renders parsed exemptions back to their raw IP|CIDR[:port] strings
+// for persistence in the account config (the credential-free at-rest form the nft
+// generator + verify re-parse). It is the inverse of the CLI/config parse.
+func rawExemptions(exemptions []lanexempt.Exempt) []string {
+	if len(exemptions) == 0 {
+		return nil
+	}
+	raw := make([]string, 0, len(exemptions))
+	for _, e := range exemptions {
+		raw = append(raw, e.Raw)
+	}
+	return raw
+}
+
+func buildConfig(ctx context.Context, r provision.Runner, account, rawEndpoint string, exemptions []lanexempt.Exempt) (accountconfig.Config, error) {
 	st, err := provision.Status(ctx, r, account)
 	if err != nil {
 		return accountconfig.Config{}, fmt.Errorf("reading provisioned account: %w", err)
@@ -356,6 +429,7 @@ func buildConfig(ctx context.Context, r provision.Runner, account, rawEndpoint s
 		EndpointHost:  ep.Host,
 		EndpointPort:  atoiOr(ep.Port, 0),
 		EndpointClass: ep.Class,
+		Exemptions:    rawExemptions(exemptions),
 	}, nil
 }
 
@@ -407,16 +481,19 @@ func emitJSON(v any) int {
 }
 
 const usage = `usage:
-  anonctl add    [--endpoint <socks5h://host:port>] [<name>]
+  anonctl add    [--endpoint <socks5h://host:port>] [--allow-direct <IP|CIDR[:port]>]... [<name>]
                                      provision the account + shim UID, install fail-closed forcing that
                                      survives reboot (default endpoint: the local Tor SocksPort) (root)
+                                     --allow-direct punches a narrow private-only LAN hole (repeatable;
+                                     RFC1918/link-local only, never :53)
   anonctl rm     [--purge-account] [<name>]
                                      remove forcing; --purge-account also deletes the account (root)
   anonctl list   [--json]           list the anon accounts that exist on the box
   anonctl status [<name>] [--json]  show one account's state (machine-readable with --json)
   anonctl verify [<name>] [--json]  prove the account is anonymized (named assertions, non-zero exit on failure)
-  anonctl update|reconfigure --endpoint <socks5h://host:port> [<name>]
+  anonctl update|reconfigure --endpoint <socks5h://host:port> [--allow-direct <IP|CIDR[:port]>]... [<name>]
                                      change the account's endpoint and re-apply fail-closed (no leak window) (root)
+                                     --allow-direct here REPLACES the account's LAN holes (omit to keep them)
   anonctl --version | version       print the anonctl version
 
 A bare verb targets the default account ` + "`anon`" + `; ` + "`<name>`" + ` targets ` + "`anon-<name>`" + `.

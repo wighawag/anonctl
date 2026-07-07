@@ -3,6 +3,7 @@ package accountconfig_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/wighawag/anonctl/internal/accountconfig"
@@ -65,6 +66,38 @@ func TestRoundTripPreservesEndpoint(t *testing.T) {
 	// isolation), preserved through the round-trip.
 	if u := ep.IsolationUsername("anon"); u != "" {
 		t.Errorf("IsolationUsername(socks-peruser) = %q, want empty", u)
+	}
+}
+
+// A config with LAN exemptions round-trips the raw exemption values (credential-
+// free: just IP/CIDR[:port] strings, no secret), so the operator's --allow-direct
+// choices survive to the next verb / reboot and reach both the ruleset and verify.
+func TestRoundTripPreservesExemptions(t *testing.T) {
+	store := accountconfig.Store{BaseDir: t.TempDir()}
+	c := sample()
+	c.Exemptions = []string{"192.168.1.150:8080", "10.0.0.0/24"}
+	if err := store.Write(c); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := store.Read("anon")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got.Exemptions) != 2 || got.Exemptions[0] != "192.168.1.150:8080" || got.Exemptions[1] != "10.0.0.0/24" {
+		t.Errorf("Exemptions = %v, want the two raw values in order", got.Exemptions)
+	}
+}
+
+// A config with NO exemptions is byte-compatible with a pre-exemption record:
+// omitempty means the `exemptions` key is absent, so existing markers/configs
+// still load and the field never appears when unused.
+func TestExemptionsOmittedWhenEmpty(t *testing.T) {
+	blob, err := sample().Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(blob), "exemptions") {
+		t.Errorf("marshaled config with no exemptions contains %q; want the key OMITTED (byte-compat)\n%s", "exemptions", blob)
 	}
 }
 

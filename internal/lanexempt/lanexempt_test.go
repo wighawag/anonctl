@@ -40,6 +40,28 @@ func TestParsePortOmittedMeansAllTCP(t *testing.T) {
 	}
 }
 
+// TestHostPortRendersProbeTarget proves the dialable host:port the verify probe
+// needs: an exemption with an explicit port renders that port; a port-omitted
+// (all-TCP) exemption falls back to the caller's default probe port (the probe
+// must pick ONE concrete non-53 TCP port to dial, since every non-53 port is
+// exempted).
+func TestHostPortRendersProbeTarget(t *testing.T) {
+	withPort, err := lanexempt.Parse("192.168.1.150:8080")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := withPort.HostPort(9999); got != "192.168.1.150:8080" {
+		t.Errorf("HostPort with explicit port = %q, want 192.168.1.150:8080", got)
+	}
+	omitted, err := lanexempt.Parse("192.168.1.150")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := omitted.HostPort(8080); got != "192.168.1.150:8080" {
+		t.Errorf("HostPort with omitted port = %q, want the default 192.168.1.150:8080", got)
+	}
+}
+
 // TestParseAcceptsEveryPrivateRange proves all four accepted ranges (the three
 // RFC1918 blocks + link-local) parse, mirroring netcage's --allow-direct guardrail
 // verbatim.
