@@ -39,6 +39,8 @@ import (
 	"fmt"
 	"net"
 	"strings"
+
+	"github.com/wighawag/anonctl/internal/lanexempt"
 )
 
 // Params is everything the generator needs to emit one account's ruleset. It is
@@ -69,6 +71,18 @@ type Params struct {
 	// the matching family so closure (b) is never silently v4-only.
 	EndpointHost string
 	EndpointPort int
+	// Exemptions are the narrow LAN exemptions: private-only, exact host:port (or
+	// whole-host / CIDR) destinations the anon UID may reach DIRECTLY over the real
+	// NIC instead of through the forced path. Each is already guardrail-validated by
+	// internal/lanexempt (RFC1918/link-local only, IP/CIDR not hostnames); Generate
+	// trusts that and emits, for the anon UID and before the redirect/drop, a nat
+	// `return` (so it is not redirected into the shim) and a filter `accept` (so the
+	// default-DROP does not drop it). Empty (the default) is byte-identical to the
+	// pre-exemption fail-closed ruleset: the hole is opt-in and never widens the
+	// forced egress. Because the default is already DROP-for-the-UID, a non-exempt
+	// LAN host is dropped by construction, so NO separate defense-in-depth RFC1918
+	// drop rules are needed (netcage's two-half TUN mechanism does not apply here).
+	Exemptions []lanexempt.Exempt
 }
 
 // TableName is the per-account nft table name (`anonctl_<account>`). nft
@@ -122,6 +136,15 @@ func Generate(p Params) (string, error) {
 	w("        meta skuid != %d return", p.AnonUID)
 	w("        ip daddr 127.0.0.1 tcp dport { %d, %d } return", p.RelayPort, p.DNSPort)
 	w("        ip daddr 127.0.0.1 udp dport %d return", p.DNSPort)
+	// LAN exemptions (enabler half): RETURN the anon UID's traffic to an exempted
+	// private destination so it is NOT redirected into the shim and egresses the
+	// real NIC directly. Emitted BEFORE the DNS and catch-all TCP redirects so the
+	// exempt packet is never swallowed by them (exact host:port, even :53, goes
+	// direct).
+	for _, e := range p.Exemptions {
+		w("        # LAN exemption (direct, not forced): %s", e.Raw)
+		w("        meta skuid %d %s return", p.AnonUID, exemptMatch(e))
+	}
 	w("        udp dport 53 redirect to :%d", p.DNSPort)
 	w("        tcp dport 53 redirect to :%d", p.DNSPort)
 	w("        meta l4proto tcp redirect to :%d", p.RelayPort)
@@ -141,6 +164,16 @@ func Generate(p Params) (string, error) {
 	// accepted), then closure (a) accept-own-shim-ports, then drop all other
 	// loopback + all IPv6 (leak-free), then policy DROP catches the rest.
 	w("        meta skuid %d %s daddr %s tcp dport %d drop", p.AnonUID, endpointFamily, p.EndpointHost, p.EndpointPort)
+	// LAN exemptions (narrowing half): ACCEPT the anon UID's traffic to an exempted
+	// private destination, before the fail-closed drops, so it leaves directly. It
+	// is scoped to EXACTLY the named daddr(+port): everything else (including the
+	// rest of that host's subnet) still hits the drops or the policy DROP, so the
+	// exemption cannot silently widen (story 25). No separate RFC1918 drop rules:
+	// the default-DROP gives netcage's defense-in-depth for free.
+	for _, e := range p.Exemptions {
+		w("        # LAN exemption (direct, not forced): %s", e.Raw)
+		w("        meta skuid %d %s accept", p.AnonUID, exemptMatch(e))
+	}
 	w("        meta skuid %d ip daddr 127.0.0.1 tcp dport { %d, %d } accept", p.AnonUID, p.RelayPort, p.DNSPort)
 	w("        meta skuid %d ip daddr 127.0.0.1 udp dport %d accept", p.AnonUID, p.DNSPort)
 	w("        meta skuid %d ip daddr 127.0.0.0/8 drop", p.AnonUID)
@@ -150,6 +183,37 @@ func Generate(p Params) (string, error) {
 	w("}")
 
 	return b.String(), nil
+}
+
+// exemptMatch builds the nft match clause for one exemption's destination,
+// SHARED by the nat `return` and the filter `accept` so the two halves can never
+// diverge (the enabler and the narrowing must target the exact same traffic). It
+// picks the ip/ip6 family from the exemption's address family, and either pins
+// the exact `tcp dport` or, for a port-omitted exemption, matches all TCP ports
+// (`meta l4proto tcp`). It never matches UDP (the forced path carries TCP; the
+// exemption is TCP-only by construction).
+func exemptMatch(e lanexempt.Exempt) string {
+	family := "ip6"
+	if e.IsV4() {
+		family = "ip"
+	}
+	if e.Port == 0 {
+		return fmt.Sprintf("%s daddr %s meta l4proto tcp", family, exemptDst(e.Network))
+	}
+	return fmt.Sprintf("%s daddr %s tcp dport %d", family, exemptDst(e.Network), e.Port)
+}
+
+// exemptDst renders an exemption's destination for nft: a host route (a /32 for
+// v4 or /128 for v6, the bare-IP case) is printed as the bare address (nft's own
+// idiom, and how the recipe writes single hosts), while a real subnet keeps its
+// CIDR. This is purely how the exact same destination is spelled; it never widens
+// the match.
+func exemptDst(n *net.IPNet) string {
+	ones, bits := n.Mask.Size()
+	if ones == bits {
+		return n.IP.String()
+	}
+	return n.String()
 }
 
 // validate rejects a Params that would produce a dangerous or nonsensical

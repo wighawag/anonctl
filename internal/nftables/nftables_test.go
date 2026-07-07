@@ -1,11 +1,24 @@
 package nftables_test
 
 import (
+	"net"
 	"strings"
 	"testing"
 
+	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anonctl/internal/nftables"
 )
+
+// mustExempt parses a LAN exemption for the tests (the guardrail is unit-tested
+// on its own in internal/lanexempt; here we only need a valid Exempt value).
+func mustExempt(t *testing.T, raw string) lanexempt.Exempt {
+	t.Helper()
+	e, err := lanexempt.Parse(raw)
+	if err != nil {
+		t.Fatalf("lanexempt.Parse(%q): %v", raw, err)
+	}
+	return e
+}
 
 // sampleParams mirrors the validated manual recipe
 // (work/notes/findings/manual-per-uid-tor-recipe.md): anon UID 30034, shim UID
@@ -184,6 +197,153 @@ func TestGenerateRejectsBadParams(t *testing.T) {
 				t.Errorf("expected Generate to reject %s, got nil error", name)
 			}
 		})
+	}
+}
+
+// TestGenerateNoExemptionsByDefault proves the exemption is OFF by default: with
+// no exemptions the ruleset is byte-identical to the pre-exemption ruleset (no
+// stray accept/return), so the narrow hole is opt-in and the empty case never
+// widens the forced egress.
+func TestGenerateNoExemptionsByDefault(t *testing.T) {
+	p := sampleParams()
+	p.Exemptions = nil
+	out, err := nftables.Generate(p)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// No exemption => no exemption accept/return lines at all.
+	if strings.Contains(out, "# LAN exemption") {
+		t.Errorf("expected no exemption lines with an empty Exemptions; got:\n%s", out)
+	}
+}
+
+// TestGenerateExemptHostReachableDirectly proves a configured exact RFC1918
+// host:port punches the narrow direct hole: (1) a nat `return` so the anon UID's
+// packet is NOT redirected into the shim (it egresses the real NIC), and (2) a
+// filter `accept` so the fail-closed default-DROP does not drop it. Both halves
+// are required (story 23).
+func TestGenerateExemptHostReachableDirectly(t *testing.T) {
+	p := sampleParams()
+	p.Exemptions = []lanexempt.Exempt{mustExempt(t, "192.168.1.150:8080")}
+	out, err := nftables.Generate(p)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// (1) nat_out: the exempt daddr+port is RETURNed (not redirected to the shim),
+	// for the anon UID, so it egresses the real NIC directly.
+	mustContain(t, out, "meta skuid 30034 ip daddr 192.168.1.150 tcp dport 8080 return")
+	// (2) filter_out: the exempt daddr+port is ACCEPTed for the anon UID, before the
+	// fail-closed drops.
+	mustContain(t, out, "meta skuid 30034 ip daddr 192.168.1.150 tcp dport 8080 accept")
+}
+
+// TestGenerateExemptPortOmittedAllowsAllTCP proves the port-omitted form (Port 0)
+// exempts ALL TCP ports on the host (no `tcp dport` clause), per the acceptance
+// criterion.
+func TestGenerateExemptPortOmittedAllowsAllTCP(t *testing.T) {
+	p := sampleParams()
+	p.Exemptions = []lanexempt.Exempt{mustExempt(t, "192.168.1.150")}
+	out, err := nftables.Generate(p)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// All TCP ports: matched by l4proto tcp with no dport, for both the nat return
+	// and the filter accept.
+	mustContain(t, out, "meta skuid 30034 ip daddr 192.168.1.150 meta l4proto tcp return")
+	mustContain(t, out, "meta skuid 30034 ip daddr 192.168.1.150 meta l4proto tcp accept")
+	// A port-omitted exemption must NOT pin a specific dport.
+	if strings.Contains(out, "daddr 192.168.1.150 tcp dport") {
+		t.Errorf("port-omitted exemption must not pin a dport; got:\n%s", out)
+	}
+	// A /32 host route is spelled as the bare address (nft idiom), not `.../32`.
+	if strings.Contains(out, "192.168.1.150/32") {
+		t.Errorf("a bare-IP exemption should render as the bare address, not /32; got:\n%s", out)
+	}
+}
+
+// TestGenerateExemptCIDRHost proves a CIDR exemption emits the network (not a
+// /32), so a user who exempts a small private subnet gets exactly that.
+func TestGenerateExemptCIDRHost(t *testing.T) {
+	p := sampleParams()
+	p.Exemptions = []lanexempt.Exempt{mustExempt(t, "192.168.5.0/24:8080")}
+	out, err := nftables.Generate(p)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	mustContain(t, out, "meta skuid 30034 ip daddr 192.168.5.0/24 tcp dport 8080 accept")
+	mustContain(t, out, "meta skuid 30034 ip daddr 192.168.5.0/24 tcp dport 8080 return")
+}
+
+// TestGenerateExemptV6UsesIP6Family proves Generate is family-aware: an IPv6
+// exemption emits ip6-family rules (never a v4-family rule for a v6 destination),
+// so the hole is punched in the right family. The guardrail (internal/lanexempt,
+// mirroring netcage verbatim) is v4-only and rejects a v6 value at config time, so
+// this constructs the Exempt directly (defense-in-depth: Generate stays correct if
+// a v6 exemption ever reaches it).
+func TestGenerateExemptV6UsesIP6Family(t *testing.T) {
+	p := sampleParams()
+	_, v6net, err := net.ParseCIDR("fe80::1/128")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+	p.Exemptions = []lanexempt.Exempt{{Network: v6net, Port: 8080, Raw: "fe80::1:8080"}}
+	out, err := nftables.Generate(p)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	mustContain(t, out, "meta skuid 30034 ip6 daddr fe80::1 tcp dport 8080 accept")
+	mustContain(t, out, "meta skuid 30034 ip6 daddr fe80::1 tcp dport 8080 return")
+}
+
+// TestGenerateExemptDoesNotWiden proves the exemption is scoped to EXACTLY the
+// named host: the rest of that host's /24 is NOT accepted, so the hole cannot
+// silently widen into a leak (story 25). The exemption emits a /32 host route for
+// a bare IP, and no broad private-range accept.
+func TestGenerateExemptDoesNotWiden(t *testing.T) {
+	p := sampleParams()
+	p.Exemptions = []lanexempt.Exempt{mustExempt(t, "192.168.1.150:8080")}
+	out, err := nftables.Generate(p)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// A sibling on the same /24 must NOT appear as an accept: the exemption is a /32.
+	if strings.Contains(out, "192.168.1.0/24") || strings.Contains(out, "192.168.1.151") {
+		t.Errorf("exemption must not widen beyond the exact host; got:\n%s", out)
+	}
+	// No broad RFC1918 accept: the fail-closed default-DROP gives that for free (the
+	// task forbids separate RFC1918 drop rules AND there must be no broad accept).
+	if strings.Contains(out, "192.168.0.0/16 accept") || strings.Contains(out, "10.0.0.0/8 accept") {
+		t.Errorf("exemption must not emit a broad private-range accept; got:\n%s", out)
+	}
+}
+
+// TestGenerateExemptOrderingBeforeDrops proves the exemption accept/return sit
+// BEFORE the anon-UID drops (and before the catch-all redirect), so the narrow
+// hole is not shadowed by a drop or swallowed by the redirect: a first-match
+// firewall is only as correct as its ordering.
+func TestGenerateExemptOrderingBeforeDrops(t *testing.T) {
+	p := sampleParams()
+	p.Exemptions = []lanexempt.Exempt{mustExempt(t, "192.168.1.150:8080")}
+	out, err := nftables.Generate(p)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	i := func(s string) int { return strings.Index(out, s) }
+
+	// nat_out: the exempt RETURN must precede the catch-all TCP redirect, else the
+	// packet is redirected into the shim before the return is reached.
+	exemptReturn := "meta skuid 30034 ip daddr 192.168.1.150 tcp dport 8080 return"
+	redirect := "meta l4proto tcp redirect to :19050"
+	if i(exemptReturn) < 0 || i(redirect) < 0 || i(exemptReturn) > i(redirect) {
+		t.Errorf("exempt nat return must precede the catch-all TCP redirect")
+	}
+
+	// filter_out: the exempt ACCEPT must precede the anon-UID loopback drop and the
+	// policy drop (which lives at the chain default, after every rule).
+	exemptAccept := "meta skuid 30034 ip daddr 192.168.1.150 tcp dport 8080 accept"
+	anonLoopbackDrop := "meta skuid 30034 ip daddr 127.0.0.0/8 drop"
+	if i(exemptAccept) < 0 || i(exemptAccept) > i(anonLoopbackDrop) {
+		t.Errorf("exempt filter accept must precede the anon-UID drops")
 	}
 }
 
