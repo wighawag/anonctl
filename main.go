@@ -18,11 +18,15 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 
 	"github.com/wighawag/anonctl/internal/cli"
+	"github.com/wighawag/anonctl/internal/endpoint"
 	"github.com/wighawag/anonctl/internal/provision"
+	"github.com/wighawag/anonctl/internal/verify"
 )
 
 func main() {
@@ -58,9 +62,11 @@ func run(args []string) int {
 		return runList(ctx, runner, cmd)
 	case "status":
 		return runStatus(ctx, runner, cmd)
-	case "verify", "update", "reconfigure":
+	case "verify":
+		return runVerify(ctx, runner, cmd)
+	case "update", "reconfigure":
 		// Stubs: the verb DISPATCHES (the surface is end-to-end) but the behaviour
-		// is filled by later tasks (nftables/persistence/verify). Fail loud so it is
+		// is filled by later tasks (persistence/reconfigure). Fail loud so it is
 		// never mistaken for a silent success.
 		fmt.Fprintf(os.Stderr, "anonctl: %s is not implemented yet (a later task fills it)\n", cmd.Verb)
 		return 3
@@ -153,6 +159,61 @@ func runStatus(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	return 0
 }
 
+// runVerify is the trust anchor (story 15-18, 25): it PROVES the account is
+// anonymized rather than assuming it, running the named assertion set with NO
+// short-circuit, printing each result, and exiting NON-ZERO on any failure (the
+// CI-gating contract). `--json` emits the versioned machine report (the contract
+// others may consume) on stdout; the human form goes to stdout too so a plain
+// `verify` reads clearly. The live probes need root + a live host and are compiled
+// only under the `integration` build tag; the DEFAULT binary's verify therefore
+// fails-closed (it cannot PROVE anonymization, so it must not exit 0).
+//
+// It reads the account's UIDs from the box (the same read-only truth `status`
+// uses). The endpoint host:port/relay/DNS ports come from the persisted account
+// config once the persistence task lands; until then verify passes the account's
+// default endpoint for the report header and the discovered UIDs, which is enough
+// for the default build's fail-closed report and for the integration harness,
+// which supplies the live params directly.
+func runVerify(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
+	st, err := provision.Status(ctx, r, cmd.Account)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "anonctl: verify: %v\n", err)
+		return 1
+	}
+	ep := endpoint.Default()
+	p := verify.LiveParams{
+		Account:      cmd.Account,
+		Endpoint:     ep.URL(),
+		Class:        ep.Class,
+		AnonUID:      atoiOr(st.UID, 0),
+		ShimUID:      atoiOr(st.ShimUID, 0),
+		EndpointHost: ep.Host,
+		EndpointPort: atoiOr(ep.Port, 0),
+	}
+	rep := verify.RunVerify(ctx, p)
+	if cmd.JSON {
+		blob, jerr := rep.JSON()
+		if jerr != nil {
+			fmt.Fprintf(os.Stderr, "anonctl: verify: %v\n", jerr)
+			return 1
+		}
+		os.Stdout.Write(append(blob, '\n'))
+	} else {
+		fmt.Print(rep.Human())
+	}
+	return rep.ExitCode()
+}
+
+// atoiOr parses s as an int, returning def on any error (an empty/absent UID for a
+// not-yet-provisioned account maps to the default rather than aborting: verify
+// still runs its assertions and reports the fail-closed verdict).
+func atoiOr(s string, def int) int {
+	if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
+		return n
+	}
+	return def
+}
+
 // emitJSON writes v as indented JSON to stdout (the machine-readable channel), so
 // a caller can capture it cleanly. Diagnostics stay on stderr.
 func emitJSON(v any) int {
@@ -171,7 +232,7 @@ const usage = `usage:
                                      remove forcing; --purge-account also deletes the account (root)
   anonctl list   [--json]           list the anon accounts that exist on the box
   anonctl status [<name>] [--json]  show one account's state (machine-readable with --json)
-  anonctl verify [<name>]           (later task) prove the account is anonymized
+  anonctl verify [<name>] [--json]  prove the account is anonymized (named assertions, non-zero exit on failure)
   anonctl update|reconfigure [<name>]
                                      (later task) change an account's endpoint, re-apply fail-closed
   anonctl --version | version       print the anonctl version

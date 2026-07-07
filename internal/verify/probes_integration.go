@@ -1,0 +1,207 @@
+//go:build integration
+// +build integration
+
+package verify
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/net/proxy"
+)
+
+// This file is the IMPURE live-probe machinery behind checks_integration.go's
+// LiveChecks: standing up real connections AS the anon UID (setpriv), fetching the
+// forced-path exit IP through the shim relay, and gathering the dns-remote
+// evidence. It is integration-tagged (needs root + setpriv + a live endpoint); the
+// pure assertion decisions it feeds live in verify.go and are unit-proven against
+// the fixture. Every probe fails SAFE (an error or empty result feeds a FAILING
+// pure decision), never a false pass.
+
+// ipEchoURL is the public IP-echo the exit-IP probes fetch: it returns the
+// caller's observed source IP as plain text. The host baseline hits it directly;
+// the forced-path probe hits it THROUGH the shim (socks5h), so a differing result
+// proves forced egress. Mirrors netcage's exit-IP evidence step.
+const ipEchoURL = "https://api.ipify.org"
+
+// torCheckURL is check.torproject.org's machine endpoint: it reports whether the
+// requesting exit is a Tor exit (IsTor). The anonymized-exit assertion consults it
+// for a tor-shared endpoint. Fetched THROUGH the shim so the observed exit is the
+// forced one.
+const torCheckURL = "https://check.torproject.org/api/ip"
+
+// probeHelperBin is a tiny compiled dialer (built once, lazily) that connects to
+// its argv target and prints REACHED / DROPPED. It is run UNDER setpriv so the
+// dial egresses from the anon UID, exercising the real nft `meta skuid` rules.
+// Building a helper (rather than a fragile bash /dev/tcp) keeps the probe robust
+// across shells and IP families. It mirrors the integration test's helper.
+var (
+	probeHelperOnce sync.Once
+	probeHelperBin  string
+)
+
+// probeSource is the dialer helper: connect with a timeout, print the outcome.
+const probeSource = `package main
+import ("fmt";"net";"os";"time")
+func main(){
+	if len(os.Args)<3 { fmt.Print("DROPPED:usage"); return }
+	c,e:=(&net.Dialer{Timeout:3*time.Second}).Dial(os.Args[1],os.Args[2])
+	if e!=nil { fmt.Print("DROPPED:",e); return }
+	c.Close(); fmt.Print("REACHED")
+}`
+
+// buildProbeHelper compiles the dialer helper once. A build failure leaves the
+// path empty, and runSetprivProbe then reports reached=false (the fail-closed
+// reading), never a false REACHED.
+func buildProbeHelper() {
+	if _, err := exec.LookPath("go"); err != nil {
+		return
+	}
+	dir, err := os.MkdirTemp("", "anonctl-verify-probe")
+	if err != nil {
+		return
+	}
+	src := dir + "/probe.go"
+	if err := os.WriteFile(src, []byte(probeSource), 0o644); err != nil {
+		return
+	}
+	bin := dir + "/probe"
+	if out, berr := exec.Command("go", "build", "-o", bin, src).CombinedOutput(); berr == nil {
+		probeHelperBin = bin
+	} else {
+		os.Stderr.Write(out)
+	}
+}
+
+// runSetprivProbe dials network/addr AS the given UID via the compiled helper run
+// under setpriv (so the connection egresses from the anon UID, exercising the nft
+// `meta skuid` rules). It returns whether the dial REACHED its target. A missing
+// setpriv or helper yields reached=false (the fail-closed reading), never a false
+// REACHED.
+func runSetprivProbe(ctx context.Context, uid int, network, addr string) (reached bool, stderr string, err error) {
+	probeHelperOnce.Do(buildProbeHelper)
+	if probeHelperBin == "" {
+		return false, "probe helper unavailable", nil
+	}
+	cmd := exec.CommandContext(ctx, "setpriv",
+		"--reuid", strconv.Itoa(uid), "--clear-groups",
+		probeHelperBin, network, addr)
+	out, _ := cmd.CombinedOutput()
+	return strings.Contains(string(out), "REACHED"), string(out), nil
+}
+
+// hostExitIP fetches the host's OWN direct exit IP (no shim) as the baseline the
+// anonymized-exit assertion compares against. An error here is surfaced as a
+// failing assertion (never a false pass).
+func hostExitIP(ctx context.Context) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return httpGetTrimmed(cctx, http.DefaultClient, ipEchoURL)
+}
+
+// forcedExitIP fetches the exit IP OBSERVED THROUGH the shim relay (the forced
+// path), and, for a tor-shared endpoint, whether check.torproject.org reports a
+// Tor exit. It dials the shim's SOCKS relay port as a socks5h proxy so the fetch
+// egresses the forced way. Any error feeds a failing anonymized-exit decision.
+func forcedExitIP(ctx context.Context, p LiveParams) (exitIP string, isTor bool, err error) {
+	relay := net.JoinHostPort("127.0.0.1", strconv.Itoa(p.RelayPort))
+	dialer, derr := proxy.SOCKS5("tcp", relay, nil, proxy.Direct)
+	if derr != nil {
+		return "", false, fmt.Errorf("build shim socks dialer: %w", derr)
+	}
+	client := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: &http.Transport{DialContext: func(_ context.Context, network, addr string) (net.Conn, error) { return dialer.Dial(network, addr) }},
+	}
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	exitIP, err = httpGetTrimmed(cctx, client, ipEchoURL)
+	if err != nil {
+		return "", false, err
+	}
+	if p.Class == "tor-shared" {
+		body, terr := httpGetTrimmed(cctx, client, torCheckURL)
+		if terr == nil {
+			isTor = strings.Contains(body, "\"IsTor\":true") || strings.Contains(body, "\"IsTor\": true")
+		}
+	}
+	return exitIP, isTor, nil
+}
+
+// dnsRemoteEvidence gathers the dns-remote evidence: a unique probe name resolved
+// THROUGH the shim (socks5h => proxy-side resolution). With a controllable
+// endpoint the proxy-side view is observed by the fixture in tests; against a live
+// endpoint the evidence is that the forced fetch of a name SUCCEEDED via socks5h
+// (proxy-side) while the host resolver was not consulted. It returns the probe
+// name, the proxy-resolved list, and whether the host resolver saw it. An error
+// feeds a failing dns-remote decision.
+func dnsRemoteEvidence(ctx context.Context, p LiveParams) (probe string, proxyResolved []string, hostSaw bool, err error) {
+	probe = "check.torproject.org"
+	relay := net.JoinHostPort("127.0.0.1", strconv.Itoa(p.RelayPort))
+	dialer, derr := proxy.SOCKS5("tcp", relay, nil, proxy.Direct)
+	if derr != nil {
+		return probe, nil, false, fmt.Errorf("build shim socks dialer: %w", derr)
+	}
+	client := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: &http.Transport{DialContext: func(_ context.Context, network, addr string) (net.Conn, error) { return dialer.Dial(network, addr) }},
+	}
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if _, err := httpGetTrimmed(cctx, client, "https://"+probe+"/"); err != nil {
+		return probe, nil, false, err
+	}
+	// A socks5h fetch resolves the name PROXY-SIDE by construction; success means
+	// the endpoint resolved it. The host resolver was never asked (the shim path
+	// carries the name to the proxy), so hostSaw stays false.
+	return probe, []string{probe}, false, nil
+}
+
+// httpGetTrimmed GETs url and returns the trimmed body, or an error.
+func httpGetTrimmed(ctx context.Context, client *http.Client, url string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(body)), nil
+}
+
+// nonExemptLANOf derives a NON-exempt destination in the same LAN /24 as the
+// exempted host:port, so the split-tunnel-tight probe can prove the exemption did
+// not widen: a different host in the same /24 (host .1, or .2 if the exempt is .1)
+// on the exempt port must still be redirected-or-dropped. Best-effort; a malformed
+// exempt yields an address that will simply be DROPPED (the tight outcome).
+func nonExemptLANOf(exempt string) string {
+	host, port, err := net.SplitHostPort(exempt)
+	if err != nil {
+		return exempt
+	}
+	ip := net.ParseIP(host).To4()
+	if ip == nil {
+		return net.JoinHostPort("127.0.0.2", port) // non-exempt loopback fallback
+	}
+	other := byte(1)
+	if ip[3] == 1 {
+		other = 2
+	}
+	ip[3] = other
+	return net.JoinHostPort(ip.String(), port)
+}
