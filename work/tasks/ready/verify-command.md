@@ -2,7 +2,7 @@
 title: The verify command (named assertions, non-zero exit, --json), the trust anchor
 slug: verify-command
 prd: per-uid-kernel-anonymized-egress
-blockedBy: [nftables-ruleset-install]
+blockedBy: [nftables-ruleset-install, lan-exemption]
 covers: [15, 16, 17, 18, 25]
 ---
 
@@ -32,6 +32,7 @@ Signature ongoing verb: it is meant to be re-run after setup, after a reboot, an
 ## Blocked by
 
 - `nftables-ruleset-install`: verify proves what the ruleset installed (the leak test and bypass-closure assertions test that ruleset's behaviour).
+- `lan-exemption`: story 25's split-tunnel-tight assertion needs a real LAN exemption in place to exercise (exempted host reachable, everything else still redirected-or-dropped).
 
 ## Prompt
 

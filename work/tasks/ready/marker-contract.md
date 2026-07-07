@@ -2,7 +2,7 @@
 title: The /etc/anonctl/<account>.json marker (double-anonymization contract) written after verify passes
 slug: marker-contract
 prd: per-uid-kernel-anonymized-egress
-blockedBy: [account-provisioning-and-cli-skeleton, verify-command]
+blockedBy: [account-provisioning-and-cli-skeleton, endpoint-classification-and-config, verify-command]
 covers: [20, 28, 29]
 ---
 
@@ -26,6 +26,7 @@ The marker file that sibling tools (anon-pi, netcage) read to detect "this accou
 ## Blocked by
 
 - `account-provisioning-and-cli-skeleton`: the account + uid the marker records, and the `status` reader.
+- `endpoint-classification-and-config`: defines the `endpointClass` (`tor-shared` | `socks-peruser`) values the marker serializes.
 - `verify-command`: the marker is written only after verify passes (the write is gated on verify success).
 
 ## Prompt
