@@ -1,0 +1,7 @@
+{
+	"verify": "test -z \"$(gofmt -l .)\" && go vet ./... && go build ./... && go test ./...",
+	"harness": "pi",
+	"autoBuild": false,
+	"autoTask": false,
+	"promptGuidance": {"testFirst": true}
+}
