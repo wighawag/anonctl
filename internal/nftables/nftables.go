@@ -1,0 +1,187 @@
+// Package nftables is the KERNEL half of anonctl's per-UID forced anonymized
+// egress: it GENERATES (pure) and APPLIES (as root, the ufw stance) the
+// fail-closed `inet` nftables ruleset that redirects an anon account's egress
+// into its per-account shim and default-DROPs everything else for that UID. It
+// encodes the hand-validated recipe verbatim
+// (work/notes/findings/manual-per-uid-tor-recipe.md), parameterised by the
+// account's UID, its dedicated shim UID, its shim loopback ports, and its
+// endpoint; it does NOT invent a fresh ruleset.
+//
+// The split mirrors provision's Runner seam: Generate is pure text (unit-tested
+// everywhere, no root) and Apply/Delete flow every mutation through a Runner so
+// the wiring is unit-testable against a fake and the real `nft` shell-out lives
+// in ONE place, behind the `integration` build tag for the tests that touch a
+// real ruleset.
+//
+// The security shape (all from the recipe, all load-bearing):
+//
+//   - ONE `inet` table so IPv4 and IPv6 share a single ruleset: the
+//     v4-rules-while-v6-leaks trap is closed by construction.
+//   - a nat/output chain (priority dstnat, so it runs BEFORE filter) that, for the
+//     anon UID only, redirects DNS (udp+tcp 53) to the shim DNS port and all other
+//     TCP to the shim relay port; a REDIRECTed packet re-enters the filter hook
+//     with its dst already rewritten to the shim port, so the filter accepts match
+//     the SHIM ports, not the original destination.
+//   - a filter/output chain with policy DROP (fail-closed) that governs ONLY the
+//     anon + shim UIDs and enforces the two bypass closures:
+//     (a) the anon UID reaches ONLY its own shim ports; all other loopback
+//     (127.0.0.0/8 and ::1) and all IPv6 is dropped (never leaked);
+//     (b) ONLY the shim UID may reach the upstream endpoint; the anon UID's dial of
+//     the endpoint is dropped so it can never skip the shim or its `<account>@`
+//     isolation username.
+//
+// The table is named per-account (`anonctl_<account>`) so two accounts never
+// clobber each other's ruleset and Delete removes exactly one account's table,
+// leaving the rest of the host's nftables untouched (ADR 0002).
+package nftables
+
+import (
+	"fmt"
+	"net"
+	"strings"
+)
+
+// Params is everything the generator needs to emit one account's ruleset. It is
+// the "given UID/ports/endpoint" input the task's acceptance names: the anon UID
+// (from provisioning), the dedicated shim UID (from provisioning), the shim's
+// per-account relay + DNS loopback ports (from the shim binary), and the upstream
+// endpoint host:port (from the endpoint model). anonctl resolves the account/shim
+// NAMES to these numeric UIDs and emits the numbers, exactly as the recipe notes
+// `meta skuid` matches by numeric UID.
+type Params struct {
+	// Account is the anon login account name; it names the per-account table
+	// (`anonctl_<account>`) so accounts never share a table.
+	Account string
+	// AnonUID is the login account's numeric UID (the UID whose egress is forced).
+	AnonUID int
+	// ShimUID is the dedicated shim service account's numeric UID (the ONLY UID
+	// allowed to reach the endpoint).
+	ShimUID int
+	// RelayPort is the shim's transparent TCP relay loopback port (all other TCP is
+	// redirected here).
+	RelayPort int
+	// DNSPort is the shim's DNS-over-SOCKS-TCP loopback port (DNS is redirected
+	// here).
+	DNSPort int
+	// EndpointHost/EndpointPort is the upstream socks5h endpoint (e.g. the Tor
+	// SocksPort). Only the shim UID may reach it; the anon UID's dial of it is
+	// dropped (closure b). The host may be v4 or v6; the emitted closure rules use
+	// the matching family so closure (b) is never silently v4-only.
+	EndpointHost string
+	EndpointPort int
+}
+
+// TableName is the per-account nft table name (`anonctl_<account>`). nft
+// identifiers cannot contain '-', so a named account's '-' becomes '_'
+// (`anon-work` -> `anonctl_anon_work`); this only names the table, never the Unix
+// account.
+func TableName(account string) string {
+	return "anonctl_" + strings.ReplaceAll(account, "-", "_")
+}
+
+// Generate produces the fail-closed `inet` nftables ruleset text for one account,
+// ready to feed to `nft -f -`. It is pure (no root, no I/O) so it is unit-tested
+// everywhere. It validates its inputs and refuses a nonsensical Params (a zero
+// UID/port, equal UIDs, or an unparseable endpoint host) rather than emit a
+// ruleset that would silently mis-force or lock out the account.
+//
+// The emitted ruleset is self-contained and idempotent: it create-if-absent then
+// DELETEs the account's own table, then defines it fresh, so a re-Apply is a
+// clean atomic replace (never an append of stale rules) and it touches no other
+// table on the host.
+func Generate(p Params) (string, error) {
+	if err := p.validate(); err != nil {
+		return "", err
+	}
+	table := TableName(p.Account)
+
+	// Endpoint closure (b) must match the endpoint's actual address family so it is
+	// not silently v4-only for a v6 endpoint.
+	endpointFamily := "ip"
+	if ip := net.ParseIP(p.EndpointHost); ip != nil && ip.To4() == nil {
+		endpointFamily = "ip6"
+	}
+
+	var b strings.Builder
+	w := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
+
+	w("# anonctl per-UID forced anonymized egress for account %q - inet table (IPv4 + IPv6), fail-closed.", p.Account)
+	w("# Generated from the validated recipe (work/notes/findings/manual-per-uid-tor-recipe.md).")
+	w("# Governs ONLY uid %d (anon) and uid %d (shim); every other uid is untouched.", p.AnonUID, p.ShimUID)
+	// Create-if-absent then delete makes the -f load atomic and idempotent: a
+	// re-Apply cleanly REPLACES this account's table and never touches another.
+	w("table inet %s {}", table)
+	w("delete table inet %s", table)
+	w("table inet %s {", table)
+
+	// nat/output (priority dstnat = -100, runs BEFORE filter): rewrite only the
+	// anon UID; leave its own shim ports as-is; DNS -> shim DNS port; all other TCP
+	// -> shim relay port.
+	w("    chain nat_out {")
+	w("        type nat hook output priority dstnat; policy accept;")
+	w("        meta skuid != %d return", p.AnonUID)
+	w("        ip daddr 127.0.0.1 tcp dport { %d, %d } return", p.RelayPort, p.DNSPort)
+	w("        ip daddr 127.0.0.1 udp dport %d return", p.DNSPort)
+	w("        udp dport 53 redirect to :%d", p.DNSPort)
+	w("        tcp dport 53 redirect to :%d", p.DNSPort)
+	w("        meta l4proto tcp redirect to :%d", p.RelayPort)
+	w("    }")
+
+	// filter/output (policy DROP = fail-closed): governs only anon + shim UIDs.
+	w("    chain filter_out {")
+	w("        type filter hook output priority filter; policy drop;")
+	w("        meta skuid != %d meta skuid != %d accept", p.AnonUID, p.ShimUID)
+	w("")
+	// SHIM UID: the ONLY UID allowed to reach the endpoint, then the world.
+	w("        meta skuid %d %s daddr %s tcp dport %d accept", p.ShimUID, endpointFamily, p.EndpointHost, p.EndpointPort)
+	w("        meta skuid %d oifname \"lo\" accept", p.ShimUID)
+	w("        meta skuid %d accept", p.ShimUID)
+	w("")
+	// ANON UID: closure (b) DROP first (so a 9050-style dial can never be
+	// accepted), then closure (a) accept-own-shim-ports, then drop all other
+	// loopback + all IPv6 (leak-free), then policy DROP catches the rest.
+	w("        meta skuid %d %s daddr %s tcp dport %d drop", p.AnonUID, endpointFamily, p.EndpointHost, p.EndpointPort)
+	w("        meta skuid %d ip daddr 127.0.0.1 tcp dport { %d, %d } accept", p.AnonUID, p.RelayPort, p.DNSPort)
+	w("        meta skuid %d ip daddr 127.0.0.1 udp dport %d accept", p.AnonUID, p.DNSPort)
+	w("        meta skuid %d ip daddr 127.0.0.0/8 drop", p.AnonUID)
+	w("        meta skuid %d ip6 daddr ::1 drop", p.AnonUID)
+	w("        meta skuid %d ip6 daddr ::/0 drop", p.AnonUID)
+	w("    }")
+	w("}")
+
+	return b.String(), nil
+}
+
+// validate rejects a Params that would produce a dangerous or nonsensical
+// ruleset: a zero UID (uid 0 is root, never a forced anon account), equal
+// anon/shim UIDs (closure b collapses), a zero port, an empty account, or an
+// endpoint host that is neither an IP literal. It fails LOUD rather than emit a
+// ruleset that silently mis-forces or locks out the account (this is the
+// highest-stakes code path).
+func (p Params) validate() error {
+	switch {
+	case p.Account == "":
+		return fmt.Errorf("nftables: empty account")
+	case p.AnonUID <= 0:
+		return fmt.Errorf("nftables: anon uid must be > 0 (got %d)", p.AnonUID)
+	case p.ShimUID <= 0:
+		return fmt.Errorf("nftables: shim uid must be > 0 (got %d)", p.ShimUID)
+	case p.AnonUID == p.ShimUID:
+		return fmt.Errorf("nftables: anon uid and shim uid must differ (both %d): bypass closure (b) requires a distinct shim UID", p.AnonUID)
+	case p.RelayPort <= 0 || p.RelayPort > 65535:
+		return fmt.Errorf("nftables: relay port out of range (got %d)", p.RelayPort)
+	case p.DNSPort <= 0 || p.DNSPort > 65535:
+		return fmt.Errorf("nftables: dns port out of range (got %d)", p.DNSPort)
+	case p.EndpointHost == "":
+		return fmt.Errorf("nftables: empty endpoint host")
+	case p.EndpointPort <= 0 || p.EndpointPort > 65535:
+		return fmt.Errorf("nftables: endpoint port out of range (got %d)", p.EndpointPort)
+	}
+	if net.ParseIP(p.EndpointHost) == nil {
+		// The closure (b) rule needs a literal IP to pick the ip/ip6 family and to
+		// match exactly; a hostname would be ambiguous (and a DNS lookup in a
+		// firewall rule is itself a leak vector).
+		return fmt.Errorf("nftables: endpoint host %q must be an IP literal (v4 or v6), not a hostname", p.EndpointHost)
+	}
+	return nil
+}
