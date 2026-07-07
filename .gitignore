@@ -1,0 +1,5 @@
+# compiled binary (matches the module/dir name, produced by `go build ./...`)
+/anonctl
+
+# goreleaser build output
+/dist/
