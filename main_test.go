@@ -1,6 +1,12 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/wighawag/anonctl/internal/accountconfig"
+	"github.com/wighawag/anonctl/internal/endpoint"
+	"github.com/wighawag/anonctl/internal/provision"
+)
 
 // The version fast-path exits 0 before any parse (no verb, no root needed).
 func TestVersionArg(t *testing.T) {
@@ -54,6 +60,57 @@ func TestVerifyDispatchesAndExitsNonZeroInDefaultBuild(t *testing.T) {
 	}
 	if code == 3 {
 		t.Errorf("run(verify) = 3 (not-implemented stub); the verb must be implemented")
+	}
+}
+
+// verifyParams READS the persisted exemption back into verify.LiveParams.Exempt,
+// so the split-tunnel-tight + lan-exemption-not-a-dns-hole assertions fire live
+// for an exempted account (they run only when Exempt != ""). A port-omitted
+// exemption renders a dialable host:port (the split-tunnel probe needs a concrete
+// port); an account with NO exemptions yields an empty Exempt (the assertions are
+// cleanly skipped, as today).
+func TestVerifyParamsPopulatesExemptFromConfig(t *testing.T) {
+	store := accountconfig.Store{BaseDir: t.TempDir()}
+	cfg := accountconfig.Config{
+		Account:       "anon",
+		AnonUID:       30034,
+		ShimUID:       995,
+		EndpointHost:  "127.0.0.1",
+		EndpointPort:  9050,
+		EndpointClass: endpoint.ClassTorShared,
+		Exemptions:    []string{"192.168.1.150:8080"},
+	}
+	if err := store.Write(cfg); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	st := provision.AccountStatus{Account: "anon", UID: "30034", ShimUID: "995"}
+	p := verifyParams(store, "anon", st)
+	if p.Exempt != "192.168.1.150:8080" {
+		t.Errorf("Exempt = %q, want 192.168.1.150:8080 (read back from the persisted config)", p.Exempt)
+	}
+
+	// A port-omitted (all-TCP) exemption still yields a concrete dialable host:port.
+	cfg.Exemptions = []string{"192.168.1.150"}
+	if err := store.Write(cfg); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	p = verifyParams(store, "anon", st)
+	if p.Exempt == "" {
+		t.Errorf("port-omitted exemption yielded empty Exempt; want a concrete host:port so the probe can dial")
+	}
+
+	// No exemptions => empty Exempt => the two assertions are cleanly skipped.
+	cfg.Exemptions = nil
+	if err := store.Write(cfg); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if p := verifyParams(store, "anon", st); p.Exempt != "" {
+		t.Errorf("Exempt = %q for an account with no exemptions, want empty", p.Exempt)
+	}
+
+	// An account with NO persisted config at all (never forced) yields empty Exempt.
+	if p := verifyParams(store, "anon-absent", st); p.Exempt != "" {
+		t.Errorf("Exempt = %q for an unconfigured account, want empty", p.Exempt)
 	}
 }
 

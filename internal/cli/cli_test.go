@@ -171,6 +171,55 @@ func TestEndpointFlag(t *testing.T) {
 	}
 }
 
+// The forcing verbs accept a repeatable `--allow-direct` (netcage's vocabulary):
+// each value is parsed+validated through lanexempt.Parse at the CLI boundary and
+// collected onto cmd.Exemptions, in both the `=value` and the space forms. A
+// public/hostname/:53 value is rejected LOUDLY here (the fail-loud config gate),
+// and the flag must not swallow the account name.
+func TestAllowDirectFlag(t *testing.T) {
+	cmd, err := cli.Parse([]string{"add", "--allow-direct", "192.168.1.150:8080", "--allow-direct=10.0.0.0/24", "work"})
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if cmd.Account != "anon-work" {
+		t.Errorf("account = %q, want anon-work (--allow-direct value must not swallow the name)", cmd.Account)
+	}
+	if len(cmd.Exemptions) != 2 {
+		t.Fatalf("Exemptions = %d, want 2 (repeatable flag)", len(cmd.Exemptions))
+	}
+	if cmd.Exemptions[0].Raw != "192.168.1.150:8080" || cmd.Exemptions[1].Raw != "10.0.0.0/24" {
+		t.Errorf("Exemptions raw = %q/%q, want the two values in order", cmd.Exemptions[0].Raw, cmd.Exemptions[1].Raw)
+	}
+
+	bare, err := cli.Parse([]string{"add"})
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if len(bare.Exemptions) != 0 {
+		t.Errorf("bare add Exemptions = %d, want 0 (no exemption unless asked)", len(bare.Exemptions))
+	}
+
+	if _, err := cli.Parse([]string{"add", "--allow-direct"}); err == nil {
+		t.Error("dangling --allow-direct (no value) must be a parse error")
+	}
+}
+
+// The guardrail is surfaced at the CLI boundary: a public address, a hostname, and
+// the un-exemptable clear-DNS port 53 are each rejected LOUDLY by Parse (via
+// lanexempt.Parse), so an operator cannot punch an anonymity leak from the CLI.
+func TestAllowDirectRejectsUnsafeValues(t *testing.T) {
+	for _, bad := range []string{
+		"8.8.8.8:443",      // public address
+		"router.local:80",  // hostname
+		"192.168.1.150:53", // un-exemptable clear-DNS port
+		"10.0.0.0/7",       // too-wide prefix straddling public space
+	} {
+		if _, err := cli.Parse([]string{"add", "--allow-direct", bad}); err == nil {
+			t.Errorf("Parse(--allow-direct %q) = nil error, want a loud reject", bad)
+		}
+	}
+}
+
 // `status` and `list` accept `--json` for machine-readable output; the other
 // verbs need not.
 func TestJSONFlag(t *testing.T) {

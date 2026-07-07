@@ -100,6 +100,15 @@ type Config struct {
 	// RelayPort / DNSPort are the shim's per-account loopback ports.
 	RelayPort int `json:"relayPort"`
 	DNSPort   int `json:"dnsPort"`
+	// Exemptions are the account's LAN exemptions in their RAW `IP|CIDR[:port]`
+	// form (as validated by lanexempt.Parse at config time): the private-only,
+	// host+port-scoped direct holes the anon UID may reach around the forced path.
+	// They are credential-free by construction (just addresses, no secret), so they
+	// live at rest alongside the endpoint. Stored raw so the SAME string reaches the
+	// nft generator (re-parsed) and verify without a lossy round-trip. omitempty:
+	// an account with no exemptions writes no `exemptions` key, so pre-exemption
+	// records stay byte-compatible and still load.
+	Exemptions []string `json:"exemptions,omitempty"`
 }
 
 // Endpoint reconstructs the endpoint.Endpoint from the stored fields, so callers
