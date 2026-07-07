@@ -1,0 +1,351 @@
+// Package verify is anonctl's trust anchor and signature ONGOING verb: it PROVES
+// an anon account is anonymized rather than assuming it, and it is meant to be
+// re-run after setup, after a reboot, and after any Tor/kernel/nftables change.
+// It mirrors netcage's internal/verify: named assertions, run-EVERY-check (no
+// short-circuit) so the report is complete, a non-zero process exit on ANY
+// failure (the CI-gating contract), and a `--json` machine shape others may
+// consume.
+//
+// The assertions it makes (each named, each a separate line/JSON entry):
+//
+//   - anonymized-exit: the account's exit IP DIFFERS from the host's; for a
+//     tor-shared endpoint it is additionally a Tor exit (check.torproject.org).
+//   - dns-remote: DNS resolves REMOTELY via the endpoint (the proxy saw the
+//     lookup), never locally / in plaintext (the host resolver did NOT see it).
+//   - leak-drop-v4 / leak-drop-v6 (LOAD-BEARING): a direct, non-anonymized
+//     connection from the anon UID is actually DROPPED, on IPv4 AND IPv6. This is
+//     the fail-closed proof: fail-closed is DEMONSTRATED, not assumed.
+//   - bypass-loopback-closure: the anon UID reaching any loopback destination
+//     other than its own shim port is DROPPED (recipe closure a).
+//   - bypass-endpoint-closure: the anon UID dialling the upstream endpoint
+//     directly is DROPPED (recipe closure b) so it can never skip the shim or its
+//     `<account>@` isolation username.
+//   - split-tunnel-tight (with a LAN exemption active): the exempted host:port is
+//     reachable directly, but the rest of that /24, other loopback, and everything
+//     else stay redirected-or-dropped.
+//
+// The DESIGN split mirrors the rest of the repo (provision's Runner seam,
+// nftables' Generate-vs-Apply): this file is the PURE assertion/render/exit
+// logic (Report, Assertion, Run, the per-assertion decision functions), unit-
+// tested EVERYWHERE against internal/socks5hfixture with NO real Tor; the LIVE
+// checks that stand up real probes as the anon UID against a real ruleset live in
+// verify_integration.go behind the `integration` build tag (they need root + a
+// live endpoint). The assertion NAMES and the JSON SHAPE are a deliberate
+// contract (ADR 0003); the checks feed the pure decisions here so the verdict
+// logic is proven without privilege.
+package verify
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/wighawag/anonctl/internal/endpoint"
+)
+
+// SchemaVersion is the version of the `--json` report CONTRACT. It evolves
+// ADDITIVELY only (new optional fields), so a consumer pinned to this version
+// keeps working; a breaking change bumps it. It is emitted as `schemaVersion` so
+// a machine consumer can guard on the shape it understands. It mirrors
+// detect-proxy's SchemaVersion discipline.
+const SchemaVersion = 1
+
+// Assertion names. They are the STABLE public identifiers a machine consumer or a
+// CI gate keys on, so they are declared once here (never spelled inline) and are
+// part of the JSON contract (ADR 0003). kebab-case mirrors netcage's assertion
+// names (e.g. `forced-egress-exit-ip-differs-from-host`).
+const (
+	// AssertAnonymizedExit: the exit IP differs from the host's (and is a Tor exit
+	// for a tor-shared endpoint).
+	AssertAnonymizedExit = "anonymized-exit"
+	// AssertDNSRemote: DNS resolves remotely via the endpoint, not locally.
+	AssertDNSRemote = "dns-remote"
+	// AssertLeakDropV4 / AssertLeakDropV6: a direct connection from the anon UID is
+	// DROPPED on IPv4 / IPv6 (the load-bearing fail-closed proof).
+	AssertLeakDropV4 = "leak-drop-v4"
+	AssertLeakDropV6 = "leak-drop-v6"
+	// AssertBypassLoopbackClosure: the anon UID reaching non-shim loopback is
+	// DROPPED (recipe closure a).
+	AssertBypassLoopbackClosure = "bypass-loopback-closure"
+	// AssertBypassEndpointClosure: the anon UID dialling the endpoint directly is
+	// DROPPED (recipe closure b).
+	AssertBypassEndpointClosure = "bypass-endpoint-closure"
+	// AssertSplitTunnelTight: with a LAN exemption active, the exempted host:port
+	// is reachable but everything else stays redirected-or-dropped.
+	AssertSplitTunnelTight = "split-tunnel-tight"
+)
+
+// Assertion is one named verify result. Ok is the pass/fail; Detail is the
+// human-readable evidence (observed vs expected); Err is non-nil when the probe
+// itself errored, which COUNTS AS a failure (a check that could not run is not a
+// pass). It mirrors netcage's Assertion.
+type Assertion struct {
+	Name   string `json:"name"`
+	Ok     bool   `json:"ok"`
+	Detail string `json:"detail,omitempty"`
+	Err    error  `json:"-"` // serialised via jsonAssertion.Error, never as a Go error value
+}
+
+// Report is the outcome of a verify run: the account and its credential-free
+// endpoint (the header, so `verify` answers "which account/endpoint did I prove?")
+// plus the ordered named assertions. Ok/ExitCode derive the CI-gating verdict from
+// the assertions; a report is a pass IFF every assertion passed AND at least one
+// ran (nothing asserted is not a pass).
+type Report struct {
+	// Account is the anon account verify ran against (`anon` / `anon-<name>`).
+	Account string
+	// Endpoint is the credential-free socks5h URL the account is forced through
+	// (endpoint.URL()); it never carries an embedded user:pass@ so a shared/logged
+	// report leaks no secret.
+	Endpoint string
+	// Assertions are the named results, in run order.
+	Assertions []Assertion
+}
+
+// Ok reports whether EVERY assertion passed. A verify run is a pass iff Ok. An
+// empty report is NOT Ok (nothing asserted is not a proof).
+func (r Report) Ok() bool {
+	for _, a := range r.Assertions {
+		if !a.Ok {
+			return false
+		}
+	}
+	return len(r.Assertions) > 0
+}
+
+// ExitCode is the process exit code: 0 iff every assertion passed, else 1. This
+// is the CI-gating contract (story 18): any failed assertion makes `anonctl
+// verify` exit non-zero.
+func (r Report) ExitCode() int {
+	if r.Ok() {
+		return 0
+	}
+	return 1
+}
+
+// Human renders the account+endpoint header followed by one PASS/FAIL line per
+// named assertion (with its detail and any probe error), so `anonctl verify`
+// reads clearly at a glance. The header states which account and endpoint were
+// proven; it prints only the credential-free socks5h URL.
+func (r Report) Human() string {
+	var b strings.Builder
+	if r.Account != "" || r.Endpoint != "" {
+		fmt.Fprintf(&b, "verify %s", r.Account)
+		if r.Endpoint != "" {
+			fmt.Fprintf(&b, " (endpoint: %s)", r.Endpoint)
+		}
+		b.WriteString("\n")
+	}
+	for _, a := range r.Assertions {
+		mark := "FAIL"
+		if a.Ok {
+			mark = "PASS"
+		}
+		fmt.Fprintf(&b, "[%s] %s", mark, a.Name)
+		if a.Detail != "" {
+			fmt.Fprintf(&b, ": %s", a.Detail)
+		}
+		if a.Err != nil {
+			fmt.Fprintf(&b, " (error: %v)", a.Err)
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// jsonReport is the wire shape of the `--json` contract (ADR 0003). It is a
+// distinct type (not the in-memory Report) so the contract is EXPLICIT and stable:
+// a versioned envelope carrying the derived top-level `ok`, the account +
+// credential-free endpoint, and the array of named assertion results with the
+// probe error flattened to a string. The shape evolves additively only.
+type jsonReport struct {
+	SchemaVersion int             `json:"schemaVersion"`
+	Ok            bool            `json:"ok"`
+	Account       string          `json:"account"`
+	Endpoint      string          `json:"endpoint,omitempty"`
+	Assertions    []jsonAssertion `json:"assertions"`
+}
+
+// jsonAssertion is one assertion on the wire: the name, its pass/fail, the detail,
+// and any probe error flattened to its message string (never a Go error object).
+type jsonAssertion struct {
+	Name   string `json:"name"`
+	Ok     bool   `json:"ok"`
+	Detail string `json:"detail,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+// JSON renders the report as the versioned machine contract. The top-level `ok`
+// is the derived greenness (== Ok()), so a consumer can gate on one boolean
+// without re-walking the array. It never embeds credentials (Endpoint is the
+// credential-free URL). It is the deliberate contract others may consume.
+func (r Report) JSON() ([]byte, error) {
+	out := jsonReport{
+		SchemaVersion: SchemaVersion,
+		Ok:            r.Ok(),
+		Account:       r.Account,
+		Endpoint:      r.Endpoint,
+		Assertions:    make([]jsonAssertion, 0, len(r.Assertions)),
+	}
+	for _, a := range r.Assertions {
+		ja := jsonAssertion{Name: a.Name, Ok: a.Ok, Detail: a.Detail}
+		if a.Err != nil {
+			ja.Error = a.Err.Error()
+		}
+		out.Assertions = append(out.Assertions, ja)
+	}
+	return json.MarshalIndent(out, "", "  ")
+}
+
+// Check is one named verify check: it runs (a live probe in the integration
+// build, or a fixture-backed one in tests) and returns the named assertion. The
+// orchestrator composes the set and Run executes them.
+type Check struct {
+	Name string
+	Run  func(ctx context.Context) Assertion
+}
+
+// Run executes the checks IN ORDER and collects them into a Report. It does NOT
+// short-circuit: every assertion runs so the report is complete (a leak-test must
+// show ALL failures, not just the first). A check whose returned assertion has no
+// Name inherits the check's Name.
+func Run(ctx context.Context, checks []Check) Report {
+	var rep Report
+	for _, c := range checks {
+		a := c.Run(ctx)
+		if a.Name == "" {
+			a.Name = c.Name
+		}
+		rep.Assertions = append(rep.Assertions, a)
+	}
+	return rep
+}
+
+// AnonymizedExitAssertion is the PURE decision for the anonymized-exit assertion.
+// Given the host's own direct exit IP (hostIP), the exit IP observed through the
+// forced path (exitIP), whether the Tor-check reported a Tor exit (isTorExit), and
+// the endpoint's share-class, it returns the named Assertion:
+//
+//   - an EMPTY observed exit fails (the forced path produced nothing; it may have
+//     failed closed) rather than silently pass;
+//   - an exit EQUAL to the host's fails (egress is NOT forced: a leak);
+//   - for a tor-shared endpoint the exit must ALSO be a Tor exit (the promised Tor
+//     exit, checked against check.torproject.org); a differing-but-not-Tor exit
+//     fails;
+//   - otherwise (a differing exit, and a Tor exit when tor-shared) it passes.
+//
+// It is pure so the verdict is unit-tested against the fixture without real Tor;
+// the live check feeds it the real probe output.
+func AnonymizedExitAssertion(hostIP, exitIP string, isTorExit bool, class endpoint.ShareClass) Assertion {
+	a := Assertion{Name: AssertAnonymizedExit}
+	if exitIP == "" {
+		a.Detail = "the forced path produced no exit IP (it may have failed closed): not anonymized"
+		return a
+	}
+	if hostIP != "" && exitIP == hostIP {
+		a.Detail = "exit IP " + exitIP + " EQUALS the host's: traffic is NOT forced through the endpoint (leak)"
+		return a
+	}
+	if class == endpoint.ClassTorShared && !isTorExit {
+		a.Detail = "exit IP " + exitIP + " differs from the host but is NOT a Tor exit (check.torproject.org IsTor=false) for a tor-shared endpoint"
+		return a
+	}
+	a.Ok = true
+	if class == endpoint.ClassTorShared {
+		a.Detail = "exit IP " + exitIP + " differs from host " + hostIP + " and is a Tor exit (IsTor=true)"
+	} else {
+		a.Detail = "exit IP " + exitIP + " differs from host " + hostIP + " (forced egress active)"
+	}
+	return a
+}
+
+// DNSRemoteAssertion is the PURE decision for the dns-remote assertion. Given the
+// unique probe name, the hostnames the ENDPOINT (proxy) was asked to resolve
+// proxy-side (proxyResolved), and whether the HOST resolver observed the same name
+// (hostResolverSaw), it passes IFF the name was resolved proxy-side AND the host
+// resolver never saw it: DNS goes via the anonymizer, never a plaintext/local
+// lookup. It is pure so it is unit-tested against the fixture's ResolvedHosts view
+// with no real resolver.
+func DNSRemoteAssertion(probeName string, proxyResolved []string, hostResolverSaw bool) Assertion {
+	a := Assertion{Name: AssertDNSRemote}
+	if hostResolverSaw {
+		a.Detail = "the host resolver observed " + probeName + ": DNS leaked locally in plaintext"
+		return a
+	}
+	for _, h := range proxyResolved {
+		if h == probeName {
+			a.Ok = true
+			a.Detail = probeName + " was resolved proxy-side (remotely, via the endpoint), not locally"
+			return a
+		}
+	}
+	a.Detail = probeName + " was NOT resolved proxy-side: DNS did not go through the anonymizer"
+	return a
+}
+
+// dropAssertion is the shared PURE decision for the fail-closed / bypass-closure
+// family (leak-drop-v4/v6, the two bypass closures): every one of them PASSES iff
+// the probed direct connection was DROPPED (did NOT reach its target) and FAILS if
+// it egressed (a leak). reached is what the live probe observed; a probe that
+// could not run at all is passed as reached=false by the caller only when that
+// genuinely means no egress (fail-closed), matching netcage's FailClosedProbe
+// polarity. name+what let each closure render its own evidence line.
+func dropAssertion(name, what string, reached bool) Assertion {
+	a := Assertion{Name: name}
+	if reached {
+		a.Detail = what + " REACHED its target: fail-closed is broken (a leak)"
+		return a
+	}
+	a.Ok = true
+	a.Detail = what + " was DROPPED (fail-closed holds)"
+	return a
+}
+
+// LeakDropAssertion is the load-bearing fail-closed assertion for one IP family: a
+// direct, non-anonymized connection from the anon UID must be DROPPED. family is
+// "v4" or "v6" and selects the assertion name (leak-drop-v4 / leak-drop-v6);
+// reached is whether the direct probe egressed (true == a LEAK == fail).
+func LeakDropAssertion(family string, reached bool) Assertion {
+	name := AssertLeakDropV4
+	if family == "v6" {
+		name = AssertLeakDropV6
+	}
+	return dropAssertion(name, "a direct "+family+" connection from the anon UID", reached)
+}
+
+// BypassLoopbackClosureAssertion is closure (a): the anon UID reaching any loopback
+// destination OTHER than its own shim port must be DROPPED. reached is whether the
+// probe to the non-shim loopback destination egressed (true == the closure is
+// broken == fail).
+func BypassLoopbackClosureAssertion(reached bool) Assertion {
+	return dropAssertion(AssertBypassLoopbackClosure, "the anon UID reaching a non-shim loopback destination", reached)
+}
+
+// BypassEndpointClosureAssertion is closure (b): the anon UID dialling the upstream
+// endpoint DIRECTLY must be DROPPED (so it can never skip the shim or its
+// isolation username). reached is whether the anon UID's direct dial of the
+// endpoint egressed (true == the closure is broken == fail).
+func BypassEndpointClosureAssertion(reached bool) Assertion {
+	return dropAssertion(AssertBypassEndpointClosure, "the anon UID dialling the upstream endpoint directly", reached)
+}
+
+// SplitTunnelTightAssertion is the split-tunnel-tight decision (story 25), only
+// meaningful with a LAN exemption active. It passes IFF the exempted host:port was
+// reachable directly (exemptReached) AND a non-exempt destination in the same LAN
+// was still redirected-or-dropped (nonExemptReached == false): the exemption works
+// but did not silently widen. exempt names the exempted destination for the
+// evidence line.
+func SplitTunnelTightAssertion(exempt string, exemptReached, nonExemptReached bool) Assertion {
+	a := Assertion{Name: AssertSplitTunnelTight}
+	switch {
+	case !exemptReached:
+		a.Detail = "the exempted destination " + exempt + " was NOT reachable directly: the split-tunnel hole is broken"
+	case nonExemptReached:
+		a.Detail = "a NON-exempt LAN destination was reachable directly: the exemption widened into a leak"
+	default:
+		a.Ok = true
+		a.Detail = "exempted " + exempt + " reachable, but the rest of the LAN / loopback stays redirected-or-dropped (tight)"
+	}
+	return a
+}
