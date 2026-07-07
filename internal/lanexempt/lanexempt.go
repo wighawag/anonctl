@@ -44,6 +44,15 @@ type Exempt struct {
 	Raw     string     // the original value, preserved for diagnostics
 }
 
+// dnsPort is the clear-DNS port (53). It is UN-EXEMPTABLE: Parse rejects an
+// explicit `:53` exemption and internal/nftables excludes it from a port-omitted
+// (all-TCP) exemption's accept, so the LAN hole can never carry clear DNS (Tails
+// leak-catalogue row 2). Exported so the nft generator names the SAME port rather
+// than spelling a bare 53, keeping the guardrail and the generation consistent.
+const DNSPort = 53
+
+const dnsPort = DNSPort
+
 // IsV4 reports whether the exemption is an IPv4 destination, so the nft layer can
 // pick the matching `ip`/`ip6` family (a v6 exemption must not emit a v4-family
 // rule and vice versa).
@@ -89,6 +98,20 @@ func Parse(raw string) (Exempt, error) {
 	hostPart, port, err := splitPort(value)
 	if err != nil {
 		return Exempt{}, err
+	}
+
+	// Reject an explicit clear-DNS port (53). A LAN DNS hole (`@192.168.x.x`) can
+	// reveal the local network's public IP (Tails leak-catalogue row 2), so 53 is
+	// UN-EXEMPTABLE by construction: DNS must go through the anonymizer, never a
+	// direct LAN query. This is the fail-loud half; the nft layer separately
+	// EXCLUDES 53 from a port-omitted (all-TCP) exemption so that path cannot carry
+	// DNS either. 853 (DoT) is encrypted DNS and does not leak the public IP the
+	// same way, and mDNS/5353 is UDP (never carried by the TCP-only exemption), so
+	// only 53 is rejected here.
+	if port == dnsPort {
+		return Exempt{}, fmt.Errorf(
+			"LAN exemption %q targets DNS port 53: a direct clear-DNS query to a LAN resolver can reveal your local network's public IP (a deanonymization vector); DNS must go through the anonymizer, so port 53 cannot be exempted",
+			raw)
 	}
 
 	network, err := parseHostToNetwork(hostPart, value)

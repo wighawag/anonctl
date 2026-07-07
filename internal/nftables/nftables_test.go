@@ -238,8 +238,9 @@ func TestGenerateExemptHostReachableDirectly(t *testing.T) {
 }
 
 // TestGenerateExemptPortOmittedAllowsAllTCP proves the port-omitted form (Port 0)
-// exempts ALL TCP ports on the host (no `tcp dport` clause), per the acceptance
-// criterion.
+// exempts all TCP ports on the host EXCEPT the clear-DNS port 53 (excluded so the
+// all-ports hole can never carry DNS, Tails leak-catalogue row 2), per the
+// acceptance criterion. It pins no specific accepted dport (it is all-except-53).
 func TestGenerateExemptPortOmittedAllowsAllTCP(t *testing.T) {
 	p := sampleParams()
 	p.Exemptions = []lanexempt.Exempt{mustExempt(t, "192.168.1.150")}
@@ -247,17 +248,62 @@ func TestGenerateExemptPortOmittedAllowsAllTCP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
-	// All TCP ports: matched by l4proto tcp with no dport, for both the nat return
-	// and the filter accept.
-	mustContain(t, out, "meta skuid 30034 ip daddr 192.168.1.150 meta l4proto tcp return")
-	mustContain(t, out, "meta skuid 30034 ip daddr 192.168.1.150 meta l4proto tcp accept")
-	// A port-omitted exemption must NOT pin a specific dport.
-	if strings.Contains(out, "daddr 192.168.1.150 tcp dport") {
-		t.Errorf("port-omitted exemption must not pin a dport; got:\n%s", out)
+	// All TCP ports except 53: matched by `tcp dport != 53`, for both the nat return
+	// and the filter accept (53 stays redirected to the shim).
+	mustContain(t, out, "meta skuid 30034 ip daddr 192.168.1.150 tcp dport != 53 return")
+	mustContain(t, out, "meta skuid 30034 ip daddr 192.168.1.150 tcp dport != 53 accept")
+	// A port-omitted exemption must NOT pin a specific ACCEPTED dport (it is
+	// all-except-53, never a single `tcp dport <n>`).
+	if strings.Contains(out, "daddr 192.168.1.150 tcp dport 5") || strings.Contains(out, "daddr 192.168.1.150 tcp dport 8") {
+		t.Errorf("port-omitted exemption must not pin a specific accepted dport; got:\n%s", out)
 	}
 	// A /32 host route is spelled as the bare address (nft idiom), not `.../32`.
 	if strings.Contains(out, "192.168.1.150/32") {
 		t.Errorf("a bare-IP exemption should render as the bare address, not /32; got:\n%s", out)
+	}
+}
+
+// TestGenerateExemptPortOmittedExcludes53 proves hole (2) is closed: a
+// port-omitted (all-TCP) exemption must NOT carry clear TCP/53. The generated
+// accept/return match all TCP EXCEPT dport 53 (`tcp dport != 53`), so port 53 to
+// the exempted host is NOT directly accepted; it stays redirected to the shim (the
+// nat catch-all `tcp dport 53 redirect` still fires because the exemption return
+// no longer swallows 53). This is the nft half of the Tails leak-catalogue row-2
+// fix (`lan-exemption-not-a-dns-hole`).
+func TestGenerateExemptPortOmittedExcludes53(t *testing.T) {
+	p := sampleParams()
+	p.Exemptions = []lanexempt.Exempt{mustExempt(t, "192.168.1.150")}
+	out, err := nftables.Generate(p)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// The all-TCP exemption must EXCLUDE 53 in both the nat return and the filter
+	// accept, so clear DNS to the LAN resolver is never punched through.
+	mustContain(t, out, "meta skuid 30034 ip daddr 192.168.1.150 tcp dport != 53 return")
+	mustContain(t, out, "meta skuid 30034 ip daddr 192.168.1.150 tcp dport != 53 accept")
+	// It must NOT emit a bare all-TCP match that would INCLUDE 53.
+	if strings.Contains(out, "ip daddr 192.168.1.150 meta l4proto tcp") {
+		t.Errorf("an all-ports exemption must exclude 53, not match all TCP incl. 53; got:\n%s", out)
+	}
+	// 53 stays redirected to the shim DNS port (the catch-all is still present and,
+	// with 53 no longer RETURNed by the exemption, actually fires for the exempt host).
+	mustContain(t, out, "tcp dport 53 redirect to :19053")
+}
+
+// TestGenerateExemptExactPortStillPinned proves the EXACT-port exemption is
+// unchanged by the 53 fix: a non-53 exact port still pins `tcp dport <port>` (the
+// guardrail already rejects an explicit :53, so no exact-53 exemption can reach
+// Generate; the exclusion only shapes the port-omitted case).
+func TestGenerateExemptExactPortStillPinned(t *testing.T) {
+	p := sampleParams()
+	p.Exemptions = []lanexempt.Exempt{mustExempt(t, "192.168.1.150:8080")}
+	out, err := nftables.Generate(p)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	mustContain(t, out, "meta skuid 30034 ip daddr 192.168.1.150 tcp dport 8080 accept")
+	if strings.Contains(out, "tcp dport != 53") {
+		t.Errorf("an exact-port exemption must not emit the all-TCP-except-53 form; got:\n%s", out)
 	}
 }
 

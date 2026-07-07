@@ -19,6 +19,95 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+// clearLANDNSReached reports whether a DIRECT clear-DNS query from the anon UID to
+// the exempted LAN host on port 53 actually LEFT the box to that off-box
+// destination (a clear-DNS hole), as opposed to being redirected to the shim or
+// dropped. It implements the black-hole/counter discipline the DNS subtlety
+// requires (work/notes/findings/manual-per-uid-tor-recipe.md): because the nat
+// redirect is TRANSPARENT, a naive dig STILL answers, so "did clear DNS leave?"
+// cannot be read from the dig result; it must be read from a packet counter keyed
+// on the ORIGINAL (un-rewritten) destination.
+//
+// It plants a throwaway counter table whose output chain runs AFTER the account's
+// nat_out (a LATER filter priority), counting anon-UID packets STILL destined to
+// exemptHost:53 (a redirected packet has had its daddr rewritten to the shim, so
+// it no longer matches; only a NON-redirected "hole" packet keeps the LAN daddr
+// and is counted). It then dials exemptHost:53 as the anon UID and reports whether
+// the counter moved. A missing nft/setpriv, or any error, yields reached=false
+// (the safe reading: no observed clear-DNS egress), never a false leak.
+func clearLANDNSReached(ctx context.Context, p LiveParams, network, addr string) bool {
+	if _, err := exec.LookPath("nft"); err != nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil || net.ParseIP(host).To4() == nil {
+		return false // only the v4 LAN-resolver case is probed here
+	}
+	l4 := "tcp"
+	if strings.HasPrefix(network, "udp") {
+		l4 = "udp"
+	}
+	const counterTable = "anonctl_verify_dnsleak"
+	ruleset := fmt.Sprintf(`table inet %s {
+    chain out {
+        type filter hook output priority 50; policy accept;
+        meta skuid %d ip daddr %s %s dport 53 counter
+    }
+}
+`, counterTable, p.AnonUID, host, l4)
+	if _, _, err := nftRun(ctx, ruleset, "nft", "-f", "-"); err != nil {
+		return false
+	}
+	defer func() { _, _, _ = nftRun(ctx, "delete table inet "+counterTable, "nft", "-f", "-") }()
+
+	// Dial exemptHost:53 AS the anon UID; a clear-DNS hole would let the packet keep
+	// its LAN daddr and hit the counter, a redirect/drop would not.
+	pctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	_, _, _ = runSetprivProbe(pctx, p.AnonUID, network, addr)
+
+	out, _, err := nftRun(ctx, "", "nft", "list", "table", "inet", counterTable)
+	if err != nil {
+		return false
+	}
+	return counterMoved(out)
+}
+
+// nftRun shells out to nft (optionally with a ruleset on stdin), returning
+// stdout/stderr/err. It is the counter-probe's ONLY nft access and lives here
+// (integration-tagged) because it needs root.
+func nftRun(ctx context.Context, stdin, name string, args ...string) (string, string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	var out, errb strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &errb
+	err := cmd.Run()
+	return strings.TrimSpace(out.String()), strings.TrimSpace(errb.String()), err
+}
+
+// counterMoved reports whether an nft `counter` line shows a non-zero packet
+// count (`counter packets N ...` with N > 0). A parse miss reads as not-moved (no
+// observed leak), the safe outcome.
+func counterMoved(listed string) bool {
+	for _, line := range strings.Split(listed, "\n") {
+		if !strings.Contains(line, "counter packets") {
+			continue
+		}
+		fields := strings.Fields(line)
+		for i, f := range fields {
+			if f == "packets" && i+1 < len(fields) {
+				if n, err := strconv.Atoi(fields[i+1]); err == nil && n > 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // This file is the IMPURE live-probe machinery behind checks_integration.go's
 // LiveChecks: standing up real connections AS the anon UID (setpriv), fetching the
 // forced-path exit IP through the shim relay, and gathering the dns-remote

@@ -98,6 +98,49 @@ func TestParseRejectsHostnames(t *testing.T) {
 	}
 }
 
+// TestParseRejectsPort53Loudly proves an explicit `:53` exemption is REJECTED
+// loudly, naming the value and the reason: a clear-DNS hole to a LAN resolver can
+// reveal the local network's public IP (Tails leak-catalogue row 2). DNS must go
+// through the anonymizer, never a direct LAN query. This closes hole (1).
+func TestParseRejectsPort53Loudly(t *testing.T) {
+	for _, raw := range []string{
+		"192.168.1.1:53",
+		"10.0.0.1:53",
+		"172.16.0.53:53",
+		"192.168.0.0/24:53", // a whole-subnet :53 is the same clear-DNS hole
+	} {
+		_, err := lanexempt.Parse(raw)
+		if err == nil {
+			t.Errorf("Parse(%q) must reject an explicit :53 exemption (a clear-DNS hole)", raw)
+			continue
+		}
+		if !strings.Contains(err.Error(), raw) {
+			t.Errorf("Parse(%q) error should name the offending value; got: %v", raw, err)
+		}
+		if !strings.Contains(err.Error(), "53") || !strings.Contains(strings.ToLower(err.Error()), "dns") {
+			t.Errorf("Parse(%q) error should explain the DNS reason; got: %v", raw, err)
+		}
+	}
+}
+
+// TestParseAcceptsNonDNSPortsAndOmitted proves the reject is scoped to 53 ONLY: a
+// nearby port and the port-omitted (all-TCP) form still parse. The all-TCP form is
+// where hole (2) lives, closed at the nft layer (53 excluded from the accept), not
+// by rejecting the exemption; so it must still be a VALID exemption here.
+func TestParseAcceptsNonDNSPortsAndOmitted(t *testing.T) {
+	for _, raw := range []string{
+		"192.168.1.1:52",
+		"192.168.1.1:54",
+		"192.168.1.1:853", // DoT is encrypted DNS, not the clear-DNS leak this guards
+		"192.168.1.1",     // port-omitted (all TCP): valid; nft excludes 53
+		"192.168.0.0/24",  // whole-subnet, port-omitted: valid; nft excludes 53
+	} {
+		if _, err := lanexempt.Parse(raw); err != nil {
+			t.Errorf("Parse(%q) should accept a non-53 / port-omitted exemption; got: %v", raw, err)
+		}
+	}
+}
+
 // TestParseRejectsMalformed proves malformed / empty / bad-port values are
 // rejected loudly rather than silently mis-parsed.
 func TestParseRejectsMalformed(t *testing.T) {

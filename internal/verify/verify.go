@@ -23,6 +23,10 @@
 //   - split-tunnel-tight (with a LAN exemption active): the exempted host:port is
 //     reachable directly, but the rest of that /24, other loopback, and everything
 //     else stay redirected-or-dropped.
+//   - lan-exemption-not-a-dns-hole (with a LAN exemption active): clear DNS (tcp
+//     AND udp 53) to the exempted host does NOT egress directly to the LAN
+//     resolver (it is redirected to the shim or dropped), so the LAN hole can
+//     never become a clear-DNS hole (Tails leak-catalogue row 2).
 //
 // The DESIGN split mirrors the rest of the repo (provision's Runner seam,
 // nftables' Generate-vs-Apply): this file is the PURE assertion/render/exit
@@ -74,6 +78,11 @@ const (
 	// AssertSplitTunnelTight: with a LAN exemption active, the exempted host:port
 	// is reachable but everything else stays redirected-or-dropped.
 	AssertSplitTunnelTight = "split-tunnel-tight"
+	// AssertLANExemptionNotADNSHole: with a LAN exemption active, clear DNS (tcp+udp
+	// 53) to the exempted host does NOT egress directly to the LAN resolver
+	// (redirected-or-dropped), so the LAN hole is never a clear-DNS hole (Tails
+	// leak-catalogue row 2).
+	AssertLANExemptionNotADNSHole = "lan-exemption-not-a-dns-hole"
 )
 
 // Assertion is one named verify result. Ok is the pass/fail; Detail is the
@@ -400,6 +409,36 @@ func SplitTunnelTightAssertion(exempt string, exemptReached, nonExemptReached bo
 	default:
 		a.Ok = true
 		a.Detail = "exempted " + exempt + " reachable, but the rest of the LAN / loopback stays redirected-or-dropped (tight)"
+	}
+	return a
+}
+
+// LANExemptionNotADNSHoleAssertion is the Tails leak-catalogue row-2 decision, only
+// meaningful with a LAN exemption active. Even when the exemption punches a direct
+// hole to a private host, clear DNS to that host must NEVER egress directly to the
+// LAN resolver: a `@192.168.x.x` clear-DNS query can reveal the local network's
+// public IP (a deanonymization vector). It passes IFF neither a direct clear
+// TCP/53 nor a direct clear UDP/53 query to the exempted host reached the LAN
+// resolver as clear DNS (each 53 packet is redirected to the shim or dropped).
+//
+// tcp53Reached / udp53Reached are what the live probe observed for a DIRECT clear
+// query to the exempted host on port 53. Per the DNS subtlety
+// (work/notes/findings/manual-per-uid-tor-recipe.md), a transparent redirect means
+// a naive `dig` may STILL get an answer (from the shim), so the live probe must
+// read a black-hole/counter signal for a CLEAR query that actually left the box,
+// not merely "dig returned nothing"; this pure decision reads that signal as
+// reached==true (a leak) vs false (redirected-or-dropped). exempt names the
+// exempted destination for the evidence line.
+func LANExemptionNotADNSHoleAssertion(exempt string, tcp53Reached, udp53Reached bool) Assertion {
+	a := Assertion{Name: AssertLANExemptionNotADNSHole}
+	switch {
+	case tcp53Reached:
+		a.Detail = "a direct clear TCP/53 query to the exempted host " + exempt + " reached the LAN resolver: the LAN exemption is a clear-DNS hole (can reveal the local network's public IP)"
+	case udp53Reached:
+		a.Detail = "a direct clear UDP/53 query to the exempted host " + exempt + " reached the LAN resolver: the LAN exemption is a clear-DNS hole (can reveal the local network's public IP)"
+	default:
+		a.Ok = true
+		a.Detail = "clear DNS (tcp+udp 53) to the exempted host " + exempt + " does not egress directly (redirected to the shim or dropped): the LAN hole is not a DNS hole"
 	}
 	return a
 }

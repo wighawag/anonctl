@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/wighawag/anonctl/internal/endpoint"
+	"github.com/wighawag/anonctl/internal/lanexempt"
 )
 
 // LiveChecks (integration build) is the REAL assertion set: it stands up live
@@ -70,8 +71,42 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 			nonExemptReached := probeAsAnon(ctx, p, "tcp4", nonExemptLANOf(p.Exempt))
 			return SplitTunnelTightAssertion(p.Exempt, exemptReached, nonExemptReached)
 		}})
+		checks = append(checks, Check{Name: AssertLANExemptionNotADNSHole, Run: func(ctx context.Context) Assertion {
+			tcp53, udp53 := clearLANDNSLeaked(ctx, p)
+			return LANExemptionNotADNSHoleAssertion(p.Exempt, tcp53, udp53)
+		}})
 	}
 	return checks
+}
+
+// clearLANDNSLeaked probes whether a DIRECT clear-DNS query (tcp AND udp 53) from
+// the anon UID to the EXEMPTED LAN host egressed to the LAN resolver as clear DNS,
+// rather than being redirected to the shim or dropped (Tails leak-catalogue row
+// 2). It reads the black-hole/counter signal the DNS subtlety requires
+// (work/notes/findings/manual-per-uid-tor-recipe.md): a transparent redirect means
+// a naive dig STILL answers, so "reached" here means a CLEAR packet actually left
+// to the exempted host's :53, which is only possible if the exemption punched a
+// DNS hole. With 53 excluded from the exemption (guardrail + nft), both must come
+// back false. It returns (tcp53Reached, udp53Reached).
+func clearLANDNSLeaked(ctx context.Context, p LiveParams) (tcp53, udp53 bool) {
+	host := exemptHost(p.Exempt)
+	if host == "" {
+		return false, false
+	}
+	dns := net.JoinHostPort(host, strconv.Itoa(lanexempt.DNSPort))
+	tcp53 = clearLANDNSReached(ctx, p, "tcp4", dns)
+	udp53 = clearLANDNSReached(ctx, p, "udp4", dns)
+	return tcp53, udp53
+}
+
+// exemptHost extracts the host from the exempted host:port (empty on a malformed
+// value, which the DNS-hole probe reads as "no clear LAN DNS", the safe outcome).
+func exemptHost(exempt string) string {
+	host, _, err := net.SplitHostPort(exempt)
+	if err != nil {
+		return ""
+	}
+	return host
 }
 
 // probeAsAnon dials addr AS the anon UID (setpriv drops to it) with a short
