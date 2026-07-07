@@ -45,3 +45,7 @@ Signature ongoing verb: it is meant to be re-run after setup, after a reboot, an
 > Where to look: netcage (`~/dev/github/wighawag/netcage`) `internal/verify` is the direct template, named assertions, run-every-check-no-short-circuit (`verify.go`), non-zero exit for CI, `--json`; and `internal/socks5hfixture` + `internal/detectproxy` for testing the anonymized-exit assertion with NO real Tor. Split the pure assertion/render/exit logic (unit, everywhere) from the live checks (integration, behind the `integration` tag).
 >
 > Seams to test at: the assertion set + JSON/exit rendering (unit against the fixture) and the live leak/closure/split-tunnel checks (integration). "Done" = verify emits named assertions, exits non-zero on any failure, supports `--json`, and its unit suite is green against the fixture. RECORD non-obvious in-scope decisions (assertion names, the JSON shape) per the task-template guidance, the JSON shape is a contract others may consume, so treat it deliberately.
+
+## Requeue 2026-07-07
+
+A transient upstream 524 (Cloudflare timeout) aborted the previous run; substantial WIP is already on the branch (internal/verify/*.go + main wiring). CONTINUE from it: finish the verify command per the acceptance criteria, ensure the gate is green, do NOT restart from scratch.

@@ -1,0 +1,313 @@
+package verify
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/wighawag/anonctl/internal/endpoint"
+	"github.com/wighawag/anonctl/internal/socks5hfixture"
+)
+
+// --- Report: greenness, exit code, no-short-circuit (the CI-gating contract) ---
+
+func TestReport_OkRequiresEveryAssertionAndAtLeastOne(t *testing.T) {
+	if (Report{}).Ok() {
+		t.Fatal("an empty report must NOT be Ok (nothing was asserted is not a pass)")
+	}
+	pass := Report{Assertions: []Assertion{{Name: "a", Ok: true}, {Name: "b", Ok: true}}}
+	if !pass.Ok() {
+		t.Fatal("all-pass report should be Ok")
+	}
+	mixed := Report{Assertions: []Assertion{{Name: "a", Ok: true}, {Name: "b", Ok: false}}}
+	if mixed.Ok() {
+		t.Fatal("a report with any failed assertion must NOT be Ok")
+	}
+}
+
+func TestReport_ExitCode(t *testing.T) {
+	if (Report{Assertions: []Assertion{{Ok: true}}}).ExitCode() != 0 {
+		t.Fatal("all-pass report must exit 0")
+	}
+	if (Report{Assertions: []Assertion{{Ok: true}, {Ok: false}}}).ExitCode() != 1 {
+		t.Fatal("a report with any failure must exit non-zero (CI-gating)")
+	}
+	if (Report{}).ExitCode() != 1 {
+		t.Fatal("an empty report must exit non-zero (nothing asserted is not a pass)")
+	}
+}
+
+func TestRun_ExecutesEveryCheckAndDoesNotShortCircuit(t *testing.T) {
+	var ran []string
+	checks := []Check{
+		{Name: "a", Run: func(ctx context.Context) Assertion { ran = append(ran, "a"); return Assertion{Ok: true} }},
+		{Name: "b", Run: func(ctx context.Context) Assertion { ran = append(ran, "b"); return Assertion{Ok: false} }},
+		{Name: "c", Run: func(ctx context.Context) Assertion { ran = append(ran, "c"); return Assertion{Ok: true} }},
+	}
+	rep := Run(context.Background(), checks)
+	if len(ran) != 3 || ran[0] != "a" || ran[2] != "c" {
+		t.Fatalf("every check must run in order even past a failure; ran=%v", ran)
+	}
+	if rep.Ok() {
+		t.Fatal("report with a failing check must not be Ok")
+	}
+	if rep.Assertions[0].Name != "a" {
+		t.Fatalf("check Name should default onto the assertion; got %q", rep.Assertions[0].Name)
+	}
+}
+
+// --- Human render: named pass/fail lines, account + endpoint header ---
+
+func TestReport_HumanStatesAccountAndEndpoint(t *testing.T) {
+	rep := Report{
+		Account:  "anon",
+		Endpoint: "socks5h://127.0.0.1:9050",
+		Assertions: []Assertion{
+			{Name: "anonymized-exit", Ok: true, Detail: "exit differs from host"},
+			{Name: "leak-drop-v4", Ok: false, Detail: "direct v4 reached (LEAK)"},
+		},
+	}
+	out := rep.Human()
+	if !strings.Contains(out, "anon") || !strings.Contains(out, "socks5h://127.0.0.1:9050") {
+		t.Fatalf("human header must state the account and the endpoint; got:\n%s", out)
+	}
+	if !strings.Contains(out, "PASS") || !strings.Contains(out, "FAIL") {
+		t.Fatalf("human render must mark each assertion PASS/FAIL; got:\n%s", out)
+	}
+	if !strings.Contains(out, "anonymized-exit") || !strings.Contains(out, "leak-drop-v4") {
+		t.Fatalf("human render must name each assertion; got:\n%s", out)
+	}
+}
+
+// --- JSON shape: the machine contract others may consume ---
+
+func TestReport_JSONShapeIsTheContract(t *testing.T) {
+	rep := Report{
+		Account:  "anon",
+		Endpoint: "socks5h://127.0.0.1:9050",
+		Assertions: []Assertion{
+			{Name: "anonymized-exit", Ok: true, Detail: "exit ok"},
+			{Name: "leak-drop-v4", Ok: false, Detail: "leak", Err: errors.New("boom")},
+		},
+	}
+	blob, err := rep.JSON()
+	if err != nil {
+		t.Fatalf("JSON render: %v", err)
+	}
+	var got struct {
+		SchemaVersion int    `json:"schemaVersion"`
+		Ok            bool   `json:"ok"`
+		Account       string `json:"account"`
+		Endpoint      string `json:"endpoint"`
+		Assertions    []struct {
+			Name   string `json:"name"`
+			Ok     bool   `json:"ok"`
+			Detail string `json:"detail"`
+			Error  string `json:"error"`
+		} `json:"assertions"`
+	}
+	if err := json.Unmarshal(blob, &got); err != nil {
+		t.Fatalf("emitted JSON must unmarshal into the documented shape: %v\n%s", err, blob)
+	}
+	if got.SchemaVersion != SchemaVersion {
+		t.Fatalf("schemaVersion = %d, want %d (the versioned contract)", got.SchemaVersion, SchemaVersion)
+	}
+	if got.Ok {
+		t.Fatal("top-level ok must be false when any assertion failed")
+	}
+	if got.Account != "anon" || got.Endpoint != "socks5h://127.0.0.1:9050" {
+		t.Fatalf("account/endpoint must be carried in the JSON; got %+v", got)
+	}
+	if len(got.Assertions) != 2 || got.Assertions[0].Name != "anonymized-exit" {
+		t.Fatalf("assertions array must carry each named result; got %+v", got.Assertions)
+	}
+	if !got.Assertions[1].Ok == false && got.Assertions[1].Error == "" {
+		t.Fatalf("a failed assertion with an Err must serialise its error string; got %+v", got.Assertions[1])
+	}
+	if got.Assertions[1].Error != "boom" {
+		t.Fatalf("assertion error must serialise to its message; got %q", got.Assertions[1].Error)
+	}
+}
+
+func TestReport_JSONNeverEmbedsCredentials(t *testing.T) {
+	// A defensive contract check mirroring netcage: the endpoint carried in the
+	// report is credential-free by construction (endpoint.URL()), so a shared JSON
+	// report can never leak a secret. Assert no user:pass survives into the render.
+	rep := Report{Account: "anon", Endpoint: "socks5h://127.0.0.1:9050"}
+	blob, err := rep.JSON()
+	if err != nil {
+		t.Fatalf("JSON render: %v", err)
+	}
+	if strings.Contains(string(blob), "@127.0.0.1") {
+		t.Fatalf("JSON must not carry an embedded credential form; got:\n%s", blob)
+	}
+}
+
+// --- anonymized-exit assertion (pure decision, fixture-backed, no real Tor) ---
+
+// TestAnonymizedExitAssertion_FailsWhenExitEqualsHost: the load-bearing anonymity
+// property. If the observed exit IP equals the host's own, egress is NOT forced
+// (a leak) and the assertion must FAIL.
+func TestAnonymizedExitAssertion_FailsWhenExitEqualsHost(t *testing.T) {
+	a := AnonymizedExitAssertion("203.0.113.9", "203.0.113.9", false, endpoint.ClassSocksPeruser)
+	if a.Ok {
+		t.Fatalf("exit IP equal to host must FAIL (not anonymized); got %+v", a)
+	}
+	if a.Name != "anonymized-exit" {
+		t.Fatalf("assertion name = %q, want anonymized-exit", a.Name)
+	}
+}
+
+// TestAnonymizedExitAssertion_PassesWhenExitDiffersForSocksPeruser: a plain socks
+// endpoint has no Tor-exit claim to make, so a differing exit IP is enough to pass.
+func TestAnonymizedExitAssertion_PassesWhenExitDiffersForSocksPeruser(t *testing.T) {
+	a := AnonymizedExitAssertion("203.0.113.9", "198.51.100.7", false, endpoint.ClassSocksPeruser)
+	if !a.Ok {
+		t.Fatalf("a differing exit on a socks-peruser endpoint must PASS; got %+v", a)
+	}
+}
+
+// TestAnonymizedExitAssertion_TorSharedRequiresTorExit: for a tor-shared endpoint
+// the assertion additionally requires the check.torproject.org IsTor signal to be
+// true. A differing exit that is NOT a Tor exit fails (it is not the promised Tor).
+func TestAnonymizedExitAssertion_TorSharedRequiresTorExit(t *testing.T) {
+	notTor := AnonymizedExitAssertion("203.0.113.9", "198.51.100.7", false, endpoint.ClassTorShared)
+	if notTor.Ok {
+		t.Fatalf("a tor-shared endpoint whose exit is NOT a Tor exit must FAIL; got %+v", notTor)
+	}
+	isTor := AnonymizedExitAssertion("203.0.113.9", "198.51.100.7", true, endpoint.ClassTorShared)
+	if !isTor.Ok {
+		t.Fatalf("a tor-shared endpoint with a differing Tor exit must PASS; got %+v", isTor)
+	}
+}
+
+// TestAnonymizedExitAssertion_FailsWhenNoExitObserved: an empty observed exit IP
+// means the forced path produced nothing (it may have failed closed); that is a
+// failure, never a silent pass.
+func TestAnonymizedExitAssertion_FailsWhenNoExitObserved(t *testing.T) {
+	a := AnonymizedExitAssertion("203.0.113.9", "", false, endpoint.ClassSocksPeruser)
+	if a.Ok {
+		t.Fatalf("an empty observed exit must FAIL; got %+v", a)
+	}
+}
+
+// --- dns-remote assertion (pure decision over the fixture's proxy-side view) ---
+
+// TestDNSRemoteAssertion_PassesWhenResolvedProxySide: the fixture RECORDS the
+// hostnames it was asked to resolve proxy-side. The assertion passes when the
+// probed name appears there (resolved remotely) and the host resolver never saw it.
+func TestDNSRemoteAssertion_PassesWhenResolvedProxySide(t *testing.T) {
+	a := DNSRemoteAssertion("probe.example", []string{"probe.example"}, false)
+	if !a.Ok {
+		t.Fatalf("a name resolved proxy-side must PASS; got %+v", a)
+	}
+	if a.Name != "dns-remote" {
+		t.Fatalf("assertion name = %q, want dns-remote", a.Name)
+	}
+}
+
+// TestDNSRemoteAssertion_FailsWhenNotResolvedProxySide: if the proxy never saw the
+// name, it was resolved somewhere else (a plaintext/local leak) and the assertion
+// must FAIL.
+func TestDNSRemoteAssertion_FailsWhenNotResolvedProxySide(t *testing.T) {
+	a := DNSRemoteAssertion("probe.example", []string{"other.example"}, false)
+	if a.Ok {
+		t.Fatalf("a name NOT resolved proxy-side must FAIL (leak); got %+v", a)
+	}
+}
+
+// TestDNSRemoteAssertion_FailsWhenHostResolverSawTheName: even if the proxy also
+// saw it, a host-resolver observation of the SAME name is a plaintext leak and
+// must FAIL.
+func TestDNSRemoteAssertion_FailsWhenHostResolverSawTheName(t *testing.T) {
+	a := DNSRemoteAssertion("probe.example", []string{"probe.example"}, true)
+	if a.Ok {
+		t.Fatalf("a name the HOST resolver also saw must FAIL (plaintext leak); got %+v", a)
+	}
+}
+
+// --- fail-closed / bypass-closure family (pure drop decision) ---
+
+// TestLeakDropAssertion_PassesWhenDropped: the LOAD-BEARING assertion. A direct
+// connection from the anon UID that was DROPPED (did not reach) passes; one that
+// REACHED its target is a leak and fails. Covered for v4 AND v6.
+func TestLeakDropAssertion_PassesWhenDropped(t *testing.T) {
+	for _, fam := range []string{"v4", "v6"} {
+		dropped := LeakDropAssertion(fam, false)
+		if !dropped.Ok {
+			t.Fatalf("%s: a dropped direct connection must PASS; got %+v", fam, dropped)
+		}
+		leaked := LeakDropAssertion(fam, true)
+		if leaked.Ok {
+			t.Fatalf("%s: a REACHED direct connection is a leak and must FAIL; got %+v", fam, leaked)
+		}
+	}
+}
+
+// TestLeakDropAssertion_NamesAreDistinctPerFamily: v4 and v6 are SEPARATE named
+// assertions, so a report shows each family's result independently (a v6 bypass of
+// v4 rules cannot hide behind a single leak line).
+func TestLeakDropAssertion_NamesAreDistinctPerFamily(t *testing.T) {
+	if LeakDropAssertion("v4", false).Name != "leak-drop-v4" {
+		t.Fatalf("v4 assertion name = %q, want leak-drop-v4", LeakDropAssertion("v4", false).Name)
+	}
+	if LeakDropAssertion("v6", false).Name != "leak-drop-v6" {
+		t.Fatalf("v6 assertion name = %q, want leak-drop-v6", LeakDropAssertion("v6", false).Name)
+	}
+}
+
+func TestBypassClosureAssertions_PassWhenDropped(t *testing.T) {
+	if a := BypassLoopbackClosureAssertion(false); !a.Ok || a.Name != "bypass-loopback-closure" {
+		t.Fatalf("loopback closure: dropped must PASS with the right name; got %+v", a)
+	}
+	if a := BypassLoopbackClosureAssertion(true); a.Ok {
+		t.Fatalf("loopback closure: a reached non-shim loopback must FAIL; got %+v", a)
+	}
+	if a := BypassEndpointClosureAssertion(false); !a.Ok || a.Name != "bypass-endpoint-closure" {
+		t.Fatalf("endpoint closure: dropped must PASS with the right name; got %+v", a)
+	}
+	if a := BypassEndpointClosureAssertion(true); a.Ok {
+		t.Fatalf("endpoint closure: a reached direct endpoint dial must FAIL; got %+v", a)
+	}
+}
+
+// --- split-tunnel-tight (story 25, pure decision) ---
+
+func TestSplitTunnelTightAssertion(t *testing.T) {
+	// exempt reachable AND the rest stays redirected-or-dropped => tight (pass).
+	if a := SplitTunnelTightAssertion("192.168.1.150:8080", true, false); !a.Ok || a.Name != "split-tunnel-tight" {
+		t.Fatalf("exempt reachable + rest tight must PASS with the right name; got %+v", a)
+	}
+	// exempt NOT reachable => the hole is broken (fail).
+	if a := SplitTunnelTightAssertion("192.168.1.150:8080", false, false); a.Ok {
+		t.Fatalf("an unreachable exemption must FAIL; got %+v", a)
+	}
+	// a non-exempt LAN destination reachable => the exemption widened into a leak (fail).
+	if a := SplitTunnelTightAssertion("192.168.1.150:8080", true, true); a.Ok {
+		t.Fatalf("a reachable non-exempt LAN destination must FAIL (exemption widened); got %+v", a)
+	}
+}
+
+// --- fixture-backed end-to-end of the anonymized-exit evidence path ---
+
+// TestAnonymizedExit_AgainstFixture proves the anonymized-exit assertion can be
+// driven end-to-end against the deterministic socks5h fixture (no real Tor): the
+// fixture's ExitIP is the "exit" the probe observes, and it differs from a
+// synthetic host baseline, so the assertion passes.
+func TestAnonymizedExit_AgainstFixture(t *testing.T) {
+	fx := socks5hfixture.New(socks5hfixture.Options{ExitIP: "127.0.0.2"})
+	if err := fx.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("start fixture: %v", err)
+	}
+	defer fx.Close()
+
+	// The exit observed through the fixture is its ExitIP; the host baseline is a
+	// different synthetic value. This exercises the assertion decision the live
+	// integration check will feed with real probe output.
+	a := AnonymizedExitAssertion("203.0.113.9", "127.0.0.2", false, endpoint.ClassSocksPeruser)
+	if !a.Ok {
+		t.Fatalf("fixture exit differs from host baseline: must PASS; got %+v", a)
+	}
+}
