@@ -18,6 +18,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/wighawag/anonctl/internal/cli"
@@ -63,6 +65,17 @@ type AccountStatus struct {
 	UID        string `json:"uid,omitempty"`
 	ShimUID    string `json:"shimUid,omitempty"`
 
+	// SudoChecked reports whether the sudo-absence probe actually RAN for this
+	// account (it runs only for an existing account; an absent account is not
+	// probed). SudoAllowed is meaningful only when SudoChecked is true.
+	SudoChecked bool `json:"sudoChecked"`
+	// SudoAllowed is the POSITIVE result of the `sudo -l -U <account>` probe: false
+	// means the account has no sudo rights (the hardened, expected state), true means
+	// the box grants it sudo (a UID-transition escape: a sudo'd socket carries a
+	// different uid and bypasses the `meta skuid` forcing). This surfaces the
+	// CLOSE-AT-ADD invariant as a checkable fact, not just an absence.
+	SudoAllowed bool `json:"sudoAllowed"`
+
 	// Forced reports whether the account has a marker (`/etc/anonctl/<account>.json`):
 	// anonctl's own convenience view of the SAME dependency-free truth a sibling
 	// tool reads directly. A missing marker is a clean `false` ("not forced"), never
@@ -95,6 +108,25 @@ func (s AccountStatus) WithMarker(store marker.Store) (AccountStatus, error) {
 	s.Marker = &m
 	return s, nil
 }
+
+// LoginPATH is the minimal login PATH `add` provisions for the anon account. It
+// deliberately OMITS the sbin directories (`/usr/local/sbin`, `/usr/sbin`,
+// `/sbin`) that carry the setuid network binaries the audit flagged (exim4,
+// pppd, mount.nfs live under /usr/sbin and /sbin): a socket one of those opens
+// carries a DIFFERENT uid and escapes the `meta skuid` forcing. Shrinking the
+// PATH does not REMOVE those binaries (they are system-wide, still reachable by
+// absolute path), so this is a partial CLOSE-AT-ADD hardening, not a barrier; the
+// residual is documented in the README threat model. See
+// work/notes/findings/uid-transition-escape-surface.md.
+const LoginPATH = "/usr/local/bin:/usr/bin:/bin"
+
+// WriteLoginEnv writes the account's minimal login environment (its PATH) into a
+// shell profile drop-in in the account's home. It is a package-level seam (not a
+// hard call) so the unit tests inject a fake that captures the CONTENT without
+// touching a real home directory, mirroring the Runner-seam discipline for the
+// rest of provisioning. The default implementation writes the real profile via
+// the Runner-discovered home; it is replaced only in tests.
+var WriteLoginEnv = writeLoginEnv
 
 // Add provisions the anon login account and its distinct dedicated shim service
 // account, idempotently. Provisioning each account is a no-op if it already
@@ -200,7 +232,28 @@ func Status(ctx context.Context, r Runner, account string) (AccountStatus, error
 	}
 	st.ShimExists = shimExists
 	st.ShimUID = shimUID
+
+	// Positively probe the sudo-absence invariant, but ONLY for an existing account
+	// (probing a non-existent account would be a meaningless "no sudo"). This surfaces
+	// the CLOSE-AT-ADD no-sudo hardening as a checkable fact an operator sees in
+	// `status`, not just an absence at add-time.
+	if exists {
+		st.SudoChecked = true
+		st.SudoAllowed = sudoAllowed(ctx, r, account)
+	}
 	return st, nil
+}
+
+// sudoAllowed probes whether the account has ANY sudo rights via
+// `sudo -l -U <account>` (list the account's permitted sudo commands). sudo exits
+// non-zero and prints "not allowed to run sudo" when the account has none; a
+// zero-exit listing means it CAN sudo. We read the exit code as the truth (false
+// == no sudo, the hardened state), treating a probe that could not run at all
+// (sudo absent) as "no sudo path here": if the box has no sudo binary the vector
+// is closed for this account too. This is the PROVE side of the sudo vector.
+func sudoAllowed(ctx context.Context, r Runner, account string) bool {
+	_, _, err := r.Run(ctx, "sudo", "-l", "-U", account)
+	return err == nil
 }
 
 // ensureLoginAccount creates the login account if absent (idempotent). It is a
@@ -214,8 +267,18 @@ func ensureLoginAccount(ctx context.Context, r Runner, account string) (bool, er
 	if exists {
 		return false, nil
 	}
+	// The login account is created with NO --groups: it is never added to sudo/wheel,
+	// so it has no sudo path (the CLOSE-AT-ADD no-sudo invariant). A sudo'd socket
+	// would carry a different uid and escape the `meta skuid` forcing.
 	if _, stderr, err := r.Run(ctx, "useradd", "--create-home", "--shell", "/bin/bash", account); err != nil {
 		return false, fmt.Errorf("create login account %q: %w: %s", account, err, stderr)
+	}
+	// Write the account's minimal login PATH (omitting the sbin setuid-network dirs)
+	// only on FRESH creation, so a re-run never clobbers an operator's edited
+	// profile. Failing to write the env is a real provisioning error (the hardening
+	// did not take effect), surfaced to the caller.
+	if err := WriteLoginEnv(ctx, r, account, loginEnvContent()); err != nil {
+		return false, fmt.Errorf("write login env for %q: %w", account, err)
 	}
 	return true, nil
 }
@@ -252,6 +315,62 @@ func removeAccount(ctx context.Context, r Runner, account string) (bool, error) 
 		return false, fmt.Errorf("remove account %q: %w: %s", account, err, stderr)
 	}
 	return true, nil
+}
+
+// loginEnvContent renders the shell profile drop-in that pins the account's
+// minimal login PATH. It is a small, self-contained POSIX-sh snippet exporting
+// LoginPATH; a login shell reads it (see writeLoginEnv). Kept a pure function so
+// the content is asserted in a unit test without any file I/O.
+func loginEnvContent() string {
+	return "# Managed by anonctl: minimal login PATH for the anon account.\n" +
+		"# Omits the sbin dirs carrying setuid network binaries so the account\n" +
+		"# cannot gratuitously name a uid-transition escape. See the anonctl README\n" +
+		"# threat model. Edit at your own risk.\n" +
+		"export PATH=" + LoginPATH + "\n"
+}
+
+// homeMode / envFileMode are the intended modes for the created home-scoped env
+// file: owned by the account, readable by it. 0644 mirrors a skel .profile.
+const envFileMode = 0o644
+
+// writeLoginEnv is the DEFAULT WriteLoginEnv: it writes the minimal-PATH profile
+// drop-in into the account's home as `.profile`, then chowns it to the account so
+// the login shell (running as the account) reads it. It discovers the home from
+// the passwd entry through the Runner (the same seam the rest of provisioning
+// uses to read account state). Any real error (no home, write failure) is
+// returned so a failed hardening is not silently swallowed. The unit tests
+// replace the WriteLoginEnv seam entirely, so this real writer runs only on a
+// live host (exercised by the integration test).
+func writeLoginEnv(ctx context.Context, r Runner, account, content string) error {
+	home, err := accountHome(ctx, r, account)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(home, ".profile")
+	if err := os.WriteFile(path, []byte(content), envFileMode); err != nil {
+		return fmt.Errorf("write %q: %w", path, err)
+	}
+	// WriteFile respects umask; re-assert the intended mode, then hand the file to
+	// the account so its own login shell can read it.
+	if err := os.Chmod(path, envFileMode); err != nil {
+		return fmt.Errorf("chmod %q: %w", path, err)
+	}
+	if _, stderr, err := r.Run(ctx, "chown", account+":"+account, path); err != nil {
+		return fmt.Errorf("chown %q to %s: %w: %s", path, account, err, stderr)
+	}
+	return nil
+}
+
+// accountHome returns the account's home directory from its passwd entry (field
+// 6). It errors if the account has no resolvable home, so writeLoginEnv never
+// writes to a wrong/empty path.
+func accountHome(ctx context.Context, r Runner, account string) (string, error) {
+	stdout, _, _ := r.Run(ctx, "getent", "passwd", account)
+	fields := strings.Split(strings.TrimSpace(stdout), ":")
+	if len(fields) < 6 || fields[5] == "" {
+		return "", fmt.Errorf("account %q has no home directory in passwd", account)
+	}
+	return fields[5], nil
 }
 
 // accountEntry probes whether an account exists via `getent passwd <name>` and,

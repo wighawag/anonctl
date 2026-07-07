@@ -3,6 +3,7 @@ package provision_test
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,18 +14,38 @@ import (
 	"github.com/wighawag/anonctl/internal/provision"
 )
 
+// TestMain neutralises the real login-env writer for the whole UNIT suite: these
+// tests drive the fake Runner and never create a real home, so the default
+// WriteLoginEnv (which touches the filesystem) would spuriously fail. Tests that
+// care about the env write override the seam themselves and restore it. The
+// integration test exercises the real writer against a real account.
+func TestMain(m *testing.M) {
+	provision.WriteLoginEnv = func(context.Context, provision.Runner, string, string) error { return nil }
+	os.Exit(m.Run())
+}
+
 // fakeRunner is the unit-test seam standing in for the real ExecRunner: it
 // records every command the provisioning issues and answers the `getent passwd`
 // existence probes from a scripted set of already-present accounts, so the whole
 // add/rm/list/status wiring is exercised WITHOUT creating a real Unix user
 // (mirrors netcage's recordRunner). No useradd/userdel ever hits the box.
 type fakeRunner struct {
-	calls   [][]string
-	present map[string]bool // accounts getent should report as existing
+	calls       [][]string
+	present     map[string]bool // accounts getent should report as existing
+	sudoAllowed bool            // when true, `sudo -l -U` reports the account CAN sudo
 }
 
 func (r *fakeRunner) Run(_ context.Context, name string, args ...string) (string, string, error) {
 	r.calls = append(r.calls, append([]string{name}, args...))
+	// sudo -l -U <account>: the read-only sudo-absence probe. By default report the
+	// finding-observed "not allowed" (a freshly-provisioned anon account has no sudo
+	// rights); a test can flip sudoAllowed to exercise the positive-detection path.
+	if name == "sudo" {
+		if r.sudoAllowed {
+			return "User is allowed to run the following commands", "", nil
+		}
+		return "", "User is not allowed to run sudo on host.", &exitErr{code: 1}
+	}
 	// getent passwd <name>: report presence from the scripted set. A missing entry
 	// is getent's exit-2 (an error with empty stdout), same as the real tool.
 	if name == "getent" && len(args) >= 2 && args[0] == "passwd" {
@@ -279,5 +300,140 @@ func TestStatus_WithMarker_MissingIsCleanNotForced(t *testing.T) {
 	b, _ := json.Marshal(st)
 	if !strings.Contains(string(b), `"forced":false`) {
 		t.Errorf("status --json must report forced:false for a missing marker; got %s", b)
+	}
+}
+
+// add provisions the login account with NO sudo grant: none of the commands it
+// issues add the account to a sudo/wheel group or write a sudoers entry. This is
+// the CLOSE-AT-ADD invariant from work/notes/findings/uid-transition-escape-surface.go:
+// a socket the anon account could own via `sudo` would carry a DIFFERENT uid and
+// escape the `meta skuid` forcing, so `add` must never grant it.
+func TestAddGrantsNoSudo(t *testing.T) {
+	r := &fakeRunner{}
+	if _, err := provision.Add(context.Background(), r, "anon"); err != nil {
+		t.Fatalf("Add error: %v", err)
+	}
+	for _, c := range r.calls {
+		line := strings.Join(c, " ")
+		// No group grant into sudo/wheel (via useradd --groups or usermod -aG), and no
+		// visudo/sudoers write.
+		if strings.Contains(line, "sudo") || strings.Contains(line, "wheel") || strings.Contains(line, "visudo") {
+			t.Errorf("add must not grant sudo; offending command: %q", line)
+		}
+		if strings.Contains(line, "usermod") && (strings.Contains(line, "-G") || strings.Contains(line, "-aG") || strings.Contains(line, "--groups")) {
+			t.Errorf("add must not add supplementary groups (a sudo/wheel path); offending command: %q", line)
+		}
+	}
+}
+
+// add provisions the login account with a minimal login PATH that omits the sbin
+// directories holding setuid network binaries (exim4/pppd/mount.nfs per the
+// audit finding), shrinking what the account can even name. The write goes
+// through the injectable WriteLoginEnv seam so the unit test asserts the CONTENT
+// without touching a real home directory.
+func TestAddWritesMinimalLoginPATH(t *testing.T) {
+	var gotAccount, gotContent string
+	var wrote bool
+	old := provision.WriteLoginEnv
+	provision.WriteLoginEnv = func(_ context.Context, _ provision.Runner, account, content string) error {
+		wrote = true
+		gotAccount, gotContent = account, content
+		return nil
+	}
+	t.Cleanup(func() { provision.WriteLoginEnv = old })
+
+	r := &fakeRunner{}
+	if _, err := provision.Add(context.Background(), r, "anon"); err != nil {
+		t.Fatalf("Add error: %v", err)
+	}
+	if !wrote {
+		t.Fatalf("Add must write the account's minimal login PATH via WriteLoginEnv")
+	}
+	if gotAccount != "anon" {
+		t.Errorf("WriteLoginEnv account = %q, want anon", gotAccount)
+	}
+	if !strings.Contains(gotContent, "PATH="+provision.LoginPATH) {
+		t.Errorf("login env must export the minimal PATH %q; got:\n%s", provision.LoginPATH, gotContent)
+	}
+	// The minimal PATH must NOT expose the sbin dirs that carry the setuid network
+	// binaries the audit flagged (exim4/pppd/mount.nfs live under /usr/sbin, /sbin).
+	for _, sbin := range []string{"/usr/sbin", "/sbin"} {
+		for _, entry := range strings.Split(provision.LoginPATH, ":") {
+			if entry == sbin {
+				t.Errorf("minimal LoginPATH must not include %q (setuid network binaries live there): %q", sbin, provision.LoginPATH)
+			}
+		}
+	}
+}
+
+// re-add on an existing account does NOT rewrite the login env (idempotent: the
+// env is written only when the account is freshly created, so a re-run never
+// clobbers an operator's edited profile).
+func TestAddIdempotentDoesNotRewriteLoginEnv(t *testing.T) {
+	var wrote bool
+	old := provision.WriteLoginEnv
+	provision.WriteLoginEnv = func(_ context.Context, _ provision.Runner, _, _ string) error {
+		wrote = true
+		return nil
+	}
+	t.Cleanup(func() { provision.WriteLoginEnv = old })
+
+	r := &fakeRunner{present: map[string]bool{"anon": true, "anon-shim": true}}
+	if _, err := provision.Add(context.Background(), r, "anon"); err != nil {
+		t.Fatalf("Add (existing) error: %v", err)
+	}
+	if wrote {
+		t.Errorf("re-add must NOT rewrite the login env for an already-provisioned account")
+	}
+}
+
+// status positively reports the account has NO sudo rights: it runs the
+// `sudo -l -U <account>` probe through the Runner and reports SudoChecked=true,
+// SudoAllowed=false (a positive assertion, not merely an absence). This is the
+// PROVE-IN-VERIFY sudo vector surfaced where an operator sees it.
+func TestStatusReportsNoSudo(t *testing.T) {
+	r := &fakeRunner{present: map[string]bool{"anon": true, "anon-shim": true}}
+	st, err := provision.Status(context.Background(), r, "anon")
+	if err != nil {
+		t.Fatalf("Status error: %v", err)
+	}
+	if !st.SudoChecked {
+		t.Errorf("SudoChecked = false, want true (status must probe sudo)")
+	}
+	if st.SudoAllowed {
+		t.Errorf("SudoAllowed = true, want false for a freshly-provisioned anon account")
+	}
+	// The positive no-sudo assertion must show up in status --json.
+	b, _ := json.Marshal(st)
+	if !strings.Contains(string(b), `"sudoAllowed":false`) {
+		t.Errorf("status --json must report sudoAllowed:false; got %s", b)
+	}
+}
+
+// status DETECTS sudo when it IS present (the probe is a real positive check, not
+// a hard-coded false): a box that grants the account sudo is reported
+// SudoAllowed=true so an operator is warned the uid-transition vector is open.
+func TestStatusDetectsSudoWhenPresent(t *testing.T) {
+	r := &fakeRunner{present: map[string]bool{"anon": true, "anon-shim": true}, sudoAllowed: true}
+	st, err := provision.Status(context.Background(), r, "anon")
+	if err != nil {
+		t.Fatalf("Status error: %v", err)
+	}
+	if !st.SudoChecked || !st.SudoAllowed {
+		t.Errorf("a box that grants sudo must report SudoChecked=true SudoAllowed=true; got checked=%v allowed=%v", st.SudoChecked, st.SudoAllowed)
+	}
+}
+
+// status on an ABSENT account does not probe sudo (there is no account to probe):
+// SudoChecked stays false so the field is not a misleading "no sudo" for a
+// non-existent account.
+func TestStatusAbsentDoesNotProbeSudo(t *testing.T) {
+	r := &fakeRunner{}
+	st, err := provision.Status(context.Background(), r, "anon")
+	if err != nil {
+		t.Fatalf("Status (absent) error: %v", err)
+	}
+	if st.SudoChecked {
+		t.Errorf("SudoChecked = true on an absent account, want false")
 	}
 }
