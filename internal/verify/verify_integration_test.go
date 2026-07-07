@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/wighawag/anonctl/internal/endpoint"
+	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anonctl/internal/nftables"
 	"github.com/wighawag/anonctl/internal/provision"
 	"github.com/wighawag/anonctl/internal/shim"
@@ -340,6 +341,89 @@ func TestLiveLeakAndClosuresAgainstRealRuleset(t *testing.T) {
 	// The sentinel stayed untouched throughout (host isolation).
 	if !tableExists(t, nr, sentinel) {
 		t.Fatalf("the ruleset clobbered the sentinel table (host not isolated)")
+	}
+}
+
+// TestLiveLANExemptionNotADNSHole is the integration proof of Tails leak-catalogue
+// row 2: with an all-TCP LAN exemption ACTIVE for a private host, a direct clear
+// DNS query (tcp AND udp 53) from the anon UID to that exempted host must NOT
+// egress as clear DNS to the LAN resolver: 53 is excluded from the exemption
+// (guardrail + nft), so the nat chain still redirects tcp/udp 53 to the shim and
+// the counter keyed on the LAN daddr never moves. It exercises the SAME live probe
+// (clearLANDNSReached) `anonctl verify` uses, feeding the pure assertion, against a
+// real kernel ruleset, isolated to throwaways.
+func TestLiveLANExemptionNotADNSHole(t *testing.T) {
+	requireLiveHost(t)
+	if probeHelperBin == "" {
+		t.Skip("probe helper failed to build; skipping")
+	}
+	ctx := context.Background()
+	r := execRunner{}
+	nr := nftRunner{}
+
+	account := "anon-vitest-dns-" + strconv.Itoa(os.Getpid())
+	shimAccount := account + "-shim"
+	table := nftables.TableName(account)
+
+	if _, err := provision.Add(ctx, r, account); err != nil {
+		t.Fatalf("provision.Add(%s): %v", account, err)
+	}
+	defer func() {
+		_, _, _ = nr.Run(ctx, "delete table inet "+table, "nft", "-f", "-")
+		_, _ = provision.Rm(ctx, r, account, true)
+	}()
+
+	anonUID := uidOf(t, account)
+	shimUID := uidOf(t, shimAccount)
+
+	const relayPort, dnsPort = 49050, 49053
+	const exempt = "192.168.1.150:8080" // all-except-53 hole for the whole host is the row-2 case
+
+	exemptAll, err := lanexempt.Parse("192.168.1.150") // port-omitted: all TCP except 53
+	if err != nil {
+		t.Fatalf("lanexempt.Parse: %v", err)
+	}
+	p := nftables.Params{
+		Account:      account,
+		AnonUID:      anonUID,
+		ShimUID:      shimUID,
+		RelayPort:    relayPort,
+		DNSPort:      dnsPort,
+		EndpointHost: "127.0.0.1",
+		EndpointPort: 9050,
+		Exemptions:   []lanexempt.Exempt{exemptAll},
+	}
+	if err := nftables.Apply(ctx, nr, p); err != nil {
+		t.Fatalf("apply ruleset with exemption: %v", err)
+	}
+
+	// Run the live DNS-hole probe through the runtime orchestrator, with the
+	// exemption active so the assertion is included.
+	lp := verify.LiveParams{
+		Account:      account,
+		Endpoint:     "socks5h://127.0.0.1:9050",
+		Class:        endpoint.ClassSocksPeruser,
+		AnonUID:      anonUID,
+		ShimUID:      shimUID,
+		RelayPort:    relayPort,
+		DNSPort:      dnsPort,
+		EndpointHost: "127.0.0.1",
+		EndpointPort: 9050,
+		Exempt:       exempt,
+	}
+	rep := verify.RunVerify(ctx, lp)
+	var found bool
+	for _, a := range rep.Assertions {
+		if a.Name != verify.AssertLANExemptionNotADNSHole {
+			continue
+		}
+		found = true
+		if !a.Ok {
+			t.Fatalf("lan-exemption-not-a-dns-hole must PASS (53 is excluded, redirected to the shim); got %+v", a)
+		}
+	}
+	if !found {
+		t.Fatalf("RunVerify must include the %s assertion with an exemption active; got %+v", verify.AssertLANExemptionNotADNSHole, rep.Assertions)
 	}
 }
 

@@ -290,6 +290,29 @@ func TestSplitTunnelTightAssertion(t *testing.T) {
 	}
 }
 
+// --- lan-exemption-not-a-dns-hole (Tails leak-catalogue row 2, pure decision) ---
+
+// TestLANExemptionNotADNSHoleAssertion proves the pure decision: with a LAN
+// exemption active, clear DNS (tcp AND udp 53) to the exempted host must NOT
+// egress directly to the LAN resolver (it is redirected to the shim or dropped).
+// The probe reports whether a DIRECT clear query to the exempted host on 53
+// reached the LAN resolver as clear DNS; the assertion passes IFF neither tcp/53
+// nor udp/53 did.
+func TestLANExemptionNotADNSHoleAssertion(t *testing.T) {
+	// Neither tcp/53 nor udp/53 leaves as a direct clear LAN query => not a hole (pass).
+	if a := LANExemptionNotADNSHoleAssertion("192.168.1.150:8080", false, false); !a.Ok || a.Name != AssertLANExemptionNotADNSHole {
+		t.Fatalf("no clear LAN DNS must PASS with the right name; got %+v", a)
+	}
+	// A direct clear TCP/53 query to the LAN resolver => a DNS hole (fail).
+	if a := LANExemptionNotADNSHoleAssertion("192.168.1.150:8080", true, false); a.Ok {
+		t.Fatalf("a direct clear TCP/53 to the LAN resolver must FAIL (a DNS hole); got %+v", a)
+	}
+	// A direct clear UDP/53 query to the LAN resolver => a DNS hole (fail).
+	if a := LANExemptionNotADNSHoleAssertion("192.168.1.150:8080", false, true); a.Ok {
+		t.Fatalf("a direct clear UDP/53 to the LAN resolver must FAIL (a DNS hole); got %+v", a)
+	}
+}
+
 // --- fixture-backed end-to-end of the anonymized-exit evidence path ---
 
 // TestAnonymizedExit_AgainstFixture proves the anonymized-exit assertion can be
