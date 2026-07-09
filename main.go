@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strconv"
@@ -297,7 +298,12 @@ func runStatus(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 // the default build's fail-closed report and for the integration harness (which
 // supplies the live params directly).
 func runVerify(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
-	rep := verifyAndMark(ctx, r, cmd)
+	// Progress is SUPPRESSED under --json (stdout must stay pure JSON a tool parses),
+	// and shown in the human path so the operator sees the multi-second probe run is
+	// alive instead of a silent wait. It goes to stderr, so the PASS/FAIL result lines
+	// stay on stdout exactly as today.
+	prog := verifyProgress(cmd.JSON)
+	rep := verifyAndMark(ctx, r, cmd, prog)
 	if cmd.JSON {
 		blob, jerr := rep.JSON()
 		if jerr != nil {
@@ -311,6 +317,39 @@ func runVerify(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	return rep.ExitCode()
 }
 
+// verifyProgressWriter is where the human-path per-check progress is emitted: it
+// is STDERR so the PASS/FAIL result lines (and, under --json, the JSON blob) stay
+// pure on stdout. It is a package var so a unit test can drive the progress
+// rendering into a buffer with no real terminal, mirroring the repo's seam
+// discipline (useExecLoginShell, provision's WriteLoginEnv).
+var verifyProgressWriter io.Writer = os.Stderr
+
+// verifyProgress builds the per-check progress hook `verify` and `use` share.
+// Under --json it returns a ZERO hook so NO progress is emitted (the machine
+// contract on stdout is untouched). Otherwise it streams, to stderr, a
+// "  ... <name>" line as each check STARTS and the completed "[PASS]/[FAIL]
+// <name>" as it finishes, so the operator watches the lines appear one by one and
+// learns which probe is slow. It is plain-text only (no cursor/spinner control
+// chars), so it degrades cleanly when stderr is redirected/piped (non-tty) with no
+// garbage in the stream.
+func verifyProgress(jsonMode bool) verify.Progress {
+	if jsonMode {
+		return verify.Progress{}
+	}
+	return verify.Progress{
+		Start: func(name string) {
+			fmt.Fprintf(verifyProgressWriter, "  ... %s\n", name)
+		},
+		Done: func(a verify.Assertion) {
+			mark := "FAIL"
+			if a.Ok {
+				mark = "PASS"
+			}
+			fmt.Fprintf(verifyProgressWriter, "  [%s] %s\n", mark, a.Name)
+		},
+	}
+}
+
 // verifyAndMark runs the LIVE verify assertion set for the command's account and,
 // on a GREEN report, writes the write-after-verify marker (the coordination CLAIM
 // an account is forced). It is the shared gate BOTH `verify` and `use` run: `use`
@@ -321,7 +360,11 @@ func runVerify(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 //
 // A marker-write failure does NOT flip a passing verify to a failure (the account
 // IS proven forced); it is surfaced on stderr so the operator can retry.
-func verifyAndMark(ctx context.Context, r provision.Runner, cmd *cli.Command) verify.Report {
+//
+// prog is the per-check progress hook (built by verifyProgress); it is observation
+// only and never changes the verdict or the assertion set. Passing it HERE (the
+// shared gate) is what gives `use` the same progress `verify` shows.
+func verifyAndMark(ctx context.Context, r provision.Runner, cmd *cli.Command, prog verify.Progress) verify.Report {
 	st, err := provision.Status(ctx, r, cmd.Account)
 	if err != nil {
 		// A status read failure yields a single failing assertion so the report is a
@@ -332,7 +375,7 @@ func verifyAndMark(ctx context.Context, r provision.Runner, cmd *cli.Command) ve
 		}
 	}
 	p := verifyParams(accountconfig.DefaultStore(), cmd.Account, st)
-	rep := verify.RunVerify(ctx, p)
+	rep := verify.RunVerifyWith(ctx, p, prog)
 
 	// WRITE-AFTER-VERIFY: the marker is a coordination CLAIM written strictly AFTER
 	// verify proves the account forced. On a passing report we write it (via the
@@ -427,7 +470,11 @@ func runUse(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		return 1
 	}
 
-	rep := useVerifyReport(ctx, r, cmd)
+	// `use` runs the SAME shared verify gate as `verify`, so it gets the same
+	// per-check progress for free: the operator sees the multi-second probe run is
+	// working before either a shell opens or the refusal prints. `use` has no --json
+	// (it execs a shell), so progress is always the human hook (stderr).
+	rep := useVerifyReport(ctx, r, cmd, verifyProgress(false))
 	if !rep.Ok() {
 		// RED: print the failing assertions and REFUSE. Do NOT exec a shell (you must
 		// never get an un-anonymized shell via `use`).
@@ -456,7 +503,8 @@ var (
 	// simulate a non-root run.
 	useGeteuid = os.Geteuid
 	// useVerifyReport runs the verify gate for the account and returns its report
-	// (the same gate `verify` runs, marker-on-green included).
+	// (the same gate `verify` runs, marker-on-green included). It takes the shared
+	// per-check progress hook so `use`'s gating verify shows the same activity.
 	useVerifyReport = verifyAndMark
 	// useExecLoginShell drops to the account and execs its interactive login shell.
 	// In the DEFAULT build this is a fail-loud stub: the real setpriv drop is

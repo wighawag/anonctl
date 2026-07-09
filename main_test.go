@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -147,7 +151,7 @@ func swapUseSeams(t *testing.T, rep verify.Report, euid int) *string {
 	t.Helper()
 	var execedAccount string
 	origVerify, origExec, origEuid := useVerifyReport, useExecLoginShell, useGeteuid
-	useVerifyReport = func(ctx context.Context, r provision.Runner, cmd *cli.Command) verify.Report {
+	useVerifyReport = func(ctx context.Context, r provision.Runner, cmd *cli.Command, prog verify.Progress) verify.Report {
 		return rep
 	}
 	useExecLoginShell = func(ctx context.Context, r provision.Runner, account string) error {
@@ -322,4 +326,107 @@ func TestVerifyJSONDispatches(t *testing.T) {
 	if code == 3 {
 		t.Errorf("run(verify --json) = 3 (stub); the verb must be implemented")
 	}
+}
+
+// --- Progress: verify (and use) must show they are WORKING during the
+// multi-second live probe run, instead of a silent wait then a dump. Progress is
+// driven into the injectable verifyProgressWriter (stderr in production) so these
+// unit tests assert it with no real terminal; --json keeps stdout pure. ---
+
+// captureProgress redirects the per-check progress writer into a buffer for the
+// duration of the test (restoring it after), so a test can assert the human path
+// streamed progress without a real terminal.
+func captureProgress(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	orig := verifyProgressWriter
+	verifyProgressWriter = &buf
+	t.Cleanup(func() { verifyProgressWriter = orig })
+	return &buf
+}
+
+// The human (non-JSON) verify path STREAMS per-check progress: a "running" line as
+// each check starts and the streamed PASS/FAIL as it completes, so the operator
+// sees visible activity during the multi-second run. It is plain text (no cursor
+// control chars), so it degrades cleanly on a non-tty (the buffer here is not a
+// terminal, standing in for a redirected stream).
+func TestVerifyHumanStreamsPerCheckProgress(t *testing.T) {
+	buf := captureProgress(t)
+	run([]string{"verify"})
+	out := buf.String()
+	if out == "" {
+		t.Fatal("human verify emitted NO progress: the operator sees a silent wait then a dump")
+	}
+	// A per-check "running" indication AND a streamed PASS/FAIL result line.
+	if !strings.Contains(out, "...") {
+		t.Errorf("human verify progress must show a per-check running indication; got:\n%s", out)
+	}
+	if !strings.Contains(out, "[PASS]") && !strings.Contains(out, "[FAIL]") {
+		t.Errorf("human verify progress must stream each PASS/FAIL as it completes; got:\n%s", out)
+	}
+	// Plain text only: no ANSI/cursor control chars in a redirected (non-tty) stream.
+	if strings.ContainsRune(out, '\x1b') || strings.ContainsRune(out, '\r') {
+		t.Errorf("progress must degrade cleanly on a non-tty (no control chars); got %q", out)
+	}
+}
+
+// Under --json, progress is SUPPRESSED entirely: NOTHING is written to the
+// progress stream, and stdout is ONLY the JSON report (the machine contract a tool
+// parses is untouched).
+func TestVerifyJSONSuppressesProgressAndStdoutIsPureJSON(t *testing.T) {
+	buf := captureProgress(t)
+	stdout := captureStdout(t, func() { run([]string{"verify", "--json"}) })
+	if buf.String() != "" {
+		t.Errorf("--json must SUPPRESS progress entirely; got progress output:\n%s", buf.String())
+	}
+	trimmed := strings.TrimSpace(stdout)
+	if !json.Valid([]byte(trimmed)) {
+		t.Fatalf("--json stdout must be pure JSON (no progress noise); got:\n%s", stdout)
+	}
+	var rep struct {
+		SchemaVersion int  `json:"schemaVersion"`
+		Ok            bool `json:"ok"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &rep); err != nil || rep.SchemaVersion == 0 {
+		t.Fatalf("--json stdout must be the versioned report envelope; err=%v out:\n%s", err, stdout)
+	}
+}
+
+// use runs the SAME shared verify gate, so it MUST show the same per-check
+// progress during its gating verify. It is driven through the real verifyAndMark
+// (NOT the swapUseSeams fake) so the shared progress path is exercised; the exec
+// seam is faked so no shell spawns.
+func TestUseGatingVerifyStreamsProgress(t *testing.T) {
+	buf := captureProgress(t)
+	origExec, origEuid := useExecLoginShell, useGeteuid
+	useExecLoginShell = func(ctx context.Context, r provision.Runner, account string) error { return nil }
+	useGeteuid = func() int { return 0 }
+	t.Cleanup(func() { useExecLoginShell, useGeteuid = origExec, origEuid })
+	run([]string{"use"})
+	if buf.String() == "" {
+		t.Fatal("use's gating verify emitted NO progress: use must show the SAME activity as verify (progress lives in the shared path)")
+	}
+}
+
+// captureStdout runs fn with os.Stdout redirected into a pipe and returns what was
+// written, so a test can assert the --json stdout is pure JSON with no progress
+// noise. It restores os.Stdout afterward.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		var b bytes.Buffer
+		io.Copy(&b, r)
+		done <- b.String()
+	}()
+	fn()
+	w.Close()
+	os.Stdout = orig
+	return <-done
 }

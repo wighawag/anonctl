@@ -59,6 +59,53 @@ func TestRun_ExecutesEveryCheckAndDoesNotShortCircuit(t *testing.T) {
 	}
 }
 
+// --- Progress hook: per-check start/done so verify shows it is working during
+// the multi-second live probe run (instead of a silent wait then a dump). The
+// hook is the shared seam both `verify` and `use` drive. ---
+
+func TestRunWith_ProgressFiresStartThenDoneForEveryCheckInOrder(t *testing.T) {
+	checks := []Check{
+		{Name: "a", Run: func(ctx context.Context) Assertion { return Assertion{Ok: true} }},
+		{Name: "b", Run: func(ctx context.Context) Assertion { return Assertion{Ok: false, Detail: "leak"} }},
+	}
+	var events []string
+	prog := Progress{
+		Start: func(name string) { events = append(events, "start:"+name) },
+		Done:  func(a Assertion) { events = append(events, "done:"+a.Name+":"+okmark(a.Ok)) },
+	}
+	rep := RunWith(context.Background(), checks, prog)
+	want := []string{"start:a", "done:a:PASS", "start:b", "done:b:FAIL"}
+	if strings.Join(events, ",") != strings.Join(want, ",") {
+		t.Fatalf("progress must fire Start then Done per check, in order; got %v want %v", events, want)
+	}
+	// The report itself is unchanged by the hook (same assertions, same order).
+	if len(rep.Assertions) != 2 || rep.Assertions[0].Name != "a" || rep.Assertions[1].Name != "b" {
+		t.Fatalf("RunWith must produce the same report as Run; got %+v", rep.Assertions)
+	}
+	// Done sees the NAME defaulted from the check (b's assertion had no Name of its own).
+	if rep.Assertions[1].Detail != "leak" {
+		t.Fatalf("RunWith must preserve assertion detail; got %q", rep.Assertions[1].Detail)
+	}
+}
+
+// A zero Progress (nil Start/Done) is safe: RunWith(nil hooks) == Run.
+func TestRunWith_ZeroProgressIsSafeAndEqualsRun(t *testing.T) {
+	checks := []Check{
+		{Name: "a", Run: func(ctx context.Context) Assertion { return Assertion{Ok: true} }},
+	}
+	rep := RunWith(context.Background(), checks, Progress{})
+	if len(rep.Assertions) != 1 || rep.Assertions[0].Name != "a" || !rep.Assertions[0].Ok {
+		t.Fatalf("RunWith with a zero Progress must equal Run; got %+v", rep.Assertions)
+	}
+}
+
+func okmark(ok bool) string {
+	if ok {
+		return "PASS"
+	}
+	return "FAIL"
+}
+
 // --- Human render: named pass/fail lines, account + endpoint header ---
 
 func TestReport_HumanStatesAccountAndEndpoint(t *testing.T) {

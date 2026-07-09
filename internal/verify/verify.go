@@ -240,16 +240,52 @@ type Check struct {
 	Run  func(ctx context.Context) Assertion
 }
 
+// Progress is an OPTIONAL per-check observation hook so a caller can show that
+// verify is WORKING during its multi-second live probe run (each check is a real
+// connection through the shim; the exit-IP check dials Tor), instead of a silent
+// wait followed by the whole report dumped at once. Start fires just BEFORE a
+// check runs (with the check's Name), Done fires just AFTER it completes (with the
+// finished Assertion, its Name already defaulted from the check). Either field may
+// be nil (a zero Progress is a no-op), so it is purely additive: `Run` is
+// `RunWith` with a zero Progress and the buffered report is byte-for-byte
+// unchanged.
+//
+// It is deliberately just two callbacks (not an io.Writer or a tty flag): WHERE
+// and HOW progress is rendered (stderr vs interleaved, plain line vs spinner,
+// suppressed under --json) is the COMMAND's concern, not this pure package's, so
+// the render policy lives in main and this seam stays testable with no terminal.
+type Progress struct {
+	Start func(name string)
+	Done  func(a Assertion)
+}
+
 // Run executes the checks IN ORDER and collects them into a Report. It does NOT
 // short-circuit: every assertion runs so the report is complete (a leak-test must
 // show ALL failures, not just the first). A check whose returned assertion has no
-// Name inherits the check's Name.
+// Name inherits the check's Name. It is RunWith with no progress hook.
 func Run(ctx context.Context, checks []Check) Report {
+	return RunWith(ctx, checks, Progress{})
+}
+
+// RunWith is Run with an optional per-check Progress hook: it fires prog.Start
+// before each check and prog.Done after, so a caller can stream "running <name>"
+// then the completed PASS/FAIL as each probe finishes. The hook is observation
+// ONLY: it does not alter the checks, their order, the no-short-circuit rule, or
+// the resulting Report (a nil/zero Progress makes RunWith identical to Run). The
+// assertion passed to Done is the FINAL one, with its Name already defaulted from
+// the check, so the caller renders the same line the report will.
+func RunWith(ctx context.Context, checks []Check, prog Progress) Report {
 	var rep Report
 	for _, c := range checks {
+		if prog.Start != nil {
+			prog.Start(c.Name)
+		}
 		a := c.Run(ctx)
 		if a.Name == "" {
 			a.Name = c.Name
+		}
+		if prog.Done != nil {
+			prog.Done(a)
 		}
 		rep.Assertions = append(rep.Assertions, a)
 	}
@@ -303,7 +339,16 @@ type LiveParams struct {
 // (missing root/setpriv/shim/endpoint) fails LOUD, so verify can never silently
 // "pass" verification.
 func RunVerify(ctx context.Context, p LiveParams) Report {
-	rep := Run(ctx, LiveChecks(ctx, p))
+	return RunVerifyWith(ctx, p, Progress{})
+}
+
+// RunVerifyWith is RunVerify with an optional per-check Progress hook (see
+// Progress and RunWith): the SHARED entry point both `anonctl verify` and
+// `anonctl use`'s gating verify drive, so wiring the hook here gives `use` the
+// same progress for free. A zero Progress makes it identical to RunVerify; the
+// composed header, assertion set, order, and exit code are unchanged.
+func RunVerifyWith(ctx context.Context, p LiveParams, prog Progress) Report {
+	rep := RunWith(ctx, LiveChecks(ctx, p), prog)
 	rep.Account = p.Account
 	rep.Endpoint = p.Endpoint
 	return rep
