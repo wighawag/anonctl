@@ -3,7 +3,6 @@ package provision_test
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,14 +13,18 @@ import (
 	"github.com/wighawag/anonctl/internal/provision"
 )
 
-// TestMain neutralises the real login-env writer for the whole UNIT suite: these
-// tests drive the fake Runner and never create a real home, so the default
-// WriteLoginEnv (which touches the filesystem) would spuriously fail. Tests that
-// care about the env write override the seam themselves and restore it. The
-// integration test exercises the real writer against a real account.
-func TestMain(m *testing.M) {
+// stubLoginEnv neutralises the real login-env writer for ONE unit test and restores
+// it on cleanup. Unit tests drive the fake Runner and never create a real home, so
+// the default WriteLoginEnv (which touches the filesystem) would spuriously fail;
+// they stub it locally. This is DELIBERATELY per-test rather than a global TestMain
+// stub: a global mutation is shared into the integration test binary (both files
+// compile into ONE binary under -tags integration), where it silently neutralised
+// the REAL writer TestRealProvisionRoundTrip must exercise (the e2e finding, BUG 3).
+func stubLoginEnv(t *testing.T) {
+	t.Helper()
+	old := provision.WriteLoginEnv
 	provision.WriteLoginEnv = func(context.Context, provision.Runner, string, string) error { return nil }
-	os.Exit(m.Run())
+	t.Cleanup(func() { provision.WriteLoginEnv = old })
 }
 
 // fakeRunner is the unit-test seam standing in for the real ExecRunner: it
@@ -86,6 +89,7 @@ func joined(calls [][]string) string {
 // add on a fresh box provisions BOTH the anon login account AND a distinct
 // dedicated shim service account, via the injected Runner (no real useradd).
 func TestAddProvisionsAccountAndShim(t *testing.T) {
+	stubLoginEnv(t)
 	r := &fakeRunner{}
 	res, err := provision.Add(context.Background(), r, "anon")
 	if err != nil {
@@ -128,6 +132,7 @@ func TestAddIdempotent(t *testing.T) {
 
 // A named account provisions anon-<name> and its OWN shim anon-<name>-shim.
 func TestAddNamed(t *testing.T) {
+	stubLoginEnv(t)
 	r := &fakeRunner{}
 	if _, err := provision.Add(context.Background(), r, "anon-work"); err != nil {
 		t.Fatalf("Add error: %v", err)
@@ -309,6 +314,7 @@ func TestStatus_WithMarker_MissingIsCleanNotForced(t *testing.T) {
 // a socket the anon account could own via `sudo` would carry a DIFFERENT uid and
 // escape the `meta skuid` forcing, so `add` must never grant it.
 func TestAddGrantsNoSudo(t *testing.T) {
+	stubLoginEnv(t)
 	r := &fakeRunner{}
 	if _, err := provision.Add(context.Background(), r, "anon"); err != nil {
 		t.Fatalf("Add error: %v", err)

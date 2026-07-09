@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/wighawag/anonctl/internal/accountconfig"
 	"github.com/wighawag/anonctl/internal/nftables"
@@ -86,6 +87,41 @@ func (s Store) InstallCommon(tp TemplateParams, lp LoaderParams) error {
 		return fmt.Errorf("systemd: write loader unit: %w", err)
 	}
 	return nil
+}
+
+// RemoveCommon tears down the SHARED, account-agnostic artifacts InstallCommon
+// wrote: the @-template shim unit and anonctl's early-boot loader unit, plus the
+// (now empty) anonctl-private env/rules dirs this Store owns. It is used on the
+// LAST account's teardown (the caller guards on HasForcedAccounts) so a fully
+// torn-down host leaves no anonctl residue (the e2e finding, BUG 4). It is
+// idempotent: a missing unit file is a clean no-op. It removes the env/rules dirs
+// ONLY when they are empty (os.Remove refuses a non-empty dir), so it can never
+// rip out a survivor account's files even if called out of turn.
+func (s Store) RemoveCommon() error {
+	for _, path := range []string{
+		filepath.Join(s.unitDir(), UnitName),
+		filepath.Join(s.unitDir(), LoaderUnitName),
+	} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("systemd: remove %q: %w", path, err)
+		}
+	}
+	// Remove the anonctl-private dirs ONLY when empty: os.Remove on a non-empty dir
+	// fails (which we tolerate), so a survivor's files are never ripped out. An absent
+	// dir is a clean no-op.
+	for _, dir := range []string{s.envDir(), s.rulesDir()} {
+		if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) && !isNotEmpty(err) {
+			return fmt.Errorf("systemd: remove dir %q: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// isNotEmpty reports whether err is the "directory not empty" error os.Remove
+// returns for a non-empty dir, which RemoveCommon deliberately tolerates (it must
+// never delete a survivor account's files).
+func isNotEmpty(err error) bool {
+	return errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST)
 }
 
 // WriteAccount persists ONE account's per-account artifacts: its EnvironmentFile

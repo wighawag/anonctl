@@ -125,6 +125,43 @@ func TestRemoveIsIdempotent(t *testing.T) {
 	}
 }
 
+// RemoveBaseDirIfEmpty removes the config dir ONLY when no configs remain, used on
+// the LAST account's teardown so a fully torn-down host leaves no empty
+// /etc/anonctl/accounts dir (the e2e finding, BUG 4). It must be a clean no-op when
+// the dir is absent, and must NEVER remove a dir that still holds a survivor
+// account's config.
+func TestRemoveBaseDirIfEmpty(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "accounts")
+	store := accountconfig.Store{BaseDir: dir}
+
+	// Absent dir: a clean no-op.
+	if err := store.RemoveBaseDirIfEmpty(); err != nil {
+		t.Errorf("RemoveBaseDirIfEmpty(absent) = %v, want nil", err)
+	}
+
+	// A survivor config keeps the dir.
+	if err := store.Write(sample()); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := store.RemoveBaseDirIfEmpty(); err != nil {
+		t.Fatalf("RemoveBaseDirIfEmpty(non-empty) = %v, want nil", err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("RemoveBaseDirIfEmpty removed a non-empty config dir: %v", err)
+	}
+
+	// After the last config is gone, the empty dir is removed.
+	if err := store.Remove("anon"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if err := store.RemoveBaseDirIfEmpty(); err != nil {
+		t.Fatalf("RemoveBaseDirIfEmpty(empty) = %v, want nil", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("RemoveBaseDirIfEmpty left the empty config dir behind")
+	}
+}
+
 func TestWriteRejectsMalformedConfig(t *testing.T) {
 	store := accountconfig.Store{BaseDir: t.TempDir()}
 	cases := map[string]func(*accountconfig.Config){

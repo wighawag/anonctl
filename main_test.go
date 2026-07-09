@@ -11,6 +11,19 @@ import (
 	"github.com/wighawag/anonctl/internal/verify"
 )
 
+// verifyHint renders the follow-up `anonctl verify` command an operator would type
+// next. The DEFAULT account is a BARE verb (no name), so the hint must be exactly
+// `anonctl verify` with NO trailing space where the empty account name used to go
+// (the e2e finding, BUG 5); a named account appends its short name.
+func TestVerifyHintHasNoTrailingSpaceForDefaultAccount(t *testing.T) {
+	if got := verifyHint(cli.DefaultAccount); got != "anonctl verify" {
+		t.Errorf("verifyHint(default) = %q, want %q (no trailing space)", got, "anonctl verify")
+	}
+	if got := verifyHint("anon-work"); got != "anonctl verify work" {
+		t.Errorf("verifyHint(named) = %q, want %q", got, "anonctl verify work")
+	}
+}
+
 // The version fast-path exits 0 before any parse (no verb, no root needed).
 func TestVersionArg(t *testing.T) {
 	for _, args := range [][]string{{"--version"}, {"version"}} {
