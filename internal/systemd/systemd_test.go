@@ -99,24 +99,8 @@ func TestEnvFilePeruserEndpointHasEmptyIsolationUser(t *testing.T) {
 	}
 }
 
-// --- the nftables persistence drop-in (the boot invariant's load-bearing half) ---
-
-func TestNftablesDropInLoadsAnonctlRulesAtBoot(t *testing.T) {
-	dropin := systemd.NftablesDropIn(systemd.NftablesDropInParams{RulesGlob: "/etc/anonctl/nftables/*.nft"})
-	// The drop-in extends the host's nftables.service WITHOUT editing its
-	// /etc/nftables.conf: an ExecStartPost that loads anonctl's own per-account rule
-	// files. Because the default-DROP is IN those persisted rules and nftables.service
-	// loads early, the boot invariant holds (worst case dropped, never leaking).
-	if !strings.Contains(dropin, "ExecStartPost") {
-		t.Errorf("nftables drop-in must load anonctl rules via ExecStartPost:\n%s", dropin)
-	}
-	if !strings.Contains(dropin, "/etc/anonctl/nftables/") {
-		t.Errorf("nftables drop-in must reference anonctl's rules dir:\n%s", dropin)
-	}
-	if !strings.Contains(dropin, "nft") {
-		t.Errorf("nftables drop-in must invoke nft to load the rules:\n%s", dropin)
-	}
-}
+// (The early-boot nftables LOADER unit, which replaced the nftables.service
+// drop-in, is covered by loader_test.go.)
 
 // --- instance name ---
 

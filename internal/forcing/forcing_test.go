@@ -23,12 +23,15 @@ type fakeNft struct{ ev *[]event }
 
 func (f fakeNft) Run(_ context.Context, stdin, name string, args ...string) (string, string, error) {
 	// The command discriminator: an apply pipes a full ruleset, a delete pipes a
-	// `delete table` line.
+	// `delete table` line. The detail carries the piped stdin (the ruleset / delete
+	// line), so a test can distinguish the baseline apply from the forcing apply and
+	// assert on the exact table names, not just that `nft` ran.
 	kind := "nft-apply"
 	if strings.HasPrefix(strings.TrimSpace(stdin), "delete table") {
 		kind = "nft-delete"
 	}
-	*f.ev = append(*f.ev, event{kind, strings.Join(append([]string{name}, args...), " ")})
+	detail := strings.Join(append([]string{name}, args...), " ") + " | " + strings.TrimSpace(stdin)
+	*f.ev = append(*f.ev, event{kind, detail})
 	return "", "", nil
 }
 
@@ -106,6 +109,34 @@ func TestInstallPersistsConfigEnvAndRuleFile(t *testing.T) {
 	if _, err := d.ConfigStore.Read("anon"); err != nil {
 		t.Errorf("Install did not persist the account config: %v", err)
 	}
+	// The standing baseline default-deny is persisted as its own always-loaded file,
+	// so forcing-absent still means DROPPED at boot.
+	if _, err := os.Stat(filepath.Join(d.SystemdStore.RulesDir, "anon.baseline.nft")); err != nil {
+		t.Errorf("Install did not persist the baseline default-deny file: %v", err)
+	}
+}
+
+func TestInstallAppliesBaselineBeforeForcingAndEnablesLoader(t *testing.T) {
+	d, ev := testDeps(t)
+	if err := forcing.Install(context.Background(), d, sampleConfig(), nil); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	// INVERTED INVARIANT ORDERING: the BASELINE default-deny is applied FIRST, before
+	// the forcing rules and before the shim, so from the very first moment the account
+	// can act its real egress is dropped (never a window with neither present).
+	baselineIdx := firstIndexOf(*ev, "nft-apply", "anonctl_baseline_anon")
+	forcingIdx := firstIndexOf(*ev, "nft-apply", "anonctl_anon {")
+	if baselineIdx < 0 || forcingIdx < 0 {
+		t.Fatalf("expected both a baseline apply and a forcing apply; got %+v", *ev)
+	}
+	if baselineIdx > forcingIdx {
+		t.Errorf("baseline default-deny applied AFTER the forcing rules (resting-deny window); order: %+v", *ev)
+	}
+	// anonctl's OWN early-boot loader unit is enabled, so the baseline + forcing load
+	// at the next boot independent of the host's nftables.service.
+	if firstIndexOf(*ev, "systemctl", "enable anonctl-nftables.service") < 0 {
+		t.Errorf("Install did not enable anonctl's own early-boot loader unit; events: %+v", *ev)
+	}
 }
 
 func TestReconfigureReAppliesBeforeRestartWithNoLeakWindow(t *testing.T) {
@@ -162,16 +193,54 @@ func TestRemoveDisablesShimAndClearsState(t *testing.T) {
 	if err := forcing.Remove(context.Background(), d, "anon"); err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
-	// Remove disables the shim AND deletes the account's nft table.
-	if firstIndexOf(*ev, "systemctl", "disable") < 0 {
+	// Remove disables the shim AND deletes the account's forcing table AND its
+	// baseline table.
+	if firstIndexOf(*ev, "systemctl", "anonctl-shim@anon.service") < 0 {
 		t.Errorf("Remove did not disable the shim; events: %+v", *ev)
 	}
-	if firstIndexOf(*ev, "nft-delete", "nft") < 0 {
-		t.Errorf("Remove did not delete the account's nft table; events: %+v", *ev)
+	if firstIndexOf(*ev, "nft-delete", "delete table inet anonctl_anon") < 0 {
+		t.Errorf("Remove did not delete the account's forcing table; events: %+v", *ev)
+	}
+	if firstIndexOf(*ev, "nft-delete", "delete table inet anonctl_baseline_anon") < 0 {
+		t.Errorf("Remove did not delete the account's baseline table; events: %+v", *ev)
+	}
+	// This was the LAST account, so anonctl's shared early-boot loader unit is
+	// disabled (a fully torn-down host leaves no anonctl unit enabled).
+	if firstIndexOf(*ev, "systemctl", "disable anonctl-nftables.service") < 0 {
+		t.Errorf("Remove of the last account did not disable the loader unit; events: %+v", *ev)
 	}
 	// The at-rest config is gone (a torn-down account leaves no residue).
 	if _, err := d.ConfigStore.Read("anon"); err != accountconfig.ErrNotFound {
 		t.Errorf("Remove left the account config behind: %v", err)
+	}
+	// The baseline file is gone too.
+	if _, err := os.Stat(filepath.Join(d.SystemdStore.RulesDir, "anon.baseline.nft")); !os.IsNotExist(err) {
+		t.Errorf("Remove left the baseline file behind")
+	}
+}
+
+func TestRemoveKeepsLoaderWhileAnotherAccountRemains(t *testing.T) {
+	d, ev := testDeps(t)
+	// Two accounts forced.
+	if err := forcing.Install(context.Background(), d, sampleConfig(), nil); err != nil {
+		t.Fatalf("Install anon: %v", err)
+	}
+	second := sampleConfig()
+	second.Account = "anon-work"
+	second.AnonUID = 41000
+	second.ShimUID = 990
+	if err := forcing.Install(context.Background(), d, second, nil); err != nil {
+		t.Fatalf("Install anon-work: %v", err)
+	}
+	*ev = nil
+	// Remove ONE account; the other survives, so the shared loader must STAY enabled
+	// (it still restores the survivor at boot). The loader is disabled only on the
+	// LAST account's teardown.
+	if err := forcing.Remove(context.Background(), d, "anon"); err != nil {
+		t.Fatalf("Remove anon: %v", err)
+	}
+	if firstIndexOf(*ev, "systemctl", "disable anonctl-nftables.service") >= 0 {
+		t.Errorf("Remove disabled the shared loader while another account remains; events: %+v", *ev)
 	}
 }
 

@@ -2,16 +2,25 @@
 // reconfigures an account's forced-egress persistence: it ties together the
 // account config (internal/accountconfig, the at-rest record), the kernel rules
 // (internal/nftables, generate + apply), and the systemd persistence
-// (internal/systemd, the @-template shim unit + the nftables.service drop-in +
+// (internal/systemd, the @-template shim unit + anonctl's early-boot loader unit +
 // the per-account env/rule files). It is what `add` / `rm` / `update` call after
 // the account itself is provisioned.
 //
-// It is designed around the BOOT INVARIANT and the NO-LEAK-WINDOW property:
+// It is designed around the BOOT INVARIANT and the NO-LEAK-WINDOW property, using
+// the INVERTED design: the anon UID's RESTING STATE is a standing per-UID
+// default-deny (the baseline), and forcing layers on top to OPEN the shim path. So
+// "the anon UID has no anonctl forcing loaded" means DROPPED, not free.
 //
-//   - Install and Reconfigure APPLY the nft rules (which carry the fail-closed
-//     default-DROP) and PERSIST them (the rule file the boot drop-in loads) so the
-//     forcing survives a reboot and re-applies fail-closed. The persisted default-
-//     DROP loading early is what makes the boot invariant hold.
+//   - Install applies the BASELINE default-deny FIRST (before the forcing rules and
+//     before the shim), so from the very first moment the account can act its real
+//     egress is dropped, then applies the forcing rules on top and PERSISTS both as
+//     their own always-loaded rule files. It also enables anonctl's OWN early-boot
+//     loader unit, so at boot the baseline + forcing load INDEPENDENT of the host's
+//     nftables.service (which Debian ships disabled). If the forcing fails, the shim
+//     is down, or the endpoint is down, the standing baseline still DROPS.
+//   - Reconfigure re-applies the forcing rules (which carry the fail-closed
+//     default-DROP) as an atomic table replace; the standing baseline is untouched
+//     throughout, so the resting deny never lapses.
 //   - Reconfigure (update) rewrites the endpoint and RE-APPLIES with no
 //     un-anonymized window: the nft rules are re-applied as an ATOMIC table
 //     replace (the default-DROP is never absent), THEN the shim env file is
@@ -75,6 +84,12 @@ func Install(ctx context.Context, d Deps, c accountconfig.Config, exemptions []l
 	// Apply the live rules (fail-closed default-DROP) FIRST, then persist the rule
 	// file the boot drop-in loads, so the running state and the persisted state
 	// agree and the account is forced both now and after a reboot.
+	// Apply the standing BASELINE default-deny FIRST, so the anon UID's resting state
+	// is DROP before either the forcing rules or the shim exist: there is no window
+	// where the account can act with neither present. Forcing then layers on top.
+	if err := nftables.ApplyBaseline(ctx, d.NftRunner, c.Account, c.AnonUID); err != nil {
+		return fmt.Errorf("forcing: apply baseline default-deny: %w", err)
+	}
 	if err := applyRuleset(ctx, d.NftRunner, c, exemptions); err != nil {
 		return err
 	}
@@ -82,13 +97,17 @@ func Install(ctx context.Context, d Deps, c accountconfig.Config, exemptions []l
 		return fmt.Errorf("forcing: persist per-account systemd files: %w", err)
 	}
 
-	// Install the account-agnostic template unit + nftables.service drop-in
-	// (idempotent), reload systemd so they are picked up, then enable --now the
-	// account's shim instance.
-	if err := d.SystemdStore.InstallCommon(systemd.TemplateParams{}, systemd.NftablesDropInParams{}); err != nil {
+	// Install the account-agnostic template unit + anonctl's early-boot loader unit
+	// (idempotent), reload systemd so they are picked up, ENABLE the loader (so the
+	// baseline + forcing load at the next boot, independent of the host's
+	// nftables.service), then enable --now the account's shim instance.
+	if err := d.SystemdStore.InstallCommon(systemd.TemplateParams{}, systemd.LoaderParams{}); err != nil {
 		return fmt.Errorf("forcing: install common systemd artifacts: %w", err)
 	}
 	if err := systemd.DaemonReload(ctx, d.SystemdRunner); err != nil {
+		return err
+	}
+	if err := systemd.EnableLoader(ctx, d.SystemdRunner); err != nil {
 		return err
 	}
 	if err := systemd.EnableNow(ctx, d.SystemdRunner, c.Account); err != nil {
@@ -132,23 +151,27 @@ func Reconfigure(ctx context.Context, d Deps, c accountconfig.Config, exemptions
 }
 
 // Remove turns off forcing for an account: it disables --now the shim instance,
-// deletes the live nft table (leaving every other table untouched), and removes
-// the per-account systemd files and the at-rest config. It is idempotent: a
-// not-enabled instance, an absent table's delete, and a missing file are all clean
-// no-ops (a torn-down account leaves no residue). The marker removal stays in the
-// caller (rm already removes it), so this focuses on the forcing artifacts.
+// deletes the live nft forcing table AND the standing baseline default-deny table
+// (leaving every other table untouched), removes the per-account systemd files (env
+// + forcing + baseline rule files) and the at-rest config, and disables anonctl's
+// early-boot loader unit ONLY when this was the LAST account (no rule files remain).
+// It is idempotent: a not-enabled instance, an absent table's delete, and a missing
+// file are all clean no-ops (a torn-down account leaves no residue). The marker
+// removal stays in the caller (rm already removes it), so this focuses on the
+// forcing artifacts.
 func Remove(ctx context.Context, d Deps, account string) error {
 	// Stop + disable the shim first so it is not left running against rules we are
 	// about to delete.
 	if err := systemd.DisableNow(ctx, d.SystemdRunner, account); err != nil {
 		return err
 	}
-	// Delete only this account's table; ignore a not-found (idempotent teardown).
+	// Delete only this account's forcing table AND its baseline table; ignore a
+	// not-found (idempotent teardown). A missing table on teardown is not a failure:
+	// the account may never have been forced.
 	if err := nftables.Delete(ctx, d.NftRunner, account); err != nil {
-		// A missing table on teardown is not a failure: the account may never have
-		// been forced. We surface any OTHER error, but tolerate the absent-table case
-		// by not aborting rm. The nftables.Delete error text carries nft's message;
-		// callers that must distinguish can, but rm's contract is idempotent teardown.
+		_ = err
+	}
+	if err := nftables.DeleteBaseline(ctx, d.NftRunner, account); err != nil {
 		_ = err
 	}
 	if err := d.SystemdStore.RemoveAccount(account); err != nil {
@@ -156,6 +179,20 @@ func Remove(ctx context.Context, d Deps, account string) error {
 	}
 	if err := d.ConfigStore.Remove(account); err != nil {
 		return fmt.Errorf("forcing: remove account config: %w", err)
+	}
+	// If this was the LAST forced account (no rule files remain), disable anonctl's
+	// shared early-boot loader unit so a fully torn-down host leaves no anonctl unit
+	// enabled. While ANY account survives, the loader stays enabled to restore the
+	// survivors at boot. A read error here is surfaced; a not-enabled unit's disable
+	// is a clean no-op.
+	hasAccounts, err := d.SystemdStore.HasForcedAccounts()
+	if err != nil {
+		return fmt.Errorf("forcing: check remaining forced accounts: %w", err)
+	}
+	if !hasAccounts {
+		if err := systemd.DisableLoader(ctx, d.SystemdRunner); err != nil {
+			return err
+		}
 	}
 	return nil
 }

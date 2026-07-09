@@ -35,12 +35,19 @@ func (nftExec) Run(ctx context.Context, stdin, name string, args ...string) (str
 
 // TestBootInvariantAnonUIDHasNoDirectEgressBeforeShim is the load-bearing proof of
 // the BOOT INVARIANT: "at no point during boot does the anon UID have direct
-// egress." It is a reboot-EQUIVALENT early-boot simulation: it loads ONLY the
-// PERSISTED nft rules (the rule file the boot drop-in loads, carrying the
-// fail-closed default-DROP) and does NOT start the shim, reproducing the boot
-// window where the rules are up but the shim/endpoint are not yet. It then asserts,
-// AS the anon UID, that a direct outbound connection is DROPPED (the worst observed
-// case is dropped, never leaking).
+// egress." It is a reboot-EQUIVALENT early-boot simulation. Under the INVERTED
+// design it loads the PERSISTED rules the loader unit would `nft -f` at boot - BOTH
+// the standing baseline default-deny AND the per-account forcing table - and does
+// NOT start the shim, reproducing the boot window where the rules are up but the
+// shim/endpoint are not yet. It then asserts, AS the anon UID, that a direct
+// outbound connection is DROPPED (the worst observed case is dropped, never
+// leaking).
+//
+// It ALSO reproduces the ORIGINAL failure's fix at this layer: after loading the
+// rules it FLUSHES the forcing table (the exact post-reboot state the finding
+// observed, where the forcing rules were absent) and re-asserts the anon UID is
+// STILL DROPPED - because the standing baseline default-deny remains. Under the old
+// design (no baseline, forcing absent) that same state LEAKED the host's real IP.
 //
 // It is guarded by the `integration` tag and NOT part of the default
 // `go test ./...`; it needs root + nft + setpriv and SKIPS (not fails) without
@@ -94,31 +101,44 @@ func TestBootInvariantAnonUIDHasNoDirectEgressBeforeShim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate persisted ruleset: %v", err)
 	}
+	baseline, err := nftables.GenerateBaseline(cfg.Account, cfg.AnonUID)
+	if err != nil {
+		t.Fatalf("generate persisted baseline: %v", err)
+	}
+	baselineTable := nftables.BaselineTableName(cfg.Account)
 
 	const sentinel = "anonctl_boot_itest_sentinel"
 	mustLoad(t, r, "table inet "+sentinel+" {}\n")
 
-	// Always clean up BOTH tables, even on a mid-test failure, so the host is left
+	// Always clean up ALL tables, even on a mid-test failure, so the host is left
 	// as found (shared-write isolation).
 	defer func() {
 		_, _, _ = r.Run(ctx, "delete table inet "+table, "nft", "-f", "-")
+		_, _, _ = r.Run(ctx, "delete table inet "+baselineTable, "nft", "-f", "-")
 		_, _, _ = r.Run(ctx, "delete table inet "+sentinel, "nft", "-f", "-")
-		if tableLoaded(t, r, table) {
-			t.Errorf("cleanup left the account table %q behind", table)
+		if tableLoaded(t, r, baselineTable) {
+			t.Errorf("cleanup left the baseline table %q behind", baselineTable)
 		}
 		if tableLoaded(t, r, sentinel) {
 			t.Errorf("cleanup left the sentinel table %q behind", sentinel)
 		}
 	}()
 
-	// EARLY-BOOT SIMULATION: load ONLY the persisted rules (default-DROP), with NO
-	// shim running. This is the exact state at boot after nftables.service (+ the
-	// anonctl drop-in) has loaded the rules but before the shim is up.
+	// EARLY-BOOT SIMULATION: load the persisted rules the loader unit would `nft -f`
+	// at boot - BOTH the baseline default-deny and the forcing table - with NO shim
+	// running. This is the exact state at boot after anonctl's early loader has loaded
+	// the rules but before the shim is up.
+	if _, stderr, err := r.Run(ctx, baseline, "nft", "-f", "-"); err != nil {
+		t.Fatalf("load persisted baseline: %v: %s", err, stderr)
+	}
 	if _, stderr, err := r.Run(ctx, ruleset, "nft", "-f", "-"); err != nil {
 		t.Fatalf("load persisted boot ruleset: %v: %s", err, stderr)
 	}
 	if !tableLoaded(t, r, table) {
 		t.Fatalf("persisted ruleset did not load the account table %q", table)
+	}
+	if !tableLoaded(t, r, baselineTable) {
+		t.Fatalf("persisted baseline did not load the baseline table %q", baselineTable)
 	}
 
 	// THE BOOT INVARIANT: with the rules up but the shim NOT running, the anon UID's
@@ -144,6 +164,25 @@ func TestBootInvariantAnonUIDHasNoDirectEgressBeforeShim(t *testing.T) {
 	// scope to exactly the account's own table.
 	if !tableLoaded(t, r, sentinel) {
 		t.Errorf("loading the persisted boot ruleset clobbered the host's other rules (sentinel gone)")
+	}
+
+	// REPRODUCE THE ORIGINAL FAILURE'S STATE, PROVE THE FIX: the finding observed that
+	// after a reboot the FORCING table was absent and the anon UID leaked the host's
+	// real IP. Flush ONLY the forcing table (the exact post-reboot state under the old
+	// design) and re-probe: because the standing baseline default-deny remains, the
+	// anon UID must STILL be DROPPED. Under the old design (no baseline) this same
+	// state LEAKED; the baseline is what closes it.
+	if _, stderr, err := r.Run(ctx, "delete table inet "+table, "nft", "-f", "-"); err != nil {
+		t.Fatalf("flush the forcing table: %v: %s", err, stderr)
+	}
+	if tableLoaded(t, r, table) {
+		t.Fatalf("flushing the forcing table left it behind")
+	}
+	if !tableLoaded(t, r, baselineTable) {
+		t.Fatalf("flushing the forcing table wrongly removed the standing baseline")
+	}
+	if setprivDialReached(t, ctx, anonUID, "tcp", "1.1.1.1:443") {
+		t.Errorf("REBOOT-LEAK REGRESSION: with the forcing table absent (the finding's observed post-reboot state) the anon UID reached 1.1.1.1:443 directly; the standing baseline default-deny must keep it DROPPED")
 	}
 }
 

@@ -10,22 +10,26 @@
 //     distinct shim UID per account), which is why this is a templated per-account
 //     unit and NOT one multiplexer process for all accounts (ADR). `add` enables
 //     the instance (`enable --now`); `rm` disables it (`disable --now`).
-//   - the anonctl-owned nftables ruleset persisted via an `nftables.service`
-//     DROP-IN (`/etc/systemd/system/nftables.service.d/anonctl.conf`) whose
-//     `ExecStartPost` loads anonctl's per-account rule files from
-//     `/etc/anonctl/nftables/*.nft`. The drop-in EXTENDS the host's nftables.service
-//     without editing its `/etc/nftables.conf`, so the host's own rules are left
-//     untouched (the shared-write isolation discipline).
+//   - the anonctl-owned nftables ruleset persisted and loaded at boot by anonctl's
+//     OWN early-ordered LOADER unit (`anonctl-nftables.service`), which `nft -f`s
+//     anonctl's per-account rule files from `/etc/anonctl/nftables/*.nft`. It is
+//     WantedBy=sysinit.target, DefaultDependencies=no, Before=network-pre.target,
+//     so it loads BEFORE the network is up and does NOT depend on the host's
+//     `nftables.service` (which Debian ships DISABLED). This REPLACES the earlier
+//     `nftables.service` drop-in, whose reliance on a host-owned, silently
+//     re-disableable unit meant the rules were absent at boot and the anon UID
+//     leaked the host's real IP after a reboot (the e2e finding, BUG 1).
 //
 // The BOOT INVARIANT ("at no point during boot does the anon UID have direct
-// egress") holds because the nft default-DROP is part of the persisted ruleset and
-// nftables.service loads it EARLY: if the shim/endpoint are not yet up, the anon
-// UID is DROPPED, never leaking. The shim unit only orders After=network.target
-// (it does NOT depend on, nor manage, the endpoint's own service, which anonctl
-// does not own): fail-closed by the kernel rules means "dropped until the shim and
-// endpoint are up" is safe.
+// egress") holds by INVERSION: each account also has a standing per-UID
+// default-deny (internal/nftables.GenerateBaseline) whose resting state is DROP,
+// loaded by this same early unit. Forcing (the redirect-into-shim rules) layers on
+// top to OPEN the shim path; the ABSENCE of forcing is DROPPED, never free. The
+// shim unit only orders After=network.target (it does NOT depend on, nor manage,
+// the endpoint's own service, which anonctl does not own): fail-closed by the
+// kernel rules means "dropped until the shim and endpoint are up" is safe.
 //
-// The pure GENERATION (TemplateUnit / EnvFile / NftablesDropIn / InstanceName) is
+// The pure GENERATION (TemplateUnit / EnvFile / LoaderUnit / InstanceName) is
 // unit-tested everywhere with no privilege; the install/enable/reload/disable
 // WIRING flows every mutation through a Runner (systemctl) and a Store (the file
 // writes), so it is unit-testable against fakes and the ONE test that touches real
@@ -54,8 +58,9 @@ const DefaultUnitDir = "/etc/systemd/system"
 // endpoint address (no secret, but not a public signal either).
 const DefaultEnvDir = "/etc/anonctl/shim"
 
-// DefaultRulesDir holds the persisted per-account nft rule files the nftables.service
-// drop-in loads at boot (`/etc/anonctl/nftables/<account>.nft`).
+// DefaultRulesDir holds the persisted per-account nft rule files anonctl's early
+// loader unit loads at boot: both the standing baseline default-deny
+// (`<account>.baseline.nft`) and the per-account forcing table (`<account>.nft`).
 const DefaultRulesDir = "/etc/anonctl/nftables"
 
 // DefaultShimBinaryPath is where the template unit's ExecStart finds the shim
@@ -63,11 +68,10 @@ const DefaultRulesDir = "/etc/anonctl/nftables"
 // can override it; this is the conventional default.
 const DefaultShimBinaryPath = "/usr/local/bin/anonctl-shim"
 
-// nftablesDropInPath is the anonctl-owned drop-in that EXTENDS the host's
-// nftables.service without touching its /etc/nftables.conf. Behind Store so tests
-// point it at a scratch dir.
-const nftablesDropInDir = DefaultUnitDir + "/nftables.service.d"
-const nftablesDropInName = "anonctl.conf"
+// LoaderUnitName is anonctl's OWN early-boot nftables loader unit. It is anonctl's
+// unit (not a host unit anonctl mutates), so `add` may enable it without touching
+// any host-owned service. It REPLACES the earlier nftables.service drop-in.
+const LoaderUnitName = "anonctl-nftables.service"
 
 // TemplateParams parameterises the ONE template unit (account-agnostic: the
 // account is the `%i` instance, its per-account params come from the env file).
@@ -175,45 +179,61 @@ func EnvFile(c accountconfig.Config) string {
 	return b.String()
 }
 
-// NftablesDropInParams parameterises the nftables.service drop-in.
-type NftablesDropInParams struct {
-	// RulesGlob is the shell glob the ExecStartPost loads at boot; when empty it is
+// LoaderParams parameterises anonctl's own early-boot nftables loader unit.
+type LoaderParams struct {
+	// RulesGlob is the shell glob the ExecStart loads at boot; when empty it is
 	// `<DefaultRulesDir>/*.nft`.
 	RulesGlob string
 }
 
-// NftablesDropIn generates the `nftables.service` drop-in that persists anonctl's
-// ruleset across reboot. It is a DROP-IN (a separate file under
-// nftables.service.d), so it EXTENDS the host's nftables.service without editing
-// its `/etc/nftables.conf`: the host's own rules load as before, and anonctl's
-// per-account rule files are loaded AFTER via ExecStartPost. Because the persisted
-// rules carry the default-DROP and nftables.service loads early, the boot
-// invariant holds: at no point during boot does the anon UID have direct egress
-// (worst case dropped-until-shim-up, never leaking).
+// LoaderUnit generates anonctl's OWN early-boot nftables loader unit
+// (`anonctl-nftables.service`). It `nft -f`s anonctl's per-account rule files (both
+// the standing baseline default-deny and the per-account forcing tables) at boot,
+// INDEPENDENT of the host's `nftables.service`. It REPLACES the earlier drop-in on
+// nftables.service, whose reliance on a host-owned unit Debian ships disabled meant
+// the rules were absent at boot and the anon UID leaked the host's real IP after a
+// reboot (the e2e finding, BUG 1). anonctl owns this unit, so `add` enabling it
+// mutates no host service; a later `systemctl disable nftables` cannot re-open the
+// leak.
 //
-// The first ExecStartPost= is an empty reset so anonctl's line does not stack if
-// the host already sets one; then the loader iterates anonctl's rule files. It
-// tolerates an empty rules dir (a `for` over a possibly-empty glob) so boot never
-// fails when no account is forced.
-func NftablesDropIn(p NftablesDropInParams) string {
+// It is ordered EARLY so the standing default-deny is present before the anon UID
+// could act: WantedBy=sysinit.target (pulled in early), DefaultDependencies=no (not
+// held to the normal late boot phase), Before=network-pre.target (loaded before the
+// network is configured). The load itself iterates the glob, so a missing/empty
+// rules dir is a clean no-op and boot never fails when no account is forced. It is
+// a oneshot with RemainAfterExit so systemd tracks it as active after the load.
+func LoaderUnit(p LoaderParams) string {
 	glob := p.RulesGlob
 	if glob == "" {
 		glob = DefaultRulesDir + "/*.nft"
 	}
 	var b strings.Builder
 	w := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
-	w("# anonctl nftables persistence (generated). Drop-in on nftables.service:")
-	w("# it EXTENDS the host's nftables.service (its /etc/nftables.conf is untouched)")
-	w("# by loading anonctl's per-account rule files AFTER the host's own rules. The")
-	w("# persisted rules carry the fail-closed default-DROP, and nftables.service")
-	w("# loads early, so at no point during boot does a forced UID have direct egress")
-	w("# (the boot invariant): worst case is dropped-until-shim-up, never leaking.")
+	w("# anonctl early-boot nftables loader (generated). anonctl's OWN unit: it does NOT")
+	w("# ride on the host's firewall service (which Debian ships disabled, so the rules")
+	w("# were absent at boot and the anon UID leaked the host's real IP). It loads")
+	w("# anonctl's per-account rule files (the standing baseline default-deny AND the")
+	w("# forcing tables) EARLY, before the network is up, so the resting-state DROP is")
+	w("# present from the first moment the anon UID could egress (the boot invariant).")
+	w("[Unit]")
+	w("Description=anonctl early-boot nftables loader (baseline default-deny + forcing)")
+	// Run early: not held to the normal late boot phase, and ordered before the
+	// network is configured, so the deny is up before any egress is possible.
+	w("DefaultDependencies=no")
+	w("Before=network-pre.target")
+	w("Wants=network-pre.target")
+	w("")
 	w("[Service]")
+	w("Type=oneshot")
+	w("RemainAfterExit=yes")
 	// Load each anonctl per-account rule file. `sh -c` so the glob expands at boot;
 	// a missing/empty dir is a clean no-op (the for-loop body never runs), so boot
 	// never fails when no account is forced. Each file is a self-contained atomic
 	// `nft -f` load of that account's own table.
-	w("ExecStartPost=/bin/sh -c 'for f in %s; do [ -e \"$f\" ] && /usr/sbin/nft -f \"$f\"; done'", glob)
+	w("ExecStart=/bin/sh -c 'for f in %s; do [ -e \"$f\" ] && /usr/sbin/nft -f \"$f\"; done'", glob)
+	w("")
+	w("[Install]")
+	w("WantedBy=sysinit.target")
 	return b.String()
 }
 
@@ -229,6 +249,31 @@ type Runner interface {
 func DaemonReload(ctx context.Context, r Runner) error {
 	if _, stderr, err := r.Run(ctx, "systemctl", "daemon-reload"); err != nil {
 		return fmt.Errorf("systemd: daemon-reload: %w: %s", err, stderr)
+	}
+	return nil
+}
+
+// EnableLoader enables anonctl's OWN early-boot nftables loader
+// (`systemctl enable anonctl-nftables.service`) so the persisted baseline + forcing
+// rules load at boot INDEPENDENT of the host's nftables.service. It is anonctl's
+// own unit, so this mutates no host-owned service. It enables WITHOUT --now: the
+// live rules are already applied by `add` (via nft), so there is no need to run the
+// loader immediately; it only needs to be wired to fire at the NEXT boot. It is
+// idempotent (re-enabling an already-enabled unit is a clean no-op).
+func EnableLoader(ctx context.Context, r Runner) error {
+	if _, stderr, err := r.Run(ctx, "systemctl", "enable", LoaderUnitName); err != nil {
+		return fmt.Errorf("systemd: enable %s: %w: %s", LoaderUnitName, err, stderr)
+	}
+	return nil
+}
+
+// DisableLoader disables anonctl's early-boot loader
+// (`systemctl disable anonctl-nftables.service`), used on the LAST account's
+// teardown so a fully torn-down host leaves no anonctl unit enabled. A not-enabled
+// unit is tolerated by systemctl (a clean no-op), so this is idempotent.
+func DisableLoader(ctx context.Context, r Runner) error {
+	if _, stderr, err := r.Run(ctx, "systemctl", "disable", LoaderUnitName); err != nil {
+		return fmt.Errorf("systemd: disable %s: %w: %s", LoaderUnitName, err, stderr)
 	}
 	return nil
 }

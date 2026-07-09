@@ -24,7 +24,7 @@ anonctl update|reconfigure --endpoint <socks5h://host:port> [<name>]   re-point 
 anonctl --version | version                                  print the version
 ```
 
-A **bare verb** targets the default account `anon`; `<name>` targets `anon-<name>`, so you can run several independently-anonymized accounts (`anonctl add work` provisions `anon-work`). Each account gets its OWN dedicated shim service account (`<account>-shim`), the only UID allowed to reach the upstream endpoint. The forcing survives reboots (an anonctl-owned nftables ruleset loaded via `nftables.service`, plus a per-account `anonctl-shim@<account>.service`) and re-applies fail-closed at boot, so there is never a window where the account has un-anonymized egress.
+A **bare verb** targets the default account `anon`; `<name>` targets `anon-<name>`, so you can run several independently-anonymized accounts (`anonctl add work` provisions `anon-work`). Each account gets its OWN dedicated shim service account (`<account>-shim`), the only UID allowed to reach the upstream endpoint. The forcing survives reboots (an anonctl-owned nftables ruleset loaded at boot by anonctl's OWN early unit `anonctl-nftables.service`, independent of the host's `nftables.service`, plus a per-account `anonctl-shim@<account>.service`) and re-applies fail-closed at boot. The account's RESTING STATE is a standing default-deny, so an anon UID with no forcing loaded is DROPPED, not free: there is never a window where the account has un-anonymized egress.
 
 ```sh
 sudo anonctl add                    # provision + force `anon` through the local Tor SOCKS port
@@ -46,7 +46,7 @@ anonctl's one **guarantee** is **per-UID fail-closed anonymized egress**: every 
 
 - **An app choosing a wrong proxy, or no proxy at all.** The forcing is at the **kernel**, keyed on the account's UID, so a proxy-unaware or misconfigured tool cannot escape it: its raw sockets are redirected into the shim regardless of what it thinks its proxy is.
 - **A DNS leak.** DNS from the account is resolved **remotely over the endpoint** (DNS-over-SOCKS-TCP, socks5h), never as a plaintext query, so you do not leak via DNS. `verify` tests this, it is not merely configured.
-- **An anonymizer-down leak.** The account's default egress policy is **DROP** (fail-closed). If the endpoint is unreachable, the account's traffic is dropped, never quietly falling back to the direct route. This holds at boot too: the default-DROP loads early, so the worst case is dropped-until-the-shim-and-endpoint-are-up, never leaking-until-forcing-is-applied.
+- **An anonymizer-down leak.** The account's default egress policy is **DROP** (fail-closed). If the endpoint is unreachable, the account's traffic is dropped, never quietly falling back to the direct route. This holds at boot too, by INVERSION: the anon UID's resting state is a standing per-UID default-deny loaded by anonctl's own early unit, and forcing only ever OPENS the shim path. So the worst case is dropped-until-the-shim-and-endpoint-are-up, and even forcing-absent (the rules never loaded) is dropped-not-free, never leaking.
 - **Cross-identification of two accounts on a shared endpoint** (see [The cross-identification boundary](#the-cross-identification-boundary) for the exact, share-class-bounded shape of this one).
 
 ### NOT defended (accepted residual)
