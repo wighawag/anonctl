@@ -1,6 +1,3 @@
-//go:build integration
-// +build integration
-
 package verify
 
 import (
@@ -9,7 +6,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/wighawag/anonctl/internal/endpoint"
 	"github.com/wighawag/anonctl/internal/lanexempt"
 )
 
@@ -42,12 +38,14 @@ const (
 	offBoxProbePort = 9999
 )
 
-// LiveChecks (integration build) is the REAL assertion set: it stands up live
-// probes AS the anon UID against the fail-closed ruleset the nftables task
-// installed, and feeds their outcomes to the PURE assertion decisions in
-// verify.go. It is compiled ONLY under the `integration` build tag (it needs root
-// + setpriv + a live endpoint); the default build ships checks_default.go, which
-// fails honestly instead of silently passing.
+// LiveChecks is the REAL assertion set: it stands up live probes AS the anon UID
+// against the fail-closed ruleset the nftables task installed, and feeds their
+// outcomes to the PURE assertion decisions in verify.go. It is compiled into
+// EVERY build (it is runtime behaviour, like `add`/`rm`, not a test): the probing
+// needs root + setpriv + the installed shim probe binary + a live endpoint, and
+// FAILS LOUD at runtime when it lacks any of them (a probe that could not run is
+// not a pass), never a silent green. Only the SLOW/PRIVILEGED *test* files stay
+// behind the `integration` build tag.
 //
 // It runs EVERY probe (RunVerify does not short-circuit) so the report is
 // complete: the load-bearing leak drop (v4 AND v6), both bypass closures, and,
@@ -100,7 +98,11 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 			return escapedLeakProbeAssertion(AssertLeakDropV4, "a direct v4 connection from the anon UID", reached, err)
 		}},
 		{Name: AssertLeakDropV6, Run: func(ctx context.Context) Assertion {
-			return LeakDropAssertion("v6", probeAsAnon(ctx, p, "tcp6", "[::1]:1"))
+			reached, err := probeAsAnon(ctx, p, "tcp6", "[::1]:1")
+			if err != nil {
+				return Assertion{Name: AssertLeakDropV6, Err: err}
+			}
+			return LeakDropAssertion("v6", reached)
 		}},
 		{Name: AssertBypassLoopbackClosure, Run: func(ctx context.Context) Assertion {
 			// Closure (a): the anon UID must not reach an arbitrary destination directly.
@@ -136,18 +138,32 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 			// gets no reply => reached=false => PASS. The off-box target is a
 			// documentation/TEST-NET address; the probe never depends on it being up
 			// (a dropped ping and an unreachable host both read as reached=false, the
-			// safe outcome), it reads whether the anon UID could EMIT ICMP at all.
-			return ICMPDropAssertion(pingAsAnon(ctx, p, icmpProbeTarget))
+			// safe outcome), it reads whether the anon UID could EMIT ICMP at all. A
+			// MISSING ping/setpriv fails the assertion LOUD (not a silent reached=false
+			// pass): a probe that could not run is not a pass.
+			reached, err := pingAsAnon(ctx, p, icmpProbeTarget)
+			if err != nil {
+				return Assertion{Name: AssertICMPDrop, Err: err}
+			}
+			return ICMPDropAssertion(reached)
 		}},
 		{Name: AssertNonTCPUDPDrop, Run: func(ctx context.Context) Assertion {
 			// Tails leak-catalogue row 5: raw non-53 UDP AND specifically UDP/443 (QUIC)
 			// from the anon UID must be DROPPED (SOCKS carries TCP only). Both dial an
 			// off-box UDP destination AS the anon UID; a dropped datagram is refused /
 			// times out => reached=false => PASS.
+			// A MISSING setpriv/shim probe binary fails the assertion LOUD (not a silent
+			// reached=false pass): a probe that could not run is not a pass.
 			rawUDP := net.JoinHostPort(udpProbeHost, strconv.Itoa(udpRawProbePort))
 			quicUDP := net.JoinHostPort(udpProbeHost, "443")
-			raw := udpSendAsAnon(ctx, p, rawUDP)
-			quic := udpSendAsAnon(ctx, p, quicUDP)
+			raw, err := udpSendAsAnon(ctx, p, rawUDP)
+			if err != nil {
+				return Assertion{Name: AssertNonTCPUDPDrop, Err: err}
+			}
+			quic, err := udpSendAsAnon(ctx, p, quicUDP)
+			if err != nil {
+				return Assertion{Name: AssertNonTCPUDPDrop, Err: err}
+			}
 			return NonTCPUDPDropAssertion(raw, quic)
 		}},
 		{Name: AssertNoUIDTransitionEgress, Run: func(ctx context.Context) Assertion {
@@ -163,7 +179,12 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 		checks = append(checks, Check{Name: AssertSplitTunnelTight, Run: func(ctx context.Context) Assertion {
 			// The exempted target is RETURNed from the nat chain (not redirected), so it
 			// egresses DIRECTLY: a real handshake to it is a truthful reachability signal.
-			exemptReached := probeAsAnon(ctx, p, "tcp4", p.Exempt)
+			// A MISSING setpriv/shim probe binary fails the assertion LOUD, never a silent
+			// reached=false (which would misreport the exemption as broken for a tool reason).
+			exemptReached, err := probeAsAnon(ctx, p, "tcp4", p.Exempt)
+			if err != nil {
+				return Assertion{Name: AssertSplitTunnelTight, Err: err}
+			}
 			// A NON-exempt sibling in the same LAN is NOT returned: its TCP is redirected
 			// into the shim, so a loopback handshake with the relay would false-"reach".
 			// Read the escaped-leak counter keyed on the sibling's off-box daddr instead:
@@ -239,12 +260,12 @@ func exemptHost(exempt string) string {
 // This is used only for the non-tcp-udp-drop assertion, which dials an OFF-BOX UDP
 // destination (nat redirects only udp/53, so any other UDP falls through to the
 // policy DROP and the EPERM is a truthful off-box drop signal, no counter needed).
-func udpSendAsAnon(ctx context.Context, p LiveParams, addr string) bool {
+func udpSendAsAnon(ctx context.Context, p LiveParams, addr string) (bool, error) {
 	return probeAsAnon(ctx, p, "udp4", addr)
 }
 
 // offBoxReachedAsAnon is the closure/leak probes' single entry point onto the
-// escaped-leak counter (offBoxLeakReached, probes_integration.go): it reports
+// escaped-leak counter (offBoxLeakReached, probes_live.go): it reports
 // whether an anon-UID packet ESCAPED the box still carrying the OFF-BOX daddr (a
 // real leak) vs was redirected into the shim / dropped (the PASS). It reads the
 // counter, NEVER a completed loopback handshake with the transparent relay.
@@ -276,13 +297,15 @@ func offBoxReachedAsAnon(ctx context.Context, p LiveParams, counterDaddr, l4 str
 // probeAsAnon dials addr AS the anon UID (setpriv drops to it) with a short
 // timeout, returning whether the connection REACHED its target. A dropped
 // connection (fail-closed / closure) times out or is refused => reached=false.
-// This is the runtime twin of the integration test's probeAsAnon; it lives here
-// (integration-tagged) because it needs setpriv + the account UID.
-func probeAsAnon(ctx context.Context, p LiveParams, network, addr string) bool {
+// This is the runtime twin of the integration test's probeAsAnon; it needs
+// setpriv + the installed shim probe binary + the account UID.
+//
+// A probe that could NOT RUN (setpriv / shim probe binary missing) returns a LOUD
+// error, never a silent reached=false (which a drop assertion would read as a
+// PASS): a probe that could not run is not a pass.
+func probeAsAnon(ctx context.Context, p LiveParams, network, addr string) (bool, error) {
 	pctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
-	out, _, _ := runSetprivProbe(pctx, p.AnonUID, network, addr)
-	return out
+	reached, _, err := runSetprivProbe(pctx, p.AnonUID, network, addr)
+	return reached, err
 }
-
-var _ = endpoint.ClassTorShared // keep the endpoint import meaningful under this tag

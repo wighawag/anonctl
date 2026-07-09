@@ -39,10 +39,13 @@
 // logic (Report, Assertion, Run, the per-assertion decision functions), unit-
 // tested EVERYWHERE against internal/socks5hfixture with NO real Tor; the LIVE
 // checks that stand up real probes as the anon UID against a real ruleset live in
-// verify_integration.go behind the `integration` build tag (they need root + a
-// live endpoint). The assertion NAMES and the JSON SHAPE are a deliberate
-// contract (ADR 0003); the checks feed the pure decisions here so the verdict
-// logic is proven without privilege.
+// checks_live.go / probes_live.go and are compiled into EVERY build (runtime
+// behaviour needing root + setpriv + the installed shim probe binary + a live
+// endpoint, like `add`/`rm`; they FAIL LOUD when a tool/probe cannot run, never a
+// silent pass). The `integration` build tag now gates only the slow/privileged
+// *test* files. The assertion NAMES and the JSON SHAPE are a deliberate contract
+// (ADR 0003); the checks feed the pure decisions here so the verdict logic is
+// proven without privilege.
 package verify
 
 import (
@@ -261,12 +264,11 @@ func Run(ctx context.Context, checks []Check) Report {
 // (empty when no LAN exemption is active, which SKIPS that assertion cleanly).
 //
 // It is the seam between the runtime command (main wiring, which discovers these
-// from the provisioned account) and the build-tag-split LiveChecks: the default
-// build cannot stand up the real probes (they need root + setpriv + a live
-// endpoint), so LiveChecks is compiled per build tag (checks_default.go returns a
-// single honest fail; checks_integration.go returns the real set). The pure
-// assertion decisions in this file are shared by BOTH and are what the unit suite
-// proves against the fixture with no privilege.
+// from the provisioned account) and LiveChecks. LiveChecks is compiled into EVERY
+// build (the probing is runtime behaviour needing root + setpriv + the installed
+// shim probe binary + a live endpoint, like `add`/`rm`; it FAILS LOUD at runtime
+// when it lacks any, never a silent pass). The pure assertion decisions in this
+// file are what the unit suite proves against the fixture with no privilege.
 type LiveParams struct {
 	// Account is the anon account being verified (`anon` / `anon-<name>`).
 	Account string
@@ -294,12 +296,12 @@ type LiveParams struct {
 }
 
 // RunVerify is the runtime orchestrator behind `anonctl verify`: it composes the
-// account+endpoint header and runs the LIVE assertion set (LiveChecks, which is
-// build-tag-split) with no short-circuit, so the report is complete and the exit
-// code is the CI-gating verdict. It is the single entry point main wires to; the
-// header states which account/endpoint was proven, and every assertion the build
-// provides runs. The default build's LiveChecks fails honestly (a binary built
-// without the live probes cannot silently "pass" verification).
+// account+endpoint header and runs the LIVE assertion set (LiveChecks) with no
+// short-circuit, so the report is complete and the exit code is the CI-gating
+// verdict. It is the single entry point main wires to; the header states which
+// account/endpoint was proven, and every assertion runs. A probe that cannot run
+// (missing root/setpriv/shim/endpoint) fails LOUD, so verify can never silently
+// "pass" verification.
 func RunVerify(ctx context.Context, p LiveParams) Report {
 	rep := Run(ctx, LiveChecks(ctx, p))
 	rep.Account = p.Account

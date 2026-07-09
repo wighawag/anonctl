@@ -1,6 +1,3 @@
-//go:build integration
-// +build integration
-
 package verify
 
 import (
@@ -9,15 +6,14 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anonctl/internal/sudoprobe"
+	"github.com/wighawag/anonctl/internal/systemd"
 )
 
 // clearLANDNSReached reports whether a DIRECT clear-DNS query from the anon UID to
@@ -85,10 +81,15 @@ func offBoxLeakReached(ctx context.Context, p LiveParams, counterDaddr, l4 strin
 	// Dial the off-box destination AS the anon UID; a genuine leak keeps the off-box
 	// daddr and hits the counter, a redirect/drop does not. We ignore whether the
 	// dial "succeeded" (a loopback handshake with the relay always does); only the
-	// counter is decisive.
+	// counter is decisive. But a probe that could NOT RUN (setpriv/shim missing) is
+	// propagated LOUD: if the dial never happened, a counter that stayed 0 is not
+	// evidence of "no leak", it is evidence of "nothing was probed" (a probe that
+	// could not run is not a pass).
 	pctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
-	_, _, _ = runSetprivProbe(pctx, p.AnonUID, probeNetwork, probeAddr)
+	if _, _, perr := runSetprivProbe(pctx, p.AnonUID, probeNetwork, probeAddr); perr != nil {
+		return false, perr
+	}
 
 	out, stderr, err := nftRun(ctx, "", "nft", "list", "table", "inet", escapedLeakCounterTable)
 	if err != nil {
@@ -98,8 +99,8 @@ func offBoxLeakReached(ctx context.Context, p LiveParams, counterDaddr, l4 strin
 }
 
 // nftRun shells out to nft (optionally with a ruleset on stdin), returning
-// stdout/stderr/err. It is the counter-probe's ONLY nft access and lives here
-// (integration-tagged) because it needs root.
+// stdout/stderr/err. It is the counter-probe's ONLY nft access; it needs root at
+// runtime (like `add`/`rm`) and its error is surfaced as a LOUD failing assertion.
 func nftRun(ctx context.Context, stdin, name string, args ...string) (string, string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	if stdin != "" {
@@ -112,13 +113,14 @@ func nftRun(ctx context.Context, stdin, name string, args ...string) (string, st
 	return strings.TrimSpace(out.String()), strings.TrimSpace(errb.String()), err
 }
 
-// This file is the IMPURE live-probe machinery behind checks_integration.go's
+// This file is the IMPURE live-probe machinery behind checks_live.go's
 // LiveChecks: standing up real connections AS the anon UID (setpriv), fetching the
 // forced-path exit IP through the shim relay, and gathering the dns-remote
-// evidence. It is integration-tagged (needs root + setpriv + a live endpoint); the
-// pure assertion decisions it feeds live in verify.go and are unit-proven against
-// the fixture. Every probe fails SAFE (an error or empty result feeds a FAILING
-// pure decision), never a false pass.
+// evidence. It is compiled into every build (runtime behaviour needing root +
+// setpriv + the installed shim probe binary + a live endpoint, failing LOUD when
+// it lacks any); the pure assertion decisions it feeds live in verify.go and are
+// unit-proven against the fixture. Every probe fails SAFE (an error or empty
+// result feeds a FAILING pure decision), never a false pass.
 
 // ipEchoURL is the public IP-echo the exit-IP probes fetch: it returns the
 // caller's observed source IP as plain text. The host baseline hits it directly;
@@ -132,75 +134,44 @@ const ipEchoURL = "https://api.ipify.org"
 // forced one.
 const torCheckURL = "https://check.torproject.org/api/ip"
 
-// probeHelperBin is a tiny compiled dialer (built once, lazily) that connects to
-// its argv target and prints REACHED / DROPPED. It is run UNDER setpriv so the
-// dial egresses from the anon UID, exercising the real nft `meta skuid` rules.
-// Building a helper (rather than a fragile bash /dev/tcp) keeps the probe robust
-// across shells and IP families. It mirrors the integration test's helper.
-var (
-	probeHelperOnce sync.Once
-	probeHelperBin  string
-)
+// probeShimBinary is the installed static shim binary verify execs (under setpriv)
+// as its dialer: `anonctl-shim -probe <network> <addr>`. It is the SAME binary the
+// per-account shim units run (internal/systemd.DefaultShimBinaryPath), already
+// installed and static, so verify reuses it and needs NO Go toolchain on the
+// user's host. It is a package var (not the bare constant) ONLY so the live probe
+// suite can point it at a throwaway-built shim; production leaves it at the default.
+var probeShimBinary = systemd.DefaultShimBinaryPath
 
-// probeSource is the dialer helper: connect with a timeout, print the outcome.
-const probeSource = `package main
-import ("fmt";"net";"os";"strings";"time")
-func main(){
-	if len(os.Args)<3 { fmt.Print("DROPPED:usage"); return }
-	c,e:=(&net.Dialer{Timeout:3*time.Second}).Dial(os.Args[1],os.Args[2])
-	if e!=nil { fmt.Print("DROPPED:",e); return }
-	// For UDP the Dial is connectionless and never proves reachability; the nft
-	// meta-skuid DROP surfaces as an EPERM on the actual sendto, so WRITE a
-	// datagram and read whether the kernel let it out (recipe row 5: a dropped
-	// UDP write returns "operation not permitted"). For TCP the Dial establishing
-	// already proves REACHED.
-	if strings.HasPrefix(os.Args[1],"udp"){
-		_,we:=c.Write([]byte("x"))
-		c.Close()
-		if we!=nil { fmt.Print("DROPPED:",we); return }
-		fmt.Print("REACHED"); return
-	}
-	c.Close(); fmt.Print("REACHED")
-}`
-
-// buildProbeHelper compiles the dialer helper once. A build failure leaves the
-// path empty, and runSetprivProbe then reports reached=false (the fail-closed
-// reading), never a false REACHED.
-func buildProbeHelper() {
-	if _, err := exec.LookPath("go"); err != nil {
-		return
-	}
-	dir, err := os.MkdirTemp("", "anonctl-verify-probe")
-	if err != nil {
-		return
-	}
-	src := dir + "/probe.go"
-	if err := os.WriteFile(src, []byte(probeSource), 0o644); err != nil {
-		return
-	}
-	bin := dir + "/probe"
-	if out, berr := exec.Command("go", "build", "-o", bin, src).CombinedOutput(); berr == nil {
-		probeHelperBin = bin
-	} else {
-		os.Stderr.Write(out)
-	}
-}
-
-// runSetprivProbe dials network/addr AS the given UID via the compiled helper run
-// under setpriv (so the connection egresses from the anon UID, exercising the nft
-// `meta skuid` rules). It returns whether the dial REACHED its target. A missing
-// setpriv or helper yields reached=false (the fail-closed reading), never a false
-// REACHED.
+// runSetprivProbe dials network/addr AS the given UID by exec'ing the installed
+// static shim binary in `-probe` mode under setpriv (so the connection egresses
+// from the anon UID, exercising the nft `meta skuid` rules). It returns whether
+// the dial REACHED its target.
+//
+// A missing `setpriv` or a missing/un-runnable shim probe binary is a LOUD ERROR
+// (never a silent reached=false, which the drop assertions would read as a PASS):
+// a probe that could not run is not a pass. verify/use require these on the host
+// exactly as `add`/`rm` require nft/useradd; the error names the missing tool.
 func runSetprivProbe(ctx context.Context, uid int, network, addr string) (reached bool, stderr string, err error) {
-	probeHelperOnce.Do(buildProbeHelper)
-	if probeHelperBin == "" {
-		return false, "probe helper unavailable", nil
+	if _, err := exec.LookPath("setpriv"); err != nil {
+		return false, "", fmt.Errorf("need setpriv on PATH to run the anon-UID probe (as `add`/`rm` need nft): %w", err)
+	}
+	if _, err := exec.LookPath(probeShimBinary); err != nil {
+		return false, "", fmt.Errorf("need the installed shim probe binary %q to run the anon-UID probe (install anonctl-shim there, or set the shim unit's ExecStart path): %w", probeShimBinary, err)
 	}
 	cmd := exec.CommandContext(ctx, "setpriv",
 		"--reuid", strconv.Itoa(uid), "--clear-groups",
-		probeHelperBin, network, addr)
+		probeShimBinary, "-probe", network, addr)
 	out, _ := cmd.CombinedOutput()
-	return strings.Contains(string(out), "REACHED"), string(out), nil
+	s := string(out)
+	// The shim probe ALWAYS prints exactly `REACHED` or `DROPPED:<reason>`. If we
+	// see neither, the probe binary never ran under the anon UID (e.g. setpriv could
+	// not drop: not root, or the anon UID does not exist), so this is an UN-RUNNABLE
+	// probe, NOT a dropped connection: fail LOUD (a probe that could not run is not a
+	// pass), never a silent reached=false the drop assertions would read as a PASS.
+	if !strings.Contains(s, "REACHED") && !strings.Contains(s, "DROPPED") {
+		return false, s, fmt.Errorf("the anon-UID probe could not run (setpriv could not drop to uid %d, or the shim probe did not execute): %s", uid, strings.TrimSpace(s))
+	}
+	return strings.Contains(s, "REACHED"), s, nil
 }
 
 // pingAsAnon sends a single ICMP echo AS the anon UID (setpriv drops to it) to an
@@ -214,9 +185,17 @@ func runSetprivProbe(ctx context.Context, uid int, network, addr string) (reache
 // anonctl drops ICMP for the anon UID ONLY, so `ping` for every OTHER uid on the
 // box (and the machine's own PMTU discovery) is untouched; this is why anonctl
 // does NOT set `net.ipv4.tcp_mtu_probing` the way Tails (OS-wide ICMP drop) does.
-func pingAsAnon(ctx context.Context, p LiveParams, target string) bool {
-	if _, err := exec.LookPath("ping"); err != nil {
-		return false
+//
+// A MISSING `ping` or `setpriv` is a LOUD error (named), never a silent
+// reached=false the icmp-drop assertion would read as a PASS: a probe that could
+// not run is not a pass. Only a probe that genuinely RAN and observed no reply
+// reads as reached=false (the honest drop).
+func pingAsAnon(ctx context.Context, p LiveParams, target string) (reached bool, err error) {
+	if _, e := exec.LookPath("setpriv"); e != nil {
+		return false, fmt.Errorf("need setpriv on PATH to run the icmp-drop probe as the anon UID: %w", e)
+	}
+	if _, e := exec.LookPath("ping"); e != nil {
+		return false, fmt.Errorf("need ping on PATH to run the icmp-drop probe: %w", e)
 	}
 	pctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
@@ -226,10 +205,19 @@ func pingAsAnon(ctx context.Context, p LiveParams, target string) bool {
 		"--reuid", strconv.Itoa(p.AnonUID), "--clear-groups",
 		"ping", "-c", "1", "-W", "3", "-n", target)
 	out, _ := cmd.CombinedOutput()
-	// A reply ("1 received" / "bytes from") means ICMP egressed and came back (a
-	// leak). No reply / an error / an EPERM on the raw socket => reached=false.
 	s := string(out)
-	return strings.Contains(s, "bytes from") || strings.Contains(s, "1 received") || strings.Contains(s, "1 packets received")
+	// A reply ("1 received" / "bytes from") means ICMP egressed and came back (a
+	// leak). A ping that RAN but got no reply prints its own summary line
+	// ("packets transmitted"), which is the honest drop => reached=false. If we see
+	// NEITHER a reply NOR that summary, ping never ran under the anon UID (setpriv
+	// could not drop: not root, or the anon UID does not exist), so this is an
+	// UN-RUNNABLE probe: fail LOUD (a probe that could not run is not a pass), never
+	// a silent reached=false the icmp-drop assertion would read as a PASS.
+	reply := strings.Contains(s, "bytes from") || strings.Contains(s, "1 received") || strings.Contains(s, "1 packets received")
+	if !reply && !strings.Contains(s, "packets transmitted") {
+		return false, fmt.Errorf("the icmp-drop probe could not run (setpriv could not drop to uid %d, or ping did not execute): %s", p.AnonUID, strings.TrimSpace(s))
+	}
+	return reply, nil
 }
 
 // hostExitIP fetches the host's OWN direct exit IP (no shim) as the baseline the
@@ -419,8 +407,8 @@ func sudoVector(ctx context.Context, p LiveParams) UIDTransitionVector {
 // runSudoList shells out to `sudo -l -U <account>` and returns its stdout+stderr
 // (the exit code is DELIBERATELY ignored: the verdict is read from the OUTPUT via
 // sudoprobe.ParseOutput, robust to lenient builds that exit 0 for a no-rights
-// account). It is the sudoVector's ONLY sudo access and lives here
-// (integration-tagged) because the live probe needs a real sudo.
+// account). It is the sudoVector's ONLY sudo access; the live probe needs a real
+// sudo on the host at runtime.
 func runSudoList(ctx context.Context, account string) (stdout, stderr string) {
 	cmd := exec.CommandContext(ctx, "sudo", "-l", "-U", account)
 	var out, errb strings.Builder
