@@ -65,9 +65,12 @@ type AccountStatus struct {
 	UID        string `json:"uid,omitempty"`
 	ShimUID    string `json:"shimUid,omitempty"`
 
-	// SudoChecked reports whether the sudo-absence probe actually RAN for this
-	// account (it runs only for an existing account; an absent account is not
-	// probed). SudoAllowed is meaningful only when SudoChecked is true.
+	// SudoChecked reports whether the sudo-absence probe produced a DECISIVE verdict
+	// for this account. It is false in two cases: the account does not exist (not
+	// probed at all), and the probe ran but its `sudo -l -U` output was ambiguous /
+	// unparseable (UNKNOWN: we do not guess). SudoAllowed is meaningful only when
+	// SudoChecked is true; a false here means "no reliable sudo verdict", never a
+	// silent "no sudo". `status` renders the UNKNOWN case as an explicit line.
 	SudoChecked bool `json:"sudoChecked"`
 	// SudoAllowed is the POSITIVE result of the `sudo -l -U <account>` probe: false
 	// means the account has no sudo rights (the hardened, expected state), true means
@@ -236,24 +239,74 @@ func Status(ctx context.Context, r Runner, account string) (AccountStatus, error
 	// Positively probe the sudo-absence invariant, but ONLY for an existing account
 	// (probing a non-existent account would be a meaningless "no sudo"). This surfaces
 	// the CLOSE-AT-ADD no-sudo hardening as a checkable fact an operator sees in
-	// `status`, not just an absence at add-time.
+	// `status`, not just an absence at add-time. An AMBIGUOUS probe (sudoUnknown)
+	// leaves SudoChecked=false: it is UNKNOWN, not a verdict, so it never reads as a
+	// false "has sudo" (a false alarm) NOR a false "no sudo" (which would hide a real
+	// escape). See sudoRights for the parse and how UNKNOWN maps onto the pair.
 	if exists {
-		st.SudoChecked = true
-		st.SudoAllowed = sudoAllowed(ctx, r, account)
+		switch sudoRights(ctx, r, account) {
+		case sudoDenied:
+			st.SudoChecked = true
+			st.SudoAllowed = false
+		case sudoGranted:
+			st.SudoChecked = true
+			st.SudoAllowed = true
+		case sudoUnknown:
+			// Leave SudoChecked=false: no reliable verdict. The `status` shell renders
+			// this as an explicit UNKNOWN line (see main.go runStatus).
+		}
 	}
 	return st, nil
 }
 
-// sudoAllowed probes whether the account has ANY sudo rights via
-// `sudo -l -U <account>` (list the account's permitted sudo commands). sudo exits
-// non-zero and prints "not allowed to run sudo" when the account has none; a
-// zero-exit listing means it CAN sudo. We read the exit code as the truth (false
-// == no sudo, the hardened state), treating a probe that could not run at all
-// (sudo absent) as "no sudo path here": if the box has no sudo binary the vector
-// is closed for this account too. This is the PROVE side of the sudo vector.
-func sudoAllowed(ctx context.Context, r Runner, account string) bool {
-	_, _, err := r.Run(ctx, "sudo", "-l", "-U", account)
-	return err == nil
+// sudoVerdict is the three-valued result of the sudo-absence probe. sudo-absence
+// cannot be read from the exit code alone: some sudo builds (observed: 1.9.16p2,
+// work/notes/findings/e2e-binary-revalidation-2.md) print the not-allowed text yet
+// exit 0 for a no-rights account, so an exit-code-only read false-alarms "can
+// sudo". We read the OUTPUT instead, and honestly report sudoUnknown when it is
+// neither a clear grant nor a clear denial rather than guessing either way.
+type sudoVerdict int
+
+const (
+	// sudoUnknown: the probe could not be classified (empty/ambiguous/unparseable
+	// output, or the probe could not run). Surfaced as UNKNOWN / not-checked, NEVER
+	// as a false "has sudo" or a false "no sudo".
+	sudoUnknown sudoVerdict = iota
+	// sudoDenied: the output carries the decisive "not allowed to run sudo" negative.
+	// The account has no sudo rights (the hardened state), whatever the exit code.
+	sudoDenied
+	// sudoGranted: the output lists permitted commands (a real grant). The account
+	// CAN sudo (a uid-transition escape), whatever the exit code.
+	sudoGranted
+)
+
+// sudoRights probes whether the account has ANY sudo rights via
+// `sudo -l -U <account>` (list the account's permitted sudo commands) and decides
+// from the OUTPUT, not the exit code. It reads stdout+stderr (the negative is
+// commonly on stderr, the listing on stdout) and classifies via parseSudoOutput.
+// This is the PROVE side of the sudo vector, robust to lenient sudo builds that
+// exit 0 for a no-rights account.
+func sudoRights(ctx context.Context, r Runner, account string) sudoVerdict {
+	stdout, stderr, _ := r.Run(ctx, "sudo", "-l", "-U", account)
+	return parseSudoOutput(stdout + "\n" + stderr)
+}
+
+// parseSudoOutput classifies `sudo -l -U <account>` OUTPUT into the three-valued
+// verdict WITHOUT trusting the exit code. It is a pure function so the parse is
+// unit-testable against real-shaped fixtures. Precedence is DENY-first: if the
+// decisive "not allowed to run sudo" negative is present the account has no rights
+// even on a build that also prints noise; else a permitted-commands listing ("may
+// run the following commands") is a grant; anything else is UNKNOWN (we do not
+// guess). Matching is case-insensitive to tolerate build/locale casing drift.
+func parseSudoOutput(out string) sudoVerdict {
+	lower := strings.ToLower(out)
+	if strings.Contains(lower, "not allowed to run sudo") {
+		return sudoDenied
+	}
+	if strings.Contains(lower, "may run the following commands") {
+		return sudoGranted
+	}
+	return sudoUnknown
 }
 
 // ensureLoginAccount creates the login account if absent (idempotent). It is a

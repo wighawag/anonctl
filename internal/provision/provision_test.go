@@ -36,18 +36,40 @@ type fakeRunner struct {
 	calls       [][]string
 	present     map[string]bool // accounts getent should report as existing
 	sudoAllowed bool            // when true, `sudo -l -U` reports the account CAN sudo
+
+	// sudoScript, when set, fully overrides the default `sudo -l -U` fixture so a
+	// test can drive an EXACT stdout/stderr/exit-code shape (the lenient exit-0
+	// no-rights build, a real grant, the not-allowed text, an ambiguous blob) through
+	// the same Runner seam - no real sudo. It takes precedence over sudoAllowed.
+	sudoScript *sudoResult
+}
+
+// sudoResult is a scripted `sudo -l -U` outcome for the fake Runner: the exact
+// stdout, stderr and (via exit) error the real sudo would return, so the parse is
+// tested against real-shaped fixtures without a real sudo binary.
+type sudoResult struct {
+	stdout string
+	stderr string
+	exit   int // 0 => nil error; non-zero => an *exitErr with that code
 }
 
 func (r *fakeRunner) Run(_ context.Context, name string, args ...string) (string, string, error) {
 	r.calls = append(r.calls, append([]string{name}, args...))
 	// sudo -l -U <account>: the read-only sudo-absence probe. By default report the
 	// finding-observed "not allowed" (a freshly-provisioned anon account has no sudo
-	// rights); a test can flip sudoAllowed to exercise the positive-detection path.
+	// rights); a test can flip sudoAllowed to exercise the positive-detection path,
+	// or set sudoScript for an exact stdout/stderr/exit fixture.
 	if name == "sudo" {
-		if r.sudoAllowed {
-			return "User is allowed to run the following commands", "", nil
+		if r.sudoScript != nil {
+			if r.sudoScript.exit == 0 {
+				return r.sudoScript.stdout, r.sudoScript.stderr, nil
+			}
+			return r.sudoScript.stdout, r.sudoScript.stderr, &exitErr{code: r.sudoScript.exit}
 		}
-		return "", "User is not allowed to run sudo on host.", &exitErr{code: 1}
+		if r.sudoAllowed {
+			return "User anon may run the following commands on host:\n    (ALL : ALL) ALL", "", nil
+		}
+		return "", "User anon is not allowed to run sudo on host.", &exitErr{code: 1}
 	}
 	// getent passwd <name>: report presence from the scripted set. A missing entry
 	// is getent's exit-2 (an error with empty stdout), same as the real tool.
@@ -441,5 +463,75 @@ func TestStatusAbsentDoesNotProbeSudo(t *testing.T) {
 	}
 	if st.SudoChecked {
 		t.Errorf("SudoChecked = true on an absent account, want false")
+	}
+}
+
+// status reads sudo-absence from the OUTPUT, not the exit code alone: on a lenient
+// sudo build that prints "not allowed to run sudo" but exits 0 for a no-rights
+// account (observed: sudo 1.9.16p2, work/notes/findings/e2e-binary-revalidation-2.md),
+// the account must still be read as NO sudo (SudoChecked=true, SudoAllowed=false),
+// NOT a false "can sudo" false-alarm.
+func TestStatusLenientExitZeroNotAllowedReadsAsNoSudo(t *testing.T) {
+	r := &fakeRunner{
+		present:    map[string]bool{"anon": true, "anon-shim": true},
+		sudoScript: &sudoResult{stdout: "User anon is not allowed to run sudo on host.\n", exit: 0},
+	}
+	st, err := provision.Status(context.Background(), r, "anon")
+	if err != nil {
+		t.Fatalf("Status error: %v", err)
+	}
+	if !st.SudoChecked {
+		t.Errorf("SudoChecked = false, want true: the not-allowed text is a decisive verdict")
+	}
+	if st.SudoAllowed {
+		t.Errorf("SudoAllowed = true on a lenient exit-0 not-allowed output, want false (must not false-alarm)")
+	}
+}
+
+// status still CATCHES a genuine grant: a real permitted-commands listing (the
+// "may run the following commands" shape) is read as SudoAllowed=true, whatever the
+// exit code, so the parse never hides a real sudo escape.
+func TestStatusRealGrantReadsAsSudoAllowed(t *testing.T) {
+	r := &fakeRunner{
+		present: map[string]bool{"anon": true, "anon-shim": true},
+		sudoScript: &sudoResult{stdout: "Matching Defaults entries for anon on host:\n    env_reset\n\n" +
+			"User anon may run the following commands on host:\n    (ALL : ALL) ALL\n", exit: 0},
+	}
+	st, err := provision.Status(context.Background(), r, "anon")
+	if err != nil {
+		t.Fatalf("Status error: %v", err)
+	}
+	if !st.SudoChecked || !st.SudoAllowed {
+		t.Errorf("a real permitted-commands listing must report SudoChecked=true SudoAllowed=true; got checked=%v allowed=%v", st.SudoChecked, st.SudoAllowed)
+	}
+}
+
+// status surfaces an AMBIGUOUS / unparseable probe result as UNKNOWN (not-checked),
+// NEVER as a false "has sudo" (a false alarm) NOR a false "no sudo" (which would
+// hide a real escape): output with neither the not-allowed text nor a
+// permitted-commands listing is not a verdict. UNKNOWN maps onto SudoChecked=false.
+func TestStatusAmbiguousOutputReadsAsUnknown(t *testing.T) {
+	cases := map[string]*sudoResult{
+		"empty exit0":     {stdout: "", stderr: "", exit: 0},
+		"empty exit1":     {stdout: "", stderr: "", exit: 1},
+		"unrelated blob":  {stdout: "sudo: a password is required\n", stderr: "", exit: 1},
+		"garbled listing": {stdout: "something happened but not a recognisable verdict\n", exit: 0},
+	}
+	for name, script := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := &fakeRunner{present: map[string]bool{"anon": true, "anon-shim": true}, sudoScript: script}
+			st, err := provision.Status(context.Background(), r, "anon")
+			if err != nil {
+				t.Fatalf("Status error: %v", err)
+			}
+			// UNKNOWN: no verdict. SudoChecked=false (so SudoAllowed is meaningless and is
+			// never read as either a false "has sudo" or a false "no sudo").
+			if st.SudoChecked {
+				t.Errorf("SudoChecked = true on an ambiguous probe (%s), want false (UNKNOWN)", name)
+			}
+			if st.SudoAllowed {
+				t.Errorf("SudoAllowed = true on an ambiguous probe (%s): must never false-alarm", name)
+			}
+		})
 	}
 }
