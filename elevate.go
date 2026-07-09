@@ -104,11 +104,11 @@ func maybeElevate(verb, account string, args []string) (handled bool, exitCode i
 		//   - any other root verb: same reason; run it from your normal account.
 		switch {
 		case verb == "use" && account == session:
-			fmt.Fprintf(os.Stderr, "anonctl: already inside the anonctl session for %q; nothing to do (type `exit` to leave it)\n", session)
+			errorf("already inside the anonctl session for %q; nothing to do (type `exit` to leave it)", session)
 		case verb == "use":
-			fmt.Fprintf(os.Stderr, "anonctl: cannot switch from the anonctl session for %q to %q in place (the anon account has no sudo to re-elevate); type `exit` to leave this session, then run `%s` from your normal account\n", session, account, useCommandFor(account))
+			errorf("cannot switch from the anonctl session for %q to %q in place (the anon account has no sudo to re-elevate); type `exit` to leave this session, then run `%s` from your normal account", session, account, useCommandFor(account))
 		default:
-			fmt.Fprintf(os.Stderr, "anonctl: %s needs root, but you are inside the anonctl session for %q (the anon account has no sudo); type `exit` to leave it, then run the command from your normal account\n", verb, session)
+			errorf("%s needs root, but you are inside the anonctl session for %q (the anon account has no sudo); type `exit` to leave it, then run the command from your normal account", verb, session)
 		}
 		return true, 1
 	}
@@ -126,8 +126,9 @@ func maybeElevate(verb, account string, args []string) (handled bool, exitCode i
 	}
 
 	// Predictable + honest: a short stderr line so the coming password prompt is not
-	// a surprise. STDERR, never stdout, so `--json` output stays pure.
-	fmt.Fprintf(os.Stderr, "anonctl: %s needs root; re-running via sudo...\n", verb)
+	// a surprise. STDERR, never stdout, so `--json` output stays pure. Dimmed (not red):
+	// this is an informational notice, not an error.
+	fmt.Fprint(os.Stderr, errStyle.Dim(fmt.Sprintf("anonctl: %s needs root; re-running via sudo...", verb))+"\n")
 
 	// argv: sudo <self> <original args...>, preserving flags/account/--json exactly.
 	argv := append([]string{sudoPath, self}, args...)
@@ -162,7 +163,7 @@ func runElevated(sudoPath string, argv, env []string) int {
 		if errors.As(err, &ee) {
 			return ee.ExitCode()
 		}
-		fmt.Fprintf(os.Stderr, "anonctl: re-exec via sudo failed: %v\n", err)
+		errorf("re-exec via sudo failed: %v", err)
 		return 1
 	}
 	return 0

@@ -37,11 +37,28 @@ import (
 	"github.com/wighawag/anonctl/internal/provision"
 	"github.com/wighawag/anonctl/internal/seedhome"
 	"github.com/wighawag/anonctl/internal/systemd"
+	"github.com/wighawag/anonctl/internal/ui"
 	"github.com/wighawag/anonctl/internal/verify"
 )
 
 func main() {
 	os.Exit(run(os.Args[1:]))
+}
+
+// errStyle / outStyle are the per-stream color helpers the CLI prints through. They
+// colorize ONLY when the stream is an interactive terminal and color is not disabled
+// (NO_COLOR), so piped output and the --json path stay byte-plain. Built once at
+// startup.
+var (
+	errStyle = ui.Stderr()
+	outStyle = ui.Stdout()
+)
+
+// errorf prints a red, `anonctl:`-prefixed error line to stderr (color-gated by the
+// stream). It is the single styled error sink the verbs route through, so the red
+// `anonctl:` prefix is consistent and one edit changes it everywhere.
+func errorf(format string, a ...any) {
+	fmt.Fprint(os.Stderr, errStyle.Red("anonctl: ")+errStyle.Red(fmt.Sprintf(format, a...))+"\n")
 }
 
 func run(args []string) int {
@@ -53,7 +70,7 @@ func run(args []string) int {
 
 	cmd, err := cli.Parse(args)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: %v\n", err)
+		errorf("%v", err)
 		fmt.Fprintln(os.Stderr, usage)
 		return 2
 	}
@@ -94,7 +111,8 @@ func run(args []string) int {
 	case "update", "reconfigure":
 		return runUpdate(ctx, runner, cmd)
 	default:
-		fmt.Fprintf(os.Stderr, "anonctl: unknown verb %q\n%s\n", cmd.Verb, usage)
+		errorf("unknown verb %q", cmd.Verb)
+		fmt.Fprintln(os.Stderr, usage)
 		return 2
 	}
 }
@@ -110,7 +128,7 @@ func run(args []string) int {
 func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	res, err := provision.Add(ctx, r, cmd.Account)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: add: %v\n", err)
+		errorf("add: %v", err)
 		return 1
 	}
 
@@ -121,7 +139,7 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	// default can never be a quieter path to a leak than the flag.
 	exemptions, err := resolveAddExemptions(cmd)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: add: %v\n", err)
+		errorf("add: %v", err)
 		return 1
 	}
 
@@ -132,7 +150,7 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	// as configured), surfaced non-zero.
 	if res.Created {
 		if n, serr := seedDefaultHome(ctx, r, cmd.Account); serr != nil {
-			fmt.Fprintf(os.Stderr, "anonctl: add: seeding home: %v\n", serr)
+			errorf("add: seeding home: %v", serr)
 			return 1
 		} else if n > 0 {
 			fmt.Printf("seeded %d file(s) into %s's home from %s\n", n, cmd.Account, defaultsStore.DefaultHomeDir())
@@ -150,7 +168,7 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	if endpointArg == "" {
 		chosen, cerr := chooseEndpointForAdd(cmd.Account)
 		if cerr != nil {
-			fmt.Fprintf(os.Stderr, "anonctl: add: %v\n", cerr)
+			errorf("add: %v", cerr)
 			return 1
 		}
 		endpointArg = chosen.URL()
@@ -160,7 +178,7 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	// endpoint, then install the forcing.
 	cfg, err := buildConfig(ctx, r, cmd.Account, endpointArg, exemptions)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: add: %v\n", err)
+		errorf("add: %v", err)
 		return 1
 	}
 	// CROSS-IDENTIFICATION GUARD: refuse pointing THIS account at a socks-peruser
@@ -169,21 +187,21 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	// refused. This runs BEFORE any nft/systemd mutation, so a refusal leaves the box
 	// untouched (the account is provisioned but not forced onto a colliding endpoint).
 	if err := claimEndpoint(cmd.Account, cfg.Endpoint()); err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: add: %v\n", err)
+		errorf("add: %v", err)
 		return 1
 	}
 	if err := forcing.Install(ctx, forcingDeps(), cfg, exemptions); err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: add: installing forcing: %v\n", err)
+		errorf("add: installing forcing: %v", err)
 		return 1
 	}
 
 	if res.Created {
-		fmt.Printf("provisioned + forced %s (shim %s, endpoint %s)\n", res.Account, res.Shim, cfg.Endpoint().URL())
+		fmt.Printf("%s %s (shim %s, endpoint %s)\n", outStyle.Green("provisioned + forced"), outStyle.Bold(res.Account), res.Shim, cfg.Endpoint().URL())
 	} else {
-		fmt.Printf("%s already existed; re-applied forcing (shim %s, endpoint %s)\n", res.Account, res.Shim, cfg.Endpoint().URL())
+		fmt.Printf("%s already existed; re-applied forcing (shim %s, endpoint %s)\n", outStyle.Bold(res.Account), res.Shim, cfg.Endpoint().URL())
 	}
-	fmt.Printf("note: anonctl does NOT manage the endpoint's own service; enable your endpoint (e.g. `systemctl enable --now tor.service`) so it is up at boot\n")
-	fmt.Printf("run `%s` to prove the account is anonymized\n", verifyHint(cmd.Account))
+	fmt.Printf("%s anonctl does NOT manage the endpoint's own service; enable your endpoint (e.g. `systemctl enable --now tor.service`) so it is up at boot\n", outStyle.Yellow("note:"))
+	fmt.Printf("run `%s` to prove the account is anonymized\n", outStyle.Cyan(verifyHint(cmd.Account)))
 	return 0
 }
 
@@ -252,18 +270,18 @@ func resolveAddExemptions(cmd *cli.Command) ([]lanexempt.Exempt, error) {
 func runSeedHome(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	st, err := provision.Status(ctx, r, cmd.Account)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: seed-home: %v\n", err)
+		errorf("seed-home: %v", err)
 		return 1
 	}
 	if !st.Exists {
-		fmt.Fprintf(os.Stderr, "anonctl: seed-home: %s is not provisioned (run `anonctl add %s` first)\n", cmd.Account, accountArg(cmd.Account))
+		errorf("seed-home: %s is not provisioned (run `anonctl add %s` first)", cmd.Account, accountArg(cmd.Account))
 		return 1
 	}
 
 	template := cmd.SeedFrom
 	if template == "" {
 		if !defaultsStore.DefaultHomePresent() {
-			fmt.Fprintf(os.Stderr, "anonctl: seed-home: no --from given and no default home at %s; nothing to seed\n", defaultsStore.DefaultHomeDir())
+			errorf("seed-home: no --from given and no default home at %s; nothing to seed", defaultsStore.DefaultHomeDir())
 			return 1
 		}
 		template = defaultsStore.DefaultHomeDir()
@@ -271,12 +289,12 @@ func runSeedHome(ctx context.Context, r provision.Runner, cmd *cli.Command) int 
 
 	home, err := provision.AccountHome(ctx, r, cmd.Account)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: seed-home: %v\n", err)
+		errorf("seed-home: %v", err)
 		return 1
 	}
 	res, err := seedHomeSeed(ctx, r, template, home, cmd.Account, cmd.Force)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: seed-home: %v\n", err)
+		errorf("seed-home: %v", err)
 		return 1
 	}
 	if len(res.Overwrote) > 0 {
@@ -325,7 +343,7 @@ var (
 func runRm(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	var firstErr error
 	fail := func(what string, err error) {
-		fmt.Fprintf(os.Stderr, "anonctl: rm: %s: %v\n", what, err)
+		errorf("rm: %s: %v", what, err)
 		if firstErr == nil {
 			firstErr = err
 		}
@@ -368,7 +386,7 @@ func runRm(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 func runList(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	accounts, err := provision.List(ctx, r, provision.ReadPasswd(ctx, r))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: list: %v\n", err)
+		errorf("list: %v", err)
 		return 1
 	}
 	if cmd.JSON {
@@ -392,28 +410,28 @@ func runList(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 func runStatus(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	st, err := provision.Status(ctx, r, cmd.Account)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: status: %v\n", err)
+		errorf("status: %v", err)
 		return 1
 	}
 	// Read the marker (the same dependency-free truth a sibling tool reads). A
 	// missing marker is a clean "not forced", not an error.
 	st, err = st.WithMarker(marker.DefaultStore())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: status: reading marker: %v\n", err)
+		errorf("status: reading marker: %v", err)
 		return 1
 	}
 	if cmd.JSON {
 		return emitJSON(st)
 	}
 	if !st.Exists {
-		fmt.Printf("%s: not provisioned\n", st.Account)
+		fmt.Printf("%s: %s\n", outStyle.Bold(st.Account), outStyle.Yellow("not provisioned"))
 		return 0
 	}
-	fmt.Printf("%s: provisioned (uid %s)\n", st.Account, st.UID)
+	fmt.Printf("%s: %s (uid %s)\n", outStyle.Bold(st.Account), outStyle.Green("provisioned"), st.UID)
 	if st.ShimExists {
-		fmt.Printf("  shim %s: present (uid %s)\n", st.Shim, st.ShimUID)
+		fmt.Printf("  shim %s: %s (uid %s)\n", st.Shim, outStyle.Green("present"), st.ShimUID)
 	} else {
-		fmt.Printf("  shim %s: MISSING\n", st.Shim)
+		fmt.Printf("  shim %s: %s\n", st.Shim, outStyle.Red("MISSING"))
 	}
 	// Positively surface the sudo-absence invariant (a UID-transition escape closed
 	// at add-time): no sudo is the hardened, expected state; sudo present is a WARN
@@ -423,17 +441,17 @@ func runStatus(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	// omit the line or guess either way.
 	if st.SudoChecked {
 		if st.SudoAllowed {
-			fmt.Printf("  sudo: PRESENT (warning: a uid-transition escape; the account should have no sudo)\n")
+			fmt.Printf("  sudo: %s (warning: a uid-transition escape; the account should have no sudo)\n", outStyle.Red("PRESENT"))
 		} else {
-			fmt.Printf("  sudo: none (no uid-transition escape via sudo)\n")
+			fmt.Printf("  sudo: %s (no uid-transition escape via sudo)\n", outStyle.Green("none"))
 		}
 	} else {
-		fmt.Printf("  sudo: UNKNOWN (could not determine sudo rights from `sudo -l -U`; not confirmed absent)\n")
+		fmt.Printf("  sudo: %s (could not determine sudo rights from `sudo -l -U`; not confirmed absent)\n", outStyle.Yellow("UNKNOWN"))
 	}
 	if st.Forced && st.Marker != nil {
-		fmt.Printf("  forced: yes (endpoint class %s, marked %s)\n", st.Marker.EndpointClass, st.Marker.CreatedAt)
+		fmt.Printf("  forced: %s (endpoint class %s, marked %s)\n", outStyle.Green("yes"), st.Marker.EndpointClass, st.Marker.CreatedAt)
 	} else {
-		fmt.Printf("  forced: no (no marker)\n")
+		fmt.Printf("  forced: %s (no marker)\n", outStyle.Yellow("no"))
 	}
 	return 0
 }
@@ -464,12 +482,12 @@ func runVerify(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	if cmd.JSON {
 		blob, jerr := rep.JSON()
 		if jerr != nil {
-			fmt.Fprintf(os.Stderr, "anonctl: verify: %v\n", jerr)
+			errorf("verify: %v", jerr)
 			return 1
 		}
 		os.Stdout.Write(append(blob, '\n'))
 	} else {
-		fmt.Print(rep.Human())
+		fmt.Print(colorizeReport(rep.Human()))
 	}
 	return rep.ExitCode()
 }
@@ -498,13 +516,42 @@ func verifyProgress(jsonMode bool) verify.Progress {
 			fmt.Fprintf(verifyProgressWriter, "  ... %s\n", name)
 		},
 		Done: func(a verify.Assertion) {
-			mark := "FAIL"
+			// Color the mark ONLY when progress goes to the real (interactive) stderr, not
+			// when a test/redirect has swapped the writer to a buffer/pipe: the progress must
+			// degrade to plain `[PASS]`/`[FAIL]` on a non-tty (no escape codes in a captured
+			// or piped stream).
+			ps := progressStyler()
+			mark := ps.Red("FAIL")
 			if a.Ok {
-				mark = "PASS"
+				mark = ps.Green("PASS")
 			}
-			fmt.Fprintf(verifyProgressWriter, "  [%s] %s\n", mark, a.Name)
+			fmt.Fprintf(verifyProgressWriter, "  [%s] %s\n", mark, ps.Bold(a.Name))
 		},
 	}
+}
+
+// progressStyler returns the styler the verify progress hook uses: the colored
+// stderr styler ONLY when progress is actually going to the real stderr (an
+// interactive terminal, color enabled). When a test or a redirect has swapped
+// verifyProgressWriter to a buffer/pipe, it returns a disabled styler so the stream
+// stays plain (`[PASS]`/`[FAIL]`, no escape codes). This keeps the human terminal
+// colored without ever leaking control chars into a captured/piped progress stream.
+func progressStyler() ui.Styler {
+	if verifyProgressWriter == os.Stderr {
+		return errStyle
+	}
+	return ui.Styler{}
+}
+
+// colorizeReport recolors the plain verify Report.Human() text at the print
+// boundary: [PASS] green, [FAIL] red, so the machine/test contract (Human() stays
+// plain) is untouched while the human terminal gets color. It is a no-op string
+// substitution when color is disabled (the styler returns its input unchanged), so
+// piped/redirected output stays byte-identical to before.
+func colorizeReport(s string) string {
+	s = strings.ReplaceAll(s, "[PASS]", "["+outStyle.Green("PASS")+"]")
+	s = strings.ReplaceAll(s, "[FAIL]", "["+outStyle.Red("FAIL")+"]")
+	return s
 }
 
 // verifyAndMark runs the LIVE verify assertion set for the command's account and,
@@ -541,7 +588,7 @@ func verifyAndMark(ctx context.Context, r provision.Runner, cmd *cli.Command, pr
 	if rep.Ok() {
 		m := marker.New(cmd.Account, st.UID, p.Class, resolveVersion(), time.Now())
 		if werr := marker.DefaultStore().WriteVerified(m, true); werr != nil {
-			fmt.Fprintf(os.Stderr, "anonctl: verify: writing marker: %v\n", werr)
+			errorf("verify: writing marker: %v", werr)
 		}
 	}
 	return rep
@@ -623,7 +670,7 @@ func firstExemptHostPort(raw []string) string {
 // exercised under the `integration` tag.
 func runUse(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	if useGeteuid() != 0 {
-		fmt.Fprintf(os.Stderr, "anonctl: use: must be root to drop into %s (it changes UID via setpriv); re-run with sudo\n", cmd.Account)
+		errorf("use: must be root to drop into %s (it changes UID via setpriv); re-run with sudo", cmd.Account)
 		return 1
 	}
 
@@ -635,17 +682,17 @@ func runUse(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	if !rep.Ok() {
 		// RED: print the failing assertions and REFUSE. Do NOT exec a shell (you must
 		// never get an un-anonymized shell via `use`).
-		fmt.Print(rep.Human())
-		fmt.Fprintf(os.Stderr, "anonctl: use: %s did NOT verify as anonymized; refusing to open a shell (fix it, then `%s`)\n", cmd.Account, verifyHint(cmd.Account))
+		fmt.Print(colorizeReport(rep.Human()))
+		errorf("use: %s did NOT verify as anonymized; refusing to open a shell (fix it, then `%s`)", cmd.Account, verifyHint(cmd.Account))
 		return rep.ExitCode()
 	}
 
 	// GREEN: drop into the account's login shell. exec replaces this process, so on
 	// success useExecLoginShell never returns; a returned error means the drop itself
 	// failed (e.g. no setpriv, no such account) and is surfaced non-zero.
-	fmt.Printf("%s verified anonymized; opening a shell as %s (the kernel forcing is in effect for this session)\n", cmd.Account, cmd.Account)
+	fmt.Printf("%s %s; opening a shell as %s (the kernel forcing is in effect for this session)\n", outStyle.Bold(cmd.Account), outStyle.Green("verified anonymized"), cmd.Account)
 	if err := useExecLoginShell(ctx, r, cmd.Account); err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: use: opening shell as %s: %v\n", cmd.Account, err)
+		errorf("use: opening shell as %s: %v", cmd.Account, err)
 		return 1
 	}
 	return 0 // unreachable on a real exec (it replaced the process)
@@ -679,17 +726,17 @@ var (
 // dropped-or-forced throughout. It runs as root (nft/systemctl).
 func runUpdate(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	if cmd.Endpoint == "" {
-		fmt.Fprintf(os.Stderr, "anonctl: %s: --endpoint is required (the new socks5h endpoint to point the account at)\n", cmd.Verb)
+		errorf("%s: --endpoint is required (the new socks5h endpoint to point the account at)", cmd.Verb)
 		return 2
 	}
 	cfg, err := accountconfig.DefaultStore().Read(cmd.Account)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: %s: %s is not provisioned/forced (run `anonctl add %s` first): %v\n", cmd.Verb, cmd.Account, accountArg(cmd.Account), err)
+		errorf("%s: %s is not provisioned/forced (run `anonctl add %s` first): %v", cmd.Verb, cmd.Account, accountArg(cmd.Account), err)
 		return 1
 	}
 	ep, err := resolveEndpoint(cmd.Endpoint)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: %s: %v\n", cmd.Verb, err)
+		errorf("%s: %v", cmd.Verb, err)
 		return 1
 	}
 	cfg.EndpointHost = ep.Host
@@ -700,7 +747,7 @@ func runUpdate(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	// re-apply. The account's OWN prior claim is excluded, so re-pointing it at its
 	// own endpoint (or a shared tor one) is never refused.
 	if err := claimEndpoint(cmd.Account, cfg.Endpoint()); err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: %s: %v\n", cmd.Verb, err)
+		errorf("%s: %v", cmd.Verb, err)
 		return 1
 	}
 	// Overlay the exemptions the operator passed on THIS update: an update that
@@ -709,16 +756,16 @@ func runUpdate(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	// endpoint change never silently drops a configured exemption.
 	exemptions, err := exemptionsForUpdate(cmd, cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: %s: %v\n", cmd.Verb, err)
+		errorf("%s: %v", cmd.Verb, err)
 		return 1
 	}
 	cfg.Exemptions = rawExemptions(exemptions)
 	if err := forcing.Reconfigure(ctx, forcingDeps(), cfg, exemptions); err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: %s: %v\n", cmd.Verb, err)
+		errorf("%s: %v", cmd.Verb, err)
 		return 1
 	}
-	fmt.Printf("reconfigured %s -> endpoint %s (re-applied fail-closed, no leak window)\n", cfg.Account, cfg.Endpoint().URL())
-	fmt.Printf("run `%s` to re-prove the account is anonymized\n", verifyHint(cmd.Account))
+	fmt.Printf("%s %s -> endpoint %s (re-applied fail-closed, no leak window)\n", outStyle.Green("reconfigured"), outStyle.Bold(cfg.Account), cfg.Endpoint().URL())
+	fmt.Printf("run `%s` to re-prove the account is anonymized\n", outStyle.Cyan(verifyHint(cmd.Account)))
 	return 0
 }
 
@@ -991,7 +1038,7 @@ func emitJSON(v any) int {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(v); err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: %v\n", err)
+		errorf("%v", err)
 		return 1
 	}
 	return 0

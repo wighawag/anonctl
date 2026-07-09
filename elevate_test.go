@@ -4,7 +4,18 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/wighawag/anonctl/internal/ui"
 )
+
+// disableColorForTest forces the CLI's stderr styler to plain for the duration of a
+// test, so message assertions match the un-colorized text regardless of whether the
+// test host's os.Stderr is a terminal.
+func disableColorForTest(t *testing.T) {
+	orig := errStyle
+	errStyle = ui.Styler{}
+	t.Cleanup(func() { errStyle = orig })
+}
 
 // swapElevateSeams installs fake elevate seams so the dispatch-time self-elevation
 // is exercised WITHOUT a real sudo, a real re-exec, or a password prompt. It
@@ -155,6 +166,7 @@ func captureStderrDuring(t *testing.T, fn func()) string {
 // sudo (the anon account has no sudo to pass): it refuses with "already inside" and a
 // non-zero exit, so the operator never hits a dead-end anon password prompt.
 func TestElevateInSessionSameAccountRefusesNoReexec(t *testing.T) {
+	disableColorForTest(t)
 	t.Setenv(anonctlSessionEnv, "anon")
 	recp := swapElevateSeams(t, 30034, true, 0)
 	var code int
@@ -174,6 +186,7 @@ func TestElevateInSessionSameAccountRefusesNoReexec(t *testing.T) {
 // cannot self-elevate from anon, so it refuses and tells the operator to exit first,
 // naming the exact command to run from their normal account.
 func TestElevateInSessionSwitchAccountRefusesWithExitInstruction(t *testing.T) {
+	disableColorForTest(t)
 	t.Setenv(anonctlSessionEnv, "anon")
 	recp := swapElevateSeams(t, 30034, true, 0)
 	var code int
@@ -192,6 +205,7 @@ func TestElevateInSessionSwitchAccountRefusesWithExitInstruction(t *testing.T) {
 // Inside a session, a NON-use root verb (e.g. verify) also refuses cleanly instead
 // of re-exec'ing into a dead-end anon sudo prompt.
 func TestElevateInSessionOtherVerbRefusesNoReexec(t *testing.T) {
+	disableColorForTest(t)
 	t.Setenv(anonctlSessionEnv, "anon")
 	recp := swapElevateSeams(t, 30034, true, 0)
 	var code int
