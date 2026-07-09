@@ -261,14 +261,23 @@ func Status(ctx context.Context, r Runner, account string) (AccountStatus, error
 }
 
 // sudoRights probes whether the account has ANY sudo rights via
-// `sudo -l -U <account>` (list the account's permitted sudo commands) and decides
-// from the OUTPUT, not the exit code. It reads stdout+stderr (the negative is
-// commonly on stderr, the listing on stdout) and classifies via the SHARED
+// `sudo -n -l -U <account>` (list the account's permitted sudo commands) and
+// decides from the OUTPUT, not the exit code. It reads stdout+stderr (the negative
+// is commonly on stderr, the listing on stdout) and classifies via the SHARED
 // sudoprobe.ParseOutput (the SAME parse verify's sudoVector uses, not a
 // duplicate). This is the PROVE side of the sudo vector, robust to lenient sudo
 // builds that exit 0 for a no-rights account.
+//
+// The `-n` (non-interactive) is LOAD-BEARING and mirrors verify's sudoListCommand:
+// listing ANOTHER user's sudo privileges (`-U <account>`) requires the CALLER to be
+// authorized, and on a desktop that authorization pops a polkit/sudo password
+// prompt BEFORE any output (the v0.1.3/v0.1.4 GNOME popup). With `-n`, sudo NEVER
+// prompts: when auth would be needed it prints "a password is required" and returns
+// non-interactively, which sudoprobe.ParseOutput reads as the honest Unknown (=>
+// SudoChecked=false, not conclusively checked), never a false grant/denial. So
+// `anonctl status` (and add's sudo-absence surfacing) can never trigger a dialog.
 func sudoRights(ctx context.Context, r Runner, account string) sudoprobe.Verdict {
-	stdout, stderr, _ := r.Run(ctx, "sudo", "-l", "-U", account)
+	stdout, stderr, _ := r.Run(ctx, "sudo", "-n", "-l", "-U", account)
 	return sudoprobe.ParseOutput(stdout + "\n" + stderr)
 }
 

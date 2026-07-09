@@ -35,9 +35,9 @@ func stubLoginEnv(t *testing.T) {
 type fakeRunner struct {
 	calls       [][]string
 	present     map[string]bool // accounts getent should report as existing
-	sudoAllowed bool            // when true, `sudo -l -U` reports the account CAN sudo
+	sudoAllowed bool            // when true, `sudo -n -l -U` reports the account CAN sudo
 
-	// sudoScript, when set, fully overrides the default `sudo -l -U` fixture so a
+	// sudoScript, when set, fully overrides the default `sudo -n -l -U` fixture so a
 	// test can drive an EXACT stdout/stderr/exit-code shape (the lenient exit-0
 	// no-rights build, a real grant, the not-allowed text, an ambiguous blob) through
 	// the same Runner seam - no real sudo. It takes precedence over sudoAllowed.
@@ -55,7 +55,7 @@ type sudoResult struct {
 
 func (r *fakeRunner) Run(_ context.Context, name string, args ...string) (string, string, error) {
 	r.calls = append(r.calls, append([]string{name}, args...))
-	// sudo -l -U <account>: the read-only sudo-absence probe. By default report the
+	// sudo -n -l -U <account>: the read-only, non-interactive sudo-absence probe. By default report the
 	// finding-observed "not allowed" (a freshly-provisioned anon account has no sudo
 	// rights); a test can flip sudoAllowed to exercise the positive-detection path,
 	// or set sudoScript for an exact stdout/stderr/exit fixture.
@@ -503,6 +503,56 @@ func TestStatusRealGrantReadsAsSudoAllowed(t *testing.T) {
 	}
 	if !st.SudoChecked || !st.SudoAllowed {
 		t.Errorf("a real permitted-commands listing must report SudoChecked=true SudoAllowed=true; got checked=%v allowed=%v", st.SudoChecked, st.SudoAllowed)
+	}
+}
+
+// status's sudo-absence probe is STRICTLY NON-INTERACTIVE: it issues
+// `sudo -n -l -U <account>`, never a bare `sudo -l -U`. Listing ANOTHER user's sudo
+// privileges (`-U <account>`) requires the caller to be authorized, and without
+// `-n` that authorization pops a polkit/sudo password prompt on a desktop (the same
+// vector the verify sudoVector fix closed). With `-n`, sudo prints "a password is
+// required" and returns instead of prompting, so `anonctl status` never pops a
+// dialog. This asserts the argv through the Runner seam: no real sudo, no prompt.
+func TestStatusSudoProbeIsNonInteractive(t *testing.T) {
+	r := &fakeRunner{present: map[string]bool{"anon": true, "anon-shim": true}}
+	if _, err := provision.Status(context.Background(), r, "anon"); err != nil {
+		t.Fatalf("Status error: %v", err)
+	}
+	var sudoCall []string
+	for _, c := range r.calls {
+		if len(c) > 0 && c[0] == "sudo" {
+			sudoCall = c
+			break
+		}
+	}
+	if sudoCall == nil {
+		t.Fatalf("status did not issue a sudo probe; calls:\n%s", joined(r.calls))
+	}
+	want := []string{"sudo", "-n", "-l", "-U", "anon"}
+	if strings.Join(sudoCall, " ") != strings.Join(want, " ") {
+		t.Errorf("sudo probe argv = %q, want %q (the -n makes it non-interactive so status never prompts)", sudoCall, want)
+	}
+}
+
+// status maps a `-n`-blocked probe (sudo prints "a password is required" and
+// returns non-interactively when auth would be needed) to UNKNOWN => SudoChecked=false:
+// an honest not-conclusive verdict, NEVER a false "has sudo" nor a false "no sudo".
+// This is the outcome that keeps the report honest once the probe can no longer
+// prompt (it fails unattended instead of popping a dialog).
+func TestStatusPasswordRequiredReadsAsUnknown(t *testing.T) {
+	r := &fakeRunner{
+		present:    map[string]bool{"anon": true, "anon-shim": true},
+		sudoScript: &sudoResult{stderr: "sudo: a password is required\n", exit: 1},
+	}
+	st, err := provision.Status(context.Background(), r, "anon")
+	if err != nil {
+		t.Fatalf("Status error: %v", err)
+	}
+	if st.SudoChecked {
+		t.Errorf("SudoChecked = true on a `-n` password-required probe, want false (UNKNOWN: not conclusively checked)")
+	}
+	if st.SudoAllowed {
+		t.Errorf("SudoAllowed = true on a `-n` password-required probe: must never false-alarm")
 	}
 }
 
