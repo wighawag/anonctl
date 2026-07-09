@@ -155,8 +155,17 @@ func swapUseSeams(t *testing.T, rep verify.Report, euid int) *string {
 		return nil // a real exec never returns; the fake records + returns nil
 	}
 	useGeteuid = func() int { return euid }
+	// Dispatch-time self-elevation now sits IN FRONT of runUse (elevate.go): a
+	// non-root root-verb re-execs via sudo before reaching the verb. Neutralise the
+	// elevate seam here so these use-gate tests exercise the runUse euid guard
+	// directly (no real sudo re-exec) - report the same simulated euid, and make the
+	// sudo lookup fail so a simulated non-root `use` falls straight through to runUse.
+	origEEuid, origLook := elevateGeteuid, elevateLookSudo
+	elevateGeteuid = func() int { return euid }
+	elevateLookSudo = func() (string, error) { return "", errSudoNotFound }
 	t.Cleanup(func() {
 		useVerifyReport, useExecLoginShell, useGeteuid = origVerify, origExec, origEuid
+		elevateGeteuid, elevateLookSudo = origEEuid, origLook
 	})
 	return &execedAccount
 }

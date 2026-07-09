@@ -54,6 +54,18 @@ func run(args []string) int {
 		return 2
 	}
 
+	// Self-elevation: a root-requiring verb (add/rm/verify/use/update/reconfigure)
+	// run WITHOUT root re-execs itself via `sudo <self> <args...>`, so a bare
+	// `anonctl verify` prompts for the password inline (no `sudo anonctl` prefix
+	// needed) and hands off with the child's exit code. Already-root runs directly
+	// (no double-sudo); read verbs (list/status) never elevate; sudo-absent falls
+	// through to the verb's own "must be root" error. The re-exec passes the ORIGINAL
+	// args unchanged (flags/account/--json), and the notice is on stderr so `--json`
+	// stdout stays pure. See elevate.go.
+	if handled, code := maybeElevate(cmd.Verb, args); handled {
+		return code
+	}
+
 	// SIGINT/SIGTERM cancels the context that flows into provisioning, so a
 	// long-running useradd is interruptible cleanly.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
