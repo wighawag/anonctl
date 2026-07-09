@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/wighawag/anonctl/internal/accountconfig"
 	"github.com/wighawag/anonctl/internal/cli"
 	"github.com/wighawag/anonctl/internal/endpoint"
+	"github.com/wighawag/anonctl/internal/forcing"
 	"github.com/wighawag/anonctl/internal/provision"
 	"github.com/wighawag/anonctl/internal/verify"
 )
@@ -212,6 +215,76 @@ func TestUseRequiresRoot(t *testing.T) {
 	}
 	if *execed != "" {
 		t.Errorf("exec seam invoked as non-root; use must refuse before dropping to the account")
+	}
+}
+
+// swapRmSeams installs fake rm seams that record their calls (in order) into a
+// shared event log, and returns a restore func + a pointer to that log. The
+// forcing-remove fake records a "disable-shim" event (standing in for the real
+// `systemctl disable --now anonctl-shim@<account>.service`); the provision-rm fake
+// records a "userdel-shim" event (standing in for the real `userdel <account>-shim`).
+// forceErr/rmErr let a test inject a failure into either seam to exercise
+// proceed-and-report. This is the ONE place the rm ordering (disable-shim BEFORE
+// userdel) is asserted at the runRm seam, mirroring swapUseSeams.
+func swapRmSeams(t *testing.T, forceErr, rmErr error) *[]string {
+	t.Helper()
+	var events []string
+	origForce, origRm := rmForcingRemove, rmProvisionRm
+	rmForcingRemove = func(ctx context.Context, d forcing.Deps, account string) error {
+		events = append(events, "disable-shim:"+account)
+		return forceErr
+	}
+	rmProvisionRm = func(ctx context.Context, r provision.Runner, account string, purge bool) (provision.RmResult, error) {
+		events = append(events, "userdel-shim:"+account)
+		return provision.RmResult{Account: account, Shim: cli.ShimAccount(account), AccountRemoved: purge && rmErr == nil, ShimRemoved: purge && rmErr == nil}, rmErr
+	}
+	t.Cleanup(func() { rmForcingRemove, rmProvisionRm = origForce, origRm })
+	return &events
+}
+
+// indexOfEvent returns the index of the first event with the given prefix, or -1.
+func indexOfEvent(events []string, prefix string) int {
+	for i, e := range events {
+		if strings.HasPrefix(e, prefix) {
+			return i
+		}
+	}
+	return -1
+}
+
+// TEARDOWN ORDER (the fix for the e2e teardown regression, BUG 1): `rm` must STOP
+// the shim unit (`disable --now`) BEFORE it `userdel`s the shim account. If the
+// userdel runs first, it fails with "user is currently used by process" (the shim
+// is still running as that UID) and the whole last-account cleanup never completes.
+// This asserts the disable-shim event is recorded BEFORE the shim userdel at the
+// runRm seam.
+func TestRmDisablesShimBeforeUserdel(t *testing.T) {
+	events := swapRmSeams(t, nil, nil)
+	if code := run([]string{"rm", "--purge-account"}); code != 0 {
+		t.Errorf("run(rm --purge-account) = %d, want 0", code)
+	}
+	disableIdx := indexOfEvent(*events, "disable-shim:")
+	userdelIdx := indexOfEvent(*events, "userdel-shim:")
+	if disableIdx < 0 || userdelIdx < 0 {
+		t.Fatalf("expected both a disable-shim and a userdel-shim event; got %v", *events)
+	}
+	if disableIdx > userdelIdx {
+		t.Errorf("userdel ran BEFORE disable-shim (the regression): %v", *events)
+	}
+}
+
+// PROCEED-AND-REPORT: a failure disabling/removing the forcing must NOT abort the
+// whole teardown. runRm still runs the userdel step (so the account is not left
+// half-removed) and reports the failure with a non-zero exit. A half-torn-down
+// account that silently stopped is worse than a fully-attempted, reported partial.
+func TestRmProceedsToUserdelDespiteForcingRemoveError(t *testing.T) {
+	events := swapRmSeams(t, errors.New("nft delete failed"), nil)
+	code := run([]string{"rm", "--purge-account"})
+	if code == 0 {
+		t.Errorf("run(rm) with a forcing-remove failure = 0, want non-zero (the failure must be reported)")
+	}
+	if indexOfEvent(*events, "userdel-shim:") < 0 {
+		t.Errorf("runRm aborted before the userdel step on a forcing-remove error; teardown must proceed-and-report: %v", *events)
 	}
 }
 

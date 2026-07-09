@@ -118,27 +118,62 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	return 0
 }
 
-// runRm removes the account's forcing hooks and, only under --purge-account,
-// deletes the account + its shim. A bare rm leaves the home intact. It ALSO
-// removes the marker (the double-anonymization claim): teardown must not leave a
-// stale `/etc/anonctl/<account>.json` asserting an account is still forced.
+// The rm teardown seams: package vars so the unit tests inject fakes and assert
+// the teardown ORDER (the disable-shim call is recorded BEFORE the shim userdel)
+// at the runRm seam, mirroring the `use` seams. Production wires the real
+// forcing.Remove (which disables --now the shim) and provision.Rm (which userdels).
+var (
+	// rmForcingRemove disables --now the shim, deletes the account's nft tables +
+	// persisted state, and (last account) removes the shared units + empty dirs.
+	rmForcingRemove = forcing.Remove
+	// rmProvisionRm userdels the login + shim accounts (only under --purge-account).
+	rmProvisionRm = provision.Rm
+)
+
+// runRm tears an account's forcing down and, only under --purge-account, deletes
+// the account + its shim. A bare rm leaves the home intact. It ALSO removes the
+// marker (the double-anonymization claim): teardown must not leave a stale
+// `/etc/anonctl/<account>.json` asserting an account is still forced.
+//
+// ORDER (the fix for the e2e teardown regression, BUG 1): the shim unit is
+// disabled --now (rmForcingRemove) BEFORE its account is userdel'd (rmProvisionRm),
+// because `userdel` REFUSES ("user is currently used by process") while the shim is
+// still running as that UID. Removing forcing first also clears the nft tables and
+// persisted state (and, on the last account, the shared units + empty dirs) before
+// the accounts go, so the last-account cleanup is reached instead of aborting at
+// the userdel. See ADR-0005 (teardown ordering).
+//
+// PROCEED-AND-REPORT: each step runs even if an earlier one failed, and the first
+// error is surfaced with a non-zero exit. A half-torn-down account that silently
+// stopped on the first error is worse than a fully-attempted, reported partial.
 func runRm(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
-	res, err := provision.Rm(ctx, r, cmd.Account, cmd.PurgeAccount)
+	var firstErr error
+	fail := func(what string, err error) {
+		fmt.Fprintf(os.Stderr, "anonctl: rm: %s: %v\n", what, err)
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	// 1. Remove the forcing: disable --now the shim (so nothing runs as the shim UID),
+	// delete the account's nft tables, the persisted env/rule files + at-rest config,
+	// and (last account) the shared units + empty dirs. This MUST precede the userdel.
+	if err := rmForcingRemove(ctx, forcingDeps(), cmd.Account); err != nil {
+		fail("removing forcing", err)
+	}
+	// 2. Delete the accounts (only under --purge-account), now that the shim unit is
+	// stopped so `userdel` no longer fails on a live shim UID. A bare rm never userdels.
+	res, err := rmProvisionRm(ctx, r, cmd.Account, cmd.PurgeAccount)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: rm: %v\n", err)
-		return 1
+		fail("removing account", err)
 	}
-	// Remove the forcing (disable the shim, delete the account's nft table, and the
-	// persisted env/rule files + at-rest config) BEFORE the marker, so a torn-down
-	// account leaves no live forcing and no stale persisted state.
-	if err := forcing.Remove(ctx, forcingDeps(), cmd.Account); err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: rm: removing forcing: %v\n", err)
-		return 1
-	}
-	// Remove the marker (idempotent: a missing marker is a clean no-op), so a
+	// 3. Remove the marker (idempotent: a missing marker is a clean no-op), so a
 	// torn-down account never leaves a stale "already forced" claim behind.
 	if err := marker.DefaultStore().Remove(cmd.Account); err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: rm: removing marker: %v\n", err)
+		fail("removing marker", err)
+	}
+
+	if firstErr != nil {
 		return 1
 	}
 	switch {
