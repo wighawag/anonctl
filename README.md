@@ -9,7 +9,7 @@ anonctl is a Linux-only **setup-and-verify manager** (like ufw/firewalld, specia
 ## Requirements
 
 - A **Linux kernel** with `nftables` (per-UID `meta skuid` matching and transparent redirect via `SO_ORIGINAL_DST`). anonctl is Linux-only; these primitives do not transfer to other platforms.
-- **Root**, for the verbs that mutate the system (`add`, `rm`, `update`/`reconfigure`). `list` and `status` are read-only and need no privilege.
+- **Root**, for the verbs that mutate the system (`add`, `rm`, `update`/`reconfigure`) and for `use` (which drops to the account via `setpriv`). `list` and `status` are read-only and need no privilege.
 - A **socks5h endpoint** to anonymize through. The default is a local **Tor** SOCKS port (`socks5h://127.0.0.1:9050`), so `anonctl add` works out of the box if you run Tor; any other socks5h endpoint (Mullvad local SOCKS, wireproxy, `ssh -D`, wireproxy chained with gost) works too via `--endpoint`. **anonctl does NOT manage the endpoint's lifecycle**: it assumes the endpoint already exists and stays up. Enabling it at boot (e.g. `systemctl enable --now tor.service`) is your job (see [Operating notes](#operating-notes)).
 
 ## Usage
@@ -20,6 +20,7 @@ anonctl rm     [--purge-account] [<name>]                    remove forcing; --p
 anonctl list   [--json]                                      list the anon accounts on the box
 anonctl status [<name>] [--json]                             show one account's state
 anonctl verify [<name>] [--json]                             PROVE the account is anonymized (non-zero exit on failure)
+anonctl use    [<name>]                                      verify, then open a shell as the account ONLY on green (root)
 anonctl update|reconfigure --endpoint <socks5h://host:port> [<name>]   re-point an account, re-applied fail-closed (root)
 anonctl --version | version                                  print the version
 ```
@@ -37,6 +38,14 @@ sudo anonctl add --endpoint socks5h://127.0.0.1:1080 work   # a second account t
 `verify` is the signature ONGOING verb: it does not assume anonymization, it PROVES it, and you re-run it **after setup, after a reboot, and after any Tor/kernel/nftables change**. It emits **named assertions**, exits **non-zero on any failure**, and supports `--json` (a versioned envelope with a derived top-level `ok`) so you can gate CI/automation on it. The assertions cover: the exit IP differs from the host's (and, for a Tor endpoint, is a Tor exit); DNS resolves remotely via the endpoint, never a plaintext local query; a direct (non-anonymized) connection from the account is actually DROPPED, for **both** IPv4 and IPv6, reported separately; the two bypass closures hold (the account can reach only its own shim's loopback port, and only the shim UID can reach the upstream endpoint); an ICMP echo (`ping`) from the account is DROPPED (no real-source-IP packet leaves); raw non-53 UDP from the account, **including UDP/443 (QUIC / HTTP-3)**, is DROPPED (SOCKS carries TCP only, so it is unrelayable); the concretely enumerable UID-transition escape vectors (sudo, the documented setuid network paths) do not leak, reported **honestly as best-effort, not exhaustive**; and, when a LAN split-tunnel is active, that it stays tight.
 
 The live probes stand up real connections as the anon UID and therefore need root and a provisioned host; they are compiled only under the `integration` build tag. The **default binary cannot silently "pass"**: without the integration build its `verify` returns one honest failing assertion telling you to run the integration build on the host, and exits non-zero. Fail-closed extends to the verifier itself: it never reports green unless it actually proved green.
+
+## use is a safe front door, NOT the protection
+
+`anonctl use [<name>]` is a **convenience + safety gate at session start**: it runs `verify` for the account and opens an interactive login shell as that account **only on a green verify**; on a red verify it prints the failing assertions and refuses, so you can never get an un-anonymized shell through `use`. It requires root (it drops to the account via `setpriv`). Day-to-day it is the ergonomic front door: `sudo anonctl use` drops you into an anonymized `anon` shell, or tells you clearly why it will not.
+
+Be honest about what `use` is and is NOT. It is **NOT the leak protection and NOT enforcement**. Two things it deliberately does not do: (1) it is a **snapshot**, verify green at login does not guarantee forcing stays up for the whole session (Tor could die, someone could flush the rules mid-session); (2) it is **not mandatory**, `su - <account>` / `sudo -iu <account>` / an SSH login / cron still reach the account and bypass `use` entirely. The **real protection is the kernel forcing plus the standing per-UID default-deny** (an anon UID with no forcing loaded is DROPPED, not free); `use` just refuses to hand you a shell on a setup that is broken RIGHT NOW. Making the account usable ONLY through anonctl is a separate, invasive login-shell/PAM change tracked as the `mandatory-anonctl-gated-login` idea, not this verb.
+
+Like the live `verify` probes, the real shell drop needs root + `setpriv` + a provisioned host and is compiled only under the `integration` build tag; the default binary's `use` cannot spawn a shell (and, since its `verify` cannot prove green either, would refuse regardless).
 
 ## What anonctl guarantees and what it does NOT
 

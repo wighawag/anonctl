@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"testing"
 
 	"github.com/wighawag/anonctl/internal/accountconfig"
+	"github.com/wighawag/anonctl/internal/cli"
 	"github.com/wighawag/anonctl/internal/endpoint"
 	"github.com/wighawag/anonctl/internal/provision"
+	"github.com/wighawag/anonctl/internal/verify"
 )
 
 // The version fast-path exits 0 before any parse (no verb, no root needed).
@@ -111,6 +114,91 @@ func TestVerifyParamsPopulatesExemptFromConfig(t *testing.T) {
 	// An account with NO persisted config at all (never forced) yields empty Exempt.
 	if p := verifyParams(store, "anon-absent", st); p.Exempt != "" {
 		t.Errorf("Exempt = %q for an unconfigured account, want empty", p.Exempt)
+	}
+}
+
+// use is the verify-then-shell safe front door. These unit tests drive the
+// verify-gate decision behind the injectable seams (useVerifyReport +
+// useExecLoginShell + useGeteuid) so they never spawn a real shell and never need
+// root: they assert the GATE polarity (green => exec attempted for the right
+// account; red => NO exec, non-zero exit, failing assertions printed) and the
+// root requirement. The real setpriv drop lives behind the `integration` tag.
+
+// swapUseSeams installs fake use seams and returns a restore func + a pointer to
+// the recorded exec target ("" until exec is attempted).
+func swapUseSeams(t *testing.T, rep verify.Report, euid int) *string {
+	t.Helper()
+	var execedAccount string
+	origVerify, origExec, origEuid := useVerifyReport, useExecLoginShell, useGeteuid
+	useVerifyReport = func(ctx context.Context, r provision.Runner, cmd *cli.Command) verify.Report {
+		return rep
+	}
+	useExecLoginShell = func(ctx context.Context, r provision.Runner, account string) error {
+		execedAccount = account
+		return nil // a real exec never returns; the fake records + returns nil
+	}
+	useGeteuid = func() int { return euid }
+	t.Cleanup(func() {
+		useVerifyReport, useExecLoginShell, useGeteuid = origVerify, origExec, origEuid
+	})
+	return &execedAccount
+}
+
+// greenReport / redReport are minimal reports whose Ok()/ExitCode() drive the gate.
+func greenReport() verify.Report {
+	return verify.Report{Account: "anon", Assertions: []verify.Assertion{{Name: "anonymized-exit", Ok: true}}}
+}
+func redReport() verify.Report {
+	return verify.Report{Account: "anon", Assertions: []verify.Assertion{{Name: "leak-drop-v4", Ok: false, Detail: "a direct v4 connection REACHED its target (a leak)"}}}
+}
+
+// On a GREEN verify, use execs the login shell for the RESOLVED account (exit 0,
+// the exec seam invoked with the right account).
+func TestUseGreenExecsLoginShell(t *testing.T) {
+	execed := swapUseSeams(t, greenReport(), 0)
+	code := run([]string{"use"})
+	if code != 0 {
+		t.Errorf("run(use) on green = %d, want 0", code)
+	}
+	if *execed != "anon" {
+		t.Errorf("exec seam invoked with account %q, want anon (green must drop into the account)", *execed)
+	}
+}
+
+// A named `use <name>` on green execs the shell for the RESOLVED `anon-<name>`.
+func TestUseGreenResolvesNamedAccount(t *testing.T) {
+	execed := swapUseSeams(t, verify.Report{Account: "anon-work", Assertions: []verify.Assertion{{Ok: true, Name: "anonymized-exit"}}}, 0)
+	if code := run([]string{"use", "work"}); code != 0 {
+		t.Errorf("run(use work) on green = %d, want 0", code)
+	}
+	if *execed != "anon-work" {
+		t.Errorf("exec seam invoked with %q, want anon-work", *execed)
+	}
+}
+
+// On a RED verify, use exits NON-ZERO and does NOT exec any shell: you cannot get
+// an un-anonymized shell via use.
+func TestUseRedRefusesNoShell(t *testing.T) {
+	execed := swapUseSeams(t, redReport(), 0)
+	code := run([]string{"use"})
+	if code == 0 {
+		t.Errorf("run(use) on red = 0, want non-zero (must refuse a shell on a broken account)")
+	}
+	if *execed != "" {
+		t.Errorf("exec seam invoked with %q on RED verify; use must NOT spawn a shell when verify fails", *execed)
+	}
+}
+
+// use requires root (it drops to the account): a non-root invocation fails loud
+// (non-zero) and does NOT run verify or exec a shell.
+func TestUseRequiresRoot(t *testing.T) {
+	execed := swapUseSeams(t, greenReport(), 1000)
+	code := run([]string{"use"})
+	if code == 0 {
+		t.Errorf("run(use) as non-root = 0, want non-zero (use must require root)")
+	}
+	if *execed != "" {
+		t.Errorf("exec seam invoked as non-root; use must refuse before dropping to the account")
 	}
 }
 
