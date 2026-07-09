@@ -12,6 +12,53 @@ anonctl is a Linux-only **setup-and-verify manager** (like ufw/firewalld, specia
 - **Root**, for the verbs that mutate the system (`add`, `rm`, `update`/`reconfigure`) and for `use` (which drops to the account via `setpriv`). `list` and `status` are read-only and need no privilege.
 - A **socks5h endpoint** to anonymize through. The default is a local **Tor** SOCKS port (`socks5h://127.0.0.1:9050`), so `anonctl add` works out of the box if you run Tor; any other socks5h endpoint (Mullvad local SOCKS, wireproxy, `ssh -D`, wireproxy chained with gost) works too via `--endpoint`. **anonctl does NOT manage the endpoint's lifecycle**: it assumes the endpoint already exists and stays up. Enabling it at boot (e.g. `systemctl enable --now tor.service`) is your job (see [Operating notes](#operating-notes)).
 
+## Install
+
+anonctl ships as **two** binaries: `anonctl` (the manager) and `anonctl-shim` (the per-account data-path helper: a transparent TCP-to-SOCKS relay + DNS-over-SOCKS-TCP forwarder). Both are **Linux-only** and the manager verbs (`add`, `verify`, `use`, `rm`, `update`/`reconfigure`) need **root**.
+
+The one thing to get right: unlike a sibling tool that finds its helper next to itself, `anonctl-shim` is launched by the per-account `anonctl-shim@<account>.service` systemd unit whose ExecStart is a **fixed path**, `/usr/local/bin/anonctl-shim` (`internal/systemd.DefaultShimBinaryPath`). `anonctl add` wires the unit at that default path and does not currently expose a flag to move it, so **the shim MUST be reachable at `/usr/local/bin/anonctl-shim`** or `anonctl add` cannot start an account's shim. "Just put both on `PATH`" is NOT sufficient. That is why the install defaults to `/usr/local/bin` (which anonctl can write to as root anyway) rather than a per-user dir.
+
+### Install script (recommended)
+
+```sh
+curl -fsSL https://github.com/wighawag/anonctl/releases/latest/download/install.sh | sh
+```
+
+This detects your architecture (amd64 / arm64 / armv7 / armv6), downloads the latest release, **verifies its sha256 checksum** (and refuses to install on a mismatch, never install an unverified anonymity tool), and installs **both** `anonctl` and `anonctl-shim` to `/usr/local/bin`, placing `anonctl-shim` at `/usr/local/bin/anonctl-shim` (the shim unit's ExecStart path). Because it writes to `/usr/local/bin`, **run it as root** (in a root shell or with `sudo`):
+
+```sh
+curl -fsSL https://github.com/wighawag/anonctl/releases/latest/download/install.sh | sudo sh
+```
+
+Override with env vars:
+
+```sh
+# pin a version, and/or install to a different dir
+curl -fsSL https://github.com/wighawag/anonctl/releases/latest/download/install.sh | ANONCTL_VERSION=v0.1.0 PREFIX=/opt/bin sudo sh
+```
+
+If you set `PREFIX` off `/usr/local/bin`, the script still makes `anonctl-shim` reachable at `/usr/local/bin/anonctl-shim` (it symlinks the fixed path to your `PREFIX`, or warns you to, since the unit's ExecStart is fixed). The installer is served as a release asset (stable storage); the same script also lives at [`install.sh`](https://github.com/wighawag/anonctl/blob/main/install.sh) in the repo, so if you would rather not pipe to `sh`, download it, read it, then run it. The armv6/armv7 builds cover older Raspberry Pi models.
+
+### go install
+
+```sh
+go install github.com/wighawag/anonctl@latest
+CGO_ENABLED=0 go install github.com/wighawag/anonctl/cmd/anonctl-shim@latest
+# then place the shim at the unit's fixed path (as root):
+sudo ln -sf "$(go env GOBIN)/anonctl-shim" /usr/local/bin/anonctl-shim   # or GOPATH/bin if GOBIN is unset
+```
+
+`go install` puts both binaries in your `$GOBIN`, which is usually a per-user dir NOT on the shim unit's fixed path, so the third step is **required**: symlink (or copy) `anonctl-shim` to `/usr/local/bin/anonctl-shim` or `anonctl add` will not start the shim. The `CGO_ENABLED=0` on the shim is **load-bearing**: the shim must be a static binary. If `go env GOBIN` is empty, the binaries land in `$(go env GOPATH)/bin`.
+
+### Manual download
+
+Download a prebuilt Linux archive (amd64 / arm64 / armv7 / armv6) from the [Releases](https://github.com/wighawag/anonctl/releases) page, **verify its checksum against `checksums.txt`**, and extract it. Each archive contains **both** `anonctl` and `anonctl-shim` side by side. Put `anonctl` on your `PATH`, and put `anonctl-shim` at `/usr/local/bin/anonctl-shim` (the shim unit's fixed ExecStart path), as root:
+
+```sh
+sudo install -m 0755 anonctl /usr/local/bin/anonctl
+sudo install -m 0755 anonctl-shim /usr/local/bin/anonctl-shim
+```
+
 ## Usage
 
 ```
