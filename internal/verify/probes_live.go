@@ -2,10 +2,12 @@ package verify
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -285,17 +287,110 @@ func hostExitIP(ctx context.Context) (string, error) {
 // is a TRANSPARENT SO_ORIGINAL_DST relay (internal/shim/relay.go), NOT a SOCKS
 // server, so a direct SOCKS handshake to it would read the relay's own listen addr
 // and reset. Any error feeds a failing anonymized-exit decision (never a false pass).
-func forcedExitIP(ctx context.Context, p LiveParams) (exitIP string, isTor bool, err error) {
+func forcedExitIP(ctx context.Context, p LiveParams) (exitIP string, ev TorExitEvidence, err error) {
 	exitIP, err = curlAsAnon(ctx, p, ipEchoURL)
 	if err != nil {
-		return "", false, err
+		return "", TorExitEvidence{}, err
 	}
-	if p.Class == "tor-shared" {
-		if body, terr := curlAsAnon(ctx, p, torCheckURL); terr == nil {
-			isTor = strings.Contains(body, "\"IsTor\":true") || strings.Contains(body, "\"IsTor\": true")
+	if p.Class != "tor-shared" {
+		return exitIP, TorExitEvidence{}, nil
+	}
+	if body, terr := curlAsAnon(ctx, p, torCheckURL); terr == nil {
+		ev.CheckTorProject = strings.Contains(body, "\"IsTor\":true") || strings.Contains(body, "\"IsTor\": true")
+	}
+	// If check.torproject.org did NOT confirm a Tor exit, corroborate against onionoo
+	// (Tor's authoritative relay database), which does not lag the way IsTor's exit
+	// list does. This ONLY rescues false-NEGATIVES: onionoo will not list a non-Tor IP
+	// as an exit relay, so it can never turn a genuinely-non-Tor exit into a pass. It
+	// is queried AS the anon UID (through the forced path), so no deanonymizing
+	// side-channel, and any failure/timeout leaves the evidence "unconfirmed" (the
+	// assertion then fails safe, exactly as before onionoo existed).
+	if !ev.CheckTorProject && exitIP != "" {
+		ev.OnionooConsulted = true
+		if isExit, oerr := onionooListsExit(ctx, p, exitIP); oerr != nil {
+			ev.OnionooError = oerr.Error()
+		} else {
+			ev.OnionooExit = isExit
 		}
 	}
-	return exitIP, isTor, nil
+	return exitIP, ev, nil
+}
+
+// onionooURL is Tor's authoritative relay-database query endpoint. We ask it whether
+// a specific IP is a running Tor EXIT relay (search by the exit IP, request the exit
+// flags/addresses only), the corroborating source for anonymized-exit when
+// check.torproject.org's IsTor list lags a brand-new exit.
+const onionooURL = "https://onionoo.torproject.org/details"
+
+// onionooBodyConfirmsExit parses an onionoo /details JSON body and reports whether
+// it lists exitIP as a RUNNING Tor EXIT relay. It is a PURE function (no network) so
+// the confirmation logic is unit-tested against captured onionoo shapes. It requires
+// a relay that (a) carries both the "Exit" and "Running" flags and (b) actually
+// advertises exitIP (in exit_addresses, or in or_addresses when no separate
+// exit_addresses are published). Being strict here is load-bearing: onionoo is
+// allowed to RESCUE a real Tor exit, never to invent one, so anything short of a
+// running exit relay that owns the IP reads as not-confirmed.
+func onionooBodyConfirmsExit(body, exitIP string) bool {
+	var doc struct {
+		Relays []struct {
+			ORAddresses   []string `json:"or_addresses"`
+			ExitAddresses []string `json:"exit_addresses"`
+			Flags         []string `json:"flags"`
+		} `json:"relays"`
+	}
+	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+		return false
+	}
+	hasIP := func(addrs []string) bool {
+		for _, a := range addrs {
+			// or_addresses are host:port; exit_addresses are bare IPs. Match the IP part.
+			if a == exitIP || strings.HasPrefix(a, exitIP+":") || hostOfAddr(a) == exitIP {
+				return true
+			}
+		}
+		return false
+	}
+	for _, r := range doc.Relays {
+		var isExit, isRunning bool
+		for _, f := range r.Flags {
+			switch f {
+			case "Exit":
+				isExit = true
+			case "Running":
+				isRunning = true
+			}
+		}
+		if isExit && isRunning && (hasIP(r.ExitAddresses) || hasIP(r.ORAddresses)) {
+			return true
+		}
+	}
+	return false
+}
+
+// hostOfAddr returns the host part of a possibly-bracketed host:port (an IPv6
+// or_address like "[2001:db8::1]:443" or a v4 "1.2.3.4:443"), or the input unchanged
+// when it has no port. Used to match an onionoo or_address against a bare exit IP.
+func hostOfAddr(addr string) string {
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		return h
+	}
+	return addr
+}
+
+// onionooListsExit reports whether onionoo lists exitIP as a RUNNING Tor exit relay.
+// It fetches AS the anon UID (through the forced path, like the other exit probes)
+// and parses the relays' flags: a relay carrying the "Exit" AND "Running" flags whose
+// exit_addresses/or_addresses include the IP confirms a Tor exit. It is intentionally
+// STRICT toward confirmation (only a running exit counts), so it can only rescue a
+// real Tor exit, never manufacture one. A fetch/parse error is returned so the caller
+// records it as "unconfirmed" rather than a silent false.
+func onionooListsExit(ctx context.Context, p LiveParams, exitIP string) (bool, error) {
+	q := onionooURL + "?search=" + url.QueryEscape(exitIP) + "&fields=exit_addresses,or_addresses,flags&running=true&flag=Exit"
+	body, err := curlAsAnon(ctx, p, q)
+	if err != nil {
+		return false, err
+	}
+	return onionooBodyConfirmsExit(body, exitIP), nil
 }
 
 // curlAsAnon fetches url AS THE ANON UID via `curl` under setpriv, so the fetch

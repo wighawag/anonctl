@@ -79,14 +79,14 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 	checks := []Check{
 		{Name: AssertAnonymizedExit, Run: func(ctx context.Context) Assertion {
 			hostIP, herr := hostExitIP(ctx)
-			exitIP, isTor, eerr := forcedExitIP(ctx, p)
+			exitIP, ev, eerr := forcedExitIP(ctx, p)
 			if herr != nil {
 				return Assertion{Name: AssertAnonymizedExit, Err: herr}
 			}
 			if eerr != nil {
 				return Assertion{Name: AssertAnonymizedExit, Err: eerr}
 			}
-			return AnonymizedExitAssertion(hostIP, exitIP, isTor, p.Class)
+			return AnonymizedExitAssertion(hostIP, exitIP, ev, p.Class, p.SkipTorExitCheck)
 		}},
 		{Name: AssertDNSRemote, Run: func(ctx context.Context) Assertion {
 			probe, proxyResolved, hostSaw, err := dnsRemoteEvidence(ctx, p)

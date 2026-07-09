@@ -66,6 +66,18 @@ type Command struct {
 	// error, never a silent leak. Meaningful only for the forcing verbs
 	// (add/update/reconfigure); ignored by list/status/rm/verify.
 	Exemptions []lanexempt.Exempt
+
+	// SkipTorExitCheck relaxes the anonymized-exit assertion's Tor-exit REQUIREMENT
+	// for a tor-shared endpoint (`--skip-tor-exit-check`, on verify/use). It never
+	// relaxes the load-bearing half (the exit IP must still DIFFER from the host's, so
+	// forced egress is proven); it only stops treating an UNCONFIRMED Tor exit as a
+	// failure. Its reason for existing: the Tor-exit confirmation consults external
+	// registries (check.torproject.org, then onionoo) that LAG the live consensus, so
+	// a genuine, brand-new Tor exit can be reported as not-Tor. This flag lets an
+	// operator who trusts their Tor proceed past that registry false-negative. It is
+	// deliberately narrow and loud (the pass detail announces the check was skipped);
+	// it is NOT a way to skip anonymization. Meaningful only for verify/use.
+	SkipTorExitCheck bool
 }
 
 // verbs is the recognised verb set. `use` is the verify-then-shell safe front
@@ -134,6 +146,8 @@ func Parse(args []string) (*Command, error) {
 			cmd.PurgeAccount = true
 		case a == "--force":
 			cmd.Force = true
+		case a == "--skip-tor-exit-check":
+			cmd.SkipTorExitCheck = true
 		case a == "--from":
 			wantSeedFromValue = true
 		case strings.HasPrefix(a, "--from="):

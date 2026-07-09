@@ -311,3 +311,33 @@ func TestJSONFlag(t *testing.T) {
 		t.Errorf("status --json media => JSON=%v account=%q", named.JSON, named.Account)
 	}
 }
+
+// `verify`/`use` accept `--skip-tor-exit-check` to relax the tor-exit requirement of
+// anonymized-exit (the registry-lag escape hatch); it parses as a bool flag and is
+// off by default, and the account name still resolves alongside it.
+func TestSkipTorExitCheckFlag(t *testing.T) {
+	defaultOff, err := cli.Parse([]string{"verify"})
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if defaultOff.SkipTorExitCheck {
+		t.Error("SkipTorExitCheck must default to false")
+	}
+	set, err := cli.Parse([]string{"verify", "--skip-tor-exit-check", "work"})
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if !set.SkipTorExitCheck {
+		t.Error("verify --skip-tor-exit-check must set SkipTorExitCheck")
+	}
+	if set.Account != "anon-work" {
+		t.Errorf("account = %q, want anon-work (the flag must not swallow the name)", set.Account)
+	}
+	useSet, err := cli.Parse([]string{"use", "--skip-tor-exit-check"})
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if !useSet.SkipTorExitCheck {
+		t.Error("use --skip-tor-exit-check must set SkipTorExitCheck")
+	}
+}

@@ -359,6 +359,12 @@ type LiveParams struct {
 	// Exempt is the LAN-exempted host:port (story 25), empty when no exemption is
 	// active; when empty the split-tunnel-tight assertion is not run.
 	Exempt string
+	// SkipTorExitCheck relaxes the anonymized-exit Tor-exit REQUIREMENT for a
+	// tor-shared endpoint (from `--skip-tor-exit-check`): the exit must still DIFFER
+	// from the host (forced egress proven), but an exit no registry confirms as Tor no
+	// longer fails. It exists for the registry-lag false-negative (a brand-new Tor
+	// exit check.torproject.org + onionoo have not yet catalogued); the pass says so.
+	SkipTorExitCheck bool
 }
 
 // RunVerify is the runtime orchestrator behind `anonctl verify`: it composes the
@@ -384,22 +390,51 @@ func RunVerifyWith(ctx context.Context, p LiveParams, prog Progress) Report {
 	return rep
 }
 
+// TorExitEvidence carries what each Tor-exit registry said about the observed exit
+// IP, so the anonymized-exit decision (and its message) can be HONEST about its
+// sources rather than trusting one lagging endpoint. CheckTorProject is the
+// check.torproject.org IsTor field; OnionooExit is whether Tor's authoritative
+// relay database (onionoo) lists the exit IP as a running exit relay. Either being
+// true confirms a Tor exit; onionoo exists to rescue check.torproject.org's
+// well-known false-negatives (its exit-address list LAGS the live consensus, so a
+// genuine new exit reads as not-Tor there). OnionooConsulted/OnionooError record
+// whether onionoo was reachable, so a corroboration that could NOT run is framed as
+// "unconfirmed", never silently treated as "not Tor".
+type TorExitEvidence struct {
+	CheckTorProject  bool
+	OnionooExit      bool
+	OnionooConsulted bool
+	OnionooError     string
+}
+
+// confirmsTor reports whether ANY consulted registry confirms the exit is a Tor
+// exit. onionoo confirming is enough even when check.torproject.org said false
+// (that is the false-negative this closes); neither confirming leaves it unproven.
+func (e TorExitEvidence) confirmsTor() bool { return e.CheckTorProject || e.OnionooExit }
+
 // AnonymizedExitAssertion is the PURE decision for the anonymized-exit assertion.
 // Given the host's own direct exit IP (hostIP), the exit IP observed through the
-// forced path (exitIP), whether the Tor-check reported a Tor exit (isTorExit), and
-// the endpoint's share-class, it returns the named Assertion:
+// forced path (exitIP), the Tor-exit EVIDENCE from the registries, the endpoint's
+// share-class, and whether the operator asked to skip the Tor-exit requirement
+// (skipTorCheck), it returns the named Assertion:
 //
 //   - an EMPTY observed exit fails (the forced path produced nothing; it may have
 //     failed closed) rather than silently pass;
 //   - an exit EQUAL to the host's fails (egress is NOT forced: a leak);
-//   - for a tor-shared endpoint the exit must ALSO be a Tor exit (the promised Tor
-//     exit, checked against check.torproject.org); a differing-but-not-Tor exit
-//     fails;
-//   - otherwise (a differing exit, and a Tor exit when tor-shared) it passes.
+//   - for a tor-shared endpoint the exit must ALSO be confirmed a Tor exit by AT
+//     LEAST ONE registry (check.torproject.org OR onionoo); a differing exit that
+//     NEITHER registry confirms fails, UNLESS skipTorCheck relaxes that half;
+//   - otherwise it passes.
+//
+// The load-bearing half (exit differs from host => forced egress) is NEVER relaxed:
+// skipTorCheck only drops the Tor-exit sub-requirement, and a skipped pass says so
+// loudly. The detail always NAMES the registries consulted and warns they can lag,
+// so a red is understood as "no registry confirmed this exit", not a definitive
+// "you are not on Tor".
 //
 // It is pure so the verdict is unit-tested against the fixture without real Tor;
 // the live check feeds it the real probe output.
-func AnonymizedExitAssertion(hostIP, exitIP string, isTorExit bool, class endpoint.ShareClass) Assertion {
+func AnonymizedExitAssertion(hostIP, exitIP string, ev TorExitEvidence, class endpoint.ShareClass, skipTorCheck bool) Assertion {
 	a := Assertion{Name: AssertAnonymizedExit}
 	if exitIP == "" {
 		a.Detail = "the forced path produced no exit IP (it may have failed closed): not anonymized"
@@ -409,17 +444,46 @@ func AnonymizedExitAssertion(hostIP, exitIP string, isTorExit bool, class endpoi
 		a.Detail = "exit IP " + exitIP + " EQUALS the host's: traffic is NOT forced through the endpoint (leak)"
 		return a
 	}
-	if class == endpoint.ClassTorShared && !isTorExit {
-		a.Detail = "exit IP " + exitIP + " differs from the host but is NOT a Tor exit (check.torproject.org IsTor=false) for a tor-shared endpoint"
+	if class != endpoint.ClassTorShared {
+		a.Ok = true
+		a.Detail = "exit IP " + exitIP + " differs from host " + hostIP + " (forced egress active)"
 		return a
 	}
-	a.Ok = true
-	if class == endpoint.ClassTorShared {
-		a.Detail = "exit IP " + exitIP + " differs from host " + hostIP + " and is a Tor exit (IsTor=true)"
-	} else {
-		a.Detail = "exit IP " + exitIP + " differs from host " + hostIP + " (forced egress active)"
+	// tor-shared: the exit should be a Tor exit. Confirmed by EITHER registry passes.
+	if ev.confirmsTor() {
+		a.Ok = true
+		a.Detail = "exit IP " + exitIP + " differs from host " + hostIP + " and is a Tor exit (" + torSourceDetail(ev) + ")"
+		return a
 	}
+	// Neither registry confirmed it. Either skip (relax the Tor-exit half, loudly) or
+	// fail with a message that names what was consulted and warns the registries lag.
+	if skipTorCheck {
+		a.Ok = true
+		a.Detail = "exit IP " + exitIP + " differs from host " + hostIP + " (forced egress active); Tor-exit check SKIPPED (--skip-tor-exit-check): " + torSourceDetail(ev) + " - forced egress is proven, but the exit was NOT confirmed a Tor exit"
+		return a
+	}
+	a.Detail = "exit IP " + exitIP + " differs from the host but was NOT confirmed a Tor exit for a tor-shared endpoint (" + torSourceDetail(ev) + "). These registries LAG the live Tor consensus, so a genuine, brand-new Tor exit can read as not-Tor here: if you trust your Tor, re-run (a later circuit usually picks a listed exit) or pass --skip-tor-exit-check to accept forced-egress-only"
 	return a
+}
+
+// torSourceDetail renders which registries were consulted and what they said, so
+// every anonymized-exit message (pass, fail, or skip) is transparent about its
+// evidence rather than citing a single opaque source.
+func torSourceDetail(ev TorExitEvidence) string {
+	ctp := "check.torproject.org IsTor=false"
+	if ev.CheckTorProject {
+		ctp = "check.torproject.org IsTor=true"
+	}
+	switch {
+	case ev.OnionooExit:
+		return ctp + ", onionoo lists it as a Tor exit relay"
+	case !ev.OnionooConsulted:
+		return ctp + ", onionoo not consulted"
+	case ev.OnionooError != "":
+		return ctp + ", onionoo could not be reached (" + ev.OnionooError + ")"
+	default:
+		return ctp + ", onionoo does not list it as a Tor exit"
+	}
 }
 
 // DNSRemoteAssertion is the PURE decision for the dns-remote assertion. Given the

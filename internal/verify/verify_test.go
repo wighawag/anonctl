@@ -280,7 +280,7 @@ func TestReport_JSONNeverEmbedsCredentials(t *testing.T) {
 // property. If the observed exit IP equals the host's own, egress is NOT forced
 // (a leak) and the assertion must FAIL.
 func TestAnonymizedExitAssertion_FailsWhenExitEqualsHost(t *testing.T) {
-	a := AnonymizedExitAssertion("203.0.113.9", "203.0.113.9", false, endpoint.ClassSocksPeruser)
+	a := AnonymizedExitAssertion("203.0.113.9", "203.0.113.9", TorExitEvidence{}, endpoint.ClassSocksPeruser, false)
 	if a.Ok {
 		t.Fatalf("exit IP equal to host must FAIL (not anonymized); got %+v", a)
 	}
@@ -292,7 +292,7 @@ func TestAnonymizedExitAssertion_FailsWhenExitEqualsHost(t *testing.T) {
 // TestAnonymizedExitAssertion_PassesWhenExitDiffersForSocksPeruser: a plain socks
 // endpoint has no Tor-exit claim to make, so a differing exit IP is enough to pass.
 func TestAnonymizedExitAssertion_PassesWhenExitDiffersForSocksPeruser(t *testing.T) {
-	a := AnonymizedExitAssertion("203.0.113.9", "198.51.100.7", false, endpoint.ClassSocksPeruser)
+	a := AnonymizedExitAssertion("203.0.113.9", "198.51.100.7", TorExitEvidence{}, endpoint.ClassSocksPeruser, false)
 	if !a.Ok {
 		t.Fatalf("a differing exit on a socks-peruser endpoint must PASS; got %+v", a)
 	}
@@ -302,11 +302,11 @@ func TestAnonymizedExitAssertion_PassesWhenExitDiffersForSocksPeruser(t *testing
 // the assertion additionally requires the check.torproject.org IsTor signal to be
 // true. A differing exit that is NOT a Tor exit fails (it is not the promised Tor).
 func TestAnonymizedExitAssertion_TorSharedRequiresTorExit(t *testing.T) {
-	notTor := AnonymizedExitAssertion("203.0.113.9", "198.51.100.7", false, endpoint.ClassTorShared)
+	notTor := AnonymizedExitAssertion("203.0.113.9", "198.51.100.7", TorExitEvidence{}, endpoint.ClassTorShared, false)
 	if notTor.Ok {
 		t.Fatalf("a tor-shared endpoint whose exit is NOT a Tor exit must FAIL; got %+v", notTor)
 	}
-	isTor := AnonymizedExitAssertion("203.0.113.9", "198.51.100.7", true, endpoint.ClassTorShared)
+	isTor := AnonymizedExitAssertion("203.0.113.9", "198.51.100.7", TorExitEvidence{CheckTorProject: true}, endpoint.ClassTorShared, false)
 	if !isTor.Ok {
 		t.Fatalf("a tor-shared endpoint with a differing Tor exit must PASS; got %+v", isTor)
 	}
@@ -316,9 +316,95 @@ func TestAnonymizedExitAssertion_TorSharedRequiresTorExit(t *testing.T) {
 // means the forced path produced nothing (it may have failed closed); that is a
 // failure, never a silent pass.
 func TestAnonymizedExitAssertion_FailsWhenNoExitObserved(t *testing.T) {
-	a := AnonymizedExitAssertion("203.0.113.9", "", false, endpoint.ClassSocksPeruser)
+	a := AnonymizedExitAssertion("203.0.113.9", "", TorExitEvidence{}, endpoint.ClassSocksPeruser, false)
 	if a.Ok {
 		t.Fatalf("an empty observed exit must FAIL; got %+v", a)
+	}
+}
+
+// onionoo RESCUES a check.torproject.org false-negative: for a tor-shared endpoint
+// whose exit check.torproject.org says is NOT Tor, but onionoo lists as a running
+// exit relay, the assertion PASSES (the registry lag this fix exists for). The
+// detail must credit onionoo so the pass is transparent about which source confirmed.
+func TestAnonymizedExitAssertion_OnionooRescuesCheckTorProjectFalseNegative(t *testing.T) {
+	ev := TorExitEvidence{CheckTorProject: false, OnionooConsulted: true, OnionooExit: true}
+	a := AnonymizedExitAssertion("203.0.113.9", "198.51.100.7", ev, endpoint.ClassTorShared, false)
+	if !a.Ok {
+		t.Fatalf("onionoo confirming a Tor exit must PASS even when check.torproject.org said false; got %+v", a)
+	}
+	if !strings.Contains(a.Detail, "onionoo") {
+		t.Errorf("a pass rescued by onionoo must name onionoo in the detail; got %q", a.Detail)
+	}
+}
+
+// When NEITHER registry confirms a Tor exit for a tor-shared endpoint, the assertion
+// FAILS, and its detail must (a) name BOTH sources it consulted and (b) warn the
+// registries can lag, so a red is understood as "unconfirmed", not "definitely not
+// Tor", and points at the --skip-tor-exit-check escape hatch.
+func TestAnonymizedExitAssertion_FailsHonestlyWhenNeitherRegistryConfirms(t *testing.T) {
+	ev := TorExitEvidence{CheckTorProject: false, OnionooConsulted: true, OnionooExit: false}
+	a := AnonymizedExitAssertion("203.0.113.9", "198.51.100.7", ev, endpoint.ClassTorShared, false)
+	if a.Ok {
+		t.Fatalf("neither registry confirming must FAIL; got %+v", a)
+	}
+	for _, want := range []string{"check.torproject.org", "onionoo", "--skip-tor-exit-check"} {
+		if !strings.Contains(a.Detail, want) {
+			t.Errorf("fail detail must mention %q so the red is honest+actionable; got %q", want, a.Detail)
+		}
+	}
+	if !strings.Contains(strings.ToLower(a.Detail), "lag") {
+		t.Errorf("fail detail must warn the registries LAG so a red is not read as definitive; got %q", a.Detail)
+	}
+}
+
+// --skip-tor-exit-check relaxes ONLY the Tor-exit requirement: an unconfirmed exit
+// that DIFFERS from the host PASSES (forced egress is proven), and the pass detail
+// announces the check was skipped. It must NOT relax the exit-differs half.
+func TestAnonymizedExitAssertion_SkipTorExitCheckRelaxesOnlyTheTorHalf(t *testing.T) {
+	ev := TorExitEvidence{CheckTorProject: false, OnionooConsulted: true, OnionooExit: false}
+	// Unconfirmed Tor exit, but differs from host + skip => PASS, loudly.
+	skip := AnonymizedExitAssertion("203.0.113.9", "198.51.100.7", ev, endpoint.ClassTorShared, true)
+	if !skip.Ok {
+		t.Fatalf("--skip-tor-exit-check must PASS an unconfirmed-but-differing exit; got %+v", skip)
+	}
+	if !strings.Contains(skip.Detail, "SKIPPED") {
+		t.Errorf("a skipped pass must announce the Tor check was skipped; got %q", skip.Detail)
+	}
+	// The load-bearing half is NEVER relaxed: an exit EQUAL to the host still FAILS,
+	// even with skip set (that is a real leak, not a registry-lag false-negative).
+	leak := AnonymizedExitAssertion("203.0.113.9", "203.0.113.9", ev, endpoint.ClassTorShared, true)
+	if leak.Ok {
+		t.Fatalf("--skip-tor-exit-check must NOT pass an exit EQUAL to the host (a leak); got %+v", leak)
+	}
+}
+
+// onionooBodyConfirmsExit is strict: it confirms ONLY a running Exit relay that owns
+// the IP, so it can rescue a real Tor exit but never invent one.
+func TestOnionooBodyConfirmsExit(t *testing.T) {
+	const ip = "203.55.81.1"
+	// A running exit relay advertising the IP: confirmed.
+	runningExit := `{"relays":[{"or_addresses":["203.55.81.1:19007"],"exit_addresses":["203.55.81.1"],"flags":["Exit","Fast","Running","Stable","Valid"]}]}`
+	if !onionooBodyConfirmsExit(runningExit, ip) {
+		t.Errorf("a running Exit relay owning the IP must confirm")
+	}
+	// Same relay but NOT running: not confirmed (only a live exit counts).
+	notRunning := `{"relays":[{"exit_addresses":["203.55.81.1"],"flags":["Exit","Valid"]}]}`
+	if onionooBodyConfirmsExit(notRunning, ip) {
+		t.Errorf("a non-Running relay must NOT confirm")
+	}
+	// A running relay WITHOUT the Exit flag (a guard/middle): not an exit, not confirmed.
+	notExit := `{"relays":[{"or_addresses":["203.55.81.1:443"],"flags":["Guard","Running","Valid"]}]}`
+	if onionooBodyConfirmsExit(notExit, ip) {
+		t.Errorf("a non-Exit relay must NOT confirm")
+	}
+	// A running exit relay for a DIFFERENT IP: not confirmed for our IP.
+	otherIP := `{"relays":[{"exit_addresses":["185.220.101.146"],"flags":["Exit","Running","Valid"]}]}`
+	if onionooBodyConfirmsExit(otherIP, ip) {
+		t.Errorf("a relay for a different IP must NOT confirm our IP")
+	}
+	// Empty / garbage: not confirmed, no panic.
+	if onionooBodyConfirmsExit(`{"relays":[]}`, ip) || onionooBodyConfirmsExit("not json", ip) {
+		t.Errorf("empty/garbage onionoo body must not confirm")
 	}
 }
 
@@ -651,7 +737,7 @@ func TestAnonymizedExit_AgainstFixture(t *testing.T) {
 	// The exit observed through the fixture is its ExitIP; the host baseline is a
 	// different synthetic value. This exercises the assertion decision the live
 	// integration check will feed with real probe output.
-	a := AnonymizedExitAssertion("203.0.113.9", "127.0.0.2", false, endpoint.ClassSocksPeruser)
+	a := AnonymizedExitAssertion("203.0.113.9", "127.0.0.2", TorExitEvidence{}, endpoint.ClassSocksPeruser, false)
 	if !a.Ok {
 		t.Fatalf("fixture exit differs from host baseline: must PASS; got %+v", a)
 	}

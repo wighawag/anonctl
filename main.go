@@ -594,6 +594,7 @@ func verifyAndMark(ctx context.Context, r provision.Runner, cmd *cli.Command, pr
 		}
 	}
 	p := verifyParams(accountconfig.DefaultStore(), cmd.Account, st)
+	p.SkipTorExitCheck = cmd.SkipTorExitCheck
 	rep := verify.RunVerifyWith(ctx, p, prog)
 
 	// WRITE-AFTER-VERIFY: the marker is a coordination CLAIM written strictly AFTER
@@ -1088,8 +1089,14 @@ const usage = `usage:
                                      on copy. add also seeds from default-home on fresh creation (root)
   anonctl list   [--json]           list the anon accounts that exist on the box
   anonctl status [<name>] [--json]  show one account's state (machine-readable with --json)
-  anonctl verify [<name>] [--json]  prove the account is anonymized (named assertions, non-zero exit on failure)
-  anonctl use    [<name>]           verify the account, then open a shell as it ONLY on green (root); refuses
+  anonctl verify [<name>] [--json] [--skip-tor-exit-check]
+                                     prove the account is anonymized (named assertions, non-zero exit on
+                                     failure). --skip-tor-exit-check accepts an exit that forced egress but
+                                     that check.torproject.org + onionoo did not confirm as a Tor exit (for
+                                     a tor-shared endpoint): those registries lag, so a new Tor exit can
+                                     read as not-Tor; the exit must still DIFFER from the host.
+  anonctl use    [<name>] [--skip-tor-exit-check]
+                                     verify the account, then open a shell as it ONLY on green (root); refuses
                                      (no shell) if it is not currently anonymized. A session-start SAFETY GATE,
                                      NOT the leak protection: it is a snapshot (verify at login, not continuous)
                                      and bypassable (su/sudo -iu/ssh/cron reach the account anyway). The real
