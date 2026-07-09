@@ -10,6 +10,7 @@ import (
 	"github.com/wighawag/anonctl/internal/cli"
 	"github.com/wighawag/anonctl/internal/endpoint"
 	"github.com/wighawag/anonctl/internal/forcing"
+	"github.com/wighawag/anonctl/internal/marker"
 	"github.com/wighawag/anonctl/internal/provision"
 	"github.com/wighawag/anonctl/internal/verify"
 )
@@ -229,7 +230,7 @@ func TestUseRequiresRoot(t *testing.T) {
 func swapRmSeams(t *testing.T, forceErr, rmErr error) *[]string {
 	t.Helper()
 	var events []string
-	origForce, origRm := rmForcingRemove, rmProvisionRm
+	origForce, origRm, origMarker := rmForcingRemove, rmProvisionRm, rmMarkerStore
 	rmForcingRemove = func(ctx context.Context, d forcing.Deps, account string) error {
 		events = append(events, "disable-shim:"+account)
 		return forceErr
@@ -238,7 +239,11 @@ func swapRmSeams(t *testing.T, forceErr, rmErr error) *[]string {
 		events = append(events, "userdel-shim:"+account)
 		return provision.RmResult{Account: account, Shim: cli.ShimAccount(account), AccountRemoved: purge && rmErr == nil, ShimRemoved: purge && rmErr == nil}, rmErr
 	}
-	t.Cleanup(func() { rmForcingRemove, rmProvisionRm = origForce, origRm })
+	// Isolate the marker removal (runRm step 3) to a scratch dir so the test never
+	// touches the real `/etc/anonctl` (a shared-write violation that fails off-root
+	// with "permission denied"), mirroring the marker package's own BaseDir isolation.
+	rmMarkerStore = marker.Store{BaseDir: t.TempDir()}
+	t.Cleanup(func() { rmForcingRemove, rmProvisionRm, rmMarkerStore = origForce, origRm, origMarker })
 	return &events
 }
 
@@ -258,8 +263,18 @@ func indexOfEvent(events []string, prefix string) int {
 // is still running as that UID) and the whole last-account cleanup never completes.
 // This asserts the disable-shim event is recorded BEFORE the shim userdel at the
 // runRm seam.
+//
+// It also proves the shared-write isolation: runRm's step-3 marker removal is
+// routed through rmMarkerStore (pointed at a scratch dir by swapRmSeams), so this
+// test passes off-root (exit 0) WITHOUT touching the real `/etc/anonctl` (the
+// pre-existing RED: the real path removal failed "permission denied" as non-root).
 func TestRmDisablesShimBeforeUserdel(t *testing.T) {
 	events := swapRmSeams(t, nil, nil)
+	// The real marker path must be left untouched: nothing here may write/delete
+	// under `/etc/anonctl`. Assert the store runRm will use is NOT the real one.
+	if rmMarkerStore.BaseDir == "" || rmMarkerStore.BaseDir == marker.DefaultBaseDir {
+		t.Fatalf("rmMarkerStore.BaseDir = %q, want an isolated scratch dir (never the real %q)", rmMarkerStore.BaseDir, marker.DefaultBaseDir)
+	}
 	if code := run([]string{"rm", "--purge-account"}); code != 0 {
 		t.Errorf("run(rm --purge-account) = %d, want 0", code)
 	}
