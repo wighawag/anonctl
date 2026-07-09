@@ -3,6 +3,7 @@ package systemd_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/wighawag/anonctl/internal/systemd"
@@ -21,20 +22,26 @@ func scratchStore(t *testing.T) systemd.Store {
 	}
 }
 
-func TestInstallTemplateWritesTheUnitAndDropIn(t *testing.T) {
+func TestInstallTemplateWritesTheUnitAndLoader(t *testing.T) {
 	s := scratchStore(t)
-	if err := s.InstallCommon(systemd.TemplateParams{}, systemd.NftablesDropInParams{}); err != nil {
+	if err := s.InstallCommon(systemd.TemplateParams{}, systemd.LoaderParams{}); err != nil {
 		t.Fatalf("InstallCommon: %v", err)
 	}
-	// The @-template unit lands in the unit dir.
+	// The @-template shim unit lands in the unit dir.
 	unitPath := filepath.Join(s.UnitDir, systemd.UnitName)
 	if _, err := os.Stat(unitPath); err != nil {
 		t.Errorf("template unit not written: %v", err)
 	}
-	// The nftables.service drop-in lands under nftables.service.d.
-	dropinPath := filepath.Join(s.UnitDir, "nftables.service.d", "anonctl.conf")
-	if _, err := os.Stat(dropinPath); err != nil {
-		t.Errorf("nftables drop-in not written: %v", err)
+	// anonctl's OWN early-boot loader unit lands in the unit dir (it REPLACED the
+	// nftables.service drop-in): a host unit anonctl does not mutate.
+	loaderPath := filepath.Join(s.UnitDir, systemd.LoaderUnitName)
+	if _, err := os.Stat(loaderPath); err != nil {
+		t.Errorf("loader unit not written: %v", err)
+	}
+	// The old drop-in must NOT be written anymore (anonctl no longer rides on the
+	// host's nftables.service).
+	if _, err := os.Stat(filepath.Join(s.UnitDir, "nftables.service.d", "anonctl.conf")); err == nil {
+		t.Errorf("the nftables.service drop-in must no longer be written (replaced by the loader unit)")
 	}
 }
 
@@ -53,7 +60,7 @@ func TestWriteAccountPersistsEnvAndRuleFile(t *testing.T) {
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Errorf("env file mode = %o, want 0600 (anonctl-private)", perm)
 	}
-	// The per-account nft rule file (loaded at boot by the drop-in) lands too, and
+	// The per-account nft rule file (loaded at boot by the loader unit) lands too, and
 	// carries the account's ruleset text.
 	rulePath := filepath.Join(s.RulesDir, "anon.nft")
 	data, err := os.ReadFile(rulePath)
@@ -62,6 +69,41 @@ func TestWriteAccountPersistsEnvAndRuleFile(t *testing.T) {
 	}
 	if string(data) != "table inet anonctl_anon {}\n" {
 		t.Errorf("rule file content = %q, want the passed ruleset", string(data))
+	}
+	// The standing baseline default-deny lands as its OWN always-loaded artifact
+	// (`<account>.baseline.nft`, matching the loader glob), generated from the anon
+	// UID: so forcing-absent still means DROPPED at boot.
+	baseline, err := os.ReadFile(filepath.Join(s.RulesDir, "anon.baseline.nft"))
+	if err != nil {
+		t.Fatalf("baseline rule file not written: %v", err)
+	}
+	if !strings.Contains(string(baseline), "table inet anonctl_baseline_anon {") {
+		t.Errorf("baseline file must carry the baseline default-deny table:\n%s", string(baseline))
+	}
+	if !strings.Contains(string(baseline), "meta skuid 30034 ip daddr != 127.0.0.0/8 drop") {
+		t.Errorf("baseline file must drop the anon UID's real egress:\n%s", string(baseline))
+	}
+}
+
+func TestHasForcedAccountsTracksRuleFiles(t *testing.T) {
+	s := scratchStore(t)
+	// No rules dir yet => no forced accounts (a clean negative, never an error). This
+	// is what teardown uses to disable the shared loader unit only on the LAST account.
+	if has, err := s.HasForcedAccounts(); err != nil || has {
+		t.Errorf("HasForcedAccounts() on an empty host = (%v, %v), want (false, nil)", has, err)
+	}
+	if err := s.WriteAccount(sampleConfig(), "table inet anonctl_anon {}\n"); err != nil {
+		t.Fatalf("WriteAccount: %v", err)
+	}
+	if has, err := s.HasForcedAccounts(); err != nil || !has {
+		t.Errorf("HasForcedAccounts() with an account = (%v, %v), want (true, nil)", has, err)
+	}
+	if err := s.RemoveAccount("anon"); err != nil {
+		t.Fatalf("RemoveAccount: %v", err)
+	}
+	// After the last account's rule files are gone, the loader is no longer needed.
+	if has, err := s.HasForcedAccounts(); err != nil || has {
+		t.Errorf("HasForcedAccounts() after the last removal = (%v, %v), want (false, nil)", has, err)
 	}
 }
 
@@ -82,6 +124,9 @@ func TestRemoveAccountDeletesEnvAndRuleFileIdempotently(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(s.RulesDir, "anon.nft")); !os.IsNotExist(err) {
 		t.Errorf("rule file survived RemoveAccount")
+	}
+	if _, err := os.Stat(filepath.Join(s.RulesDir, "anon.baseline.nft")); !os.IsNotExist(err) {
+		t.Errorf("baseline rule file survived RemoveAccount")
 	}
 }
 

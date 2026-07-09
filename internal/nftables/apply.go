@@ -32,6 +32,24 @@ func Apply(ctx context.Context, r Runner, p Params) error {
 	return nil
 }
 
+// ApplyBaseline generates the account's standing per-UID default-deny (baseline)
+// ruleset and loads it atomically via `nft -f -`. It is applied FIRST (before the
+// forcing rules) at add-time so the anon UID's resting state is DROP from the very
+// moment forcing is being installed: there is no window where the account can act
+// with neither the baseline nor the forcing present. The load is idempotent (the
+// baseline table is create-if-absent, deleted, then defined fresh) and touches only
+// the baseline table.
+func ApplyBaseline(ctx context.Context, r Runner, account string, anonUID int) error {
+	ruleset, err := GenerateBaseline(account, anonUID)
+	if err != nil {
+		return err
+	}
+	if _, stderr, err := r.Run(ctx, ruleset, "nft", "-f", "-"); err != nil {
+		return fmt.Errorf("nftables: apply baseline default-deny for account %q: %w: %s", account, err, stderr)
+	}
+	return nil
+}
+
 // Delete removes ONLY the given account's table (`delete table inet
 // anonctl_<account>`), so tearing one account down leaves every other table (and
 // the rest of the host's firewall) untouched. It never flushes the whole ruleset.
@@ -45,6 +63,22 @@ func Delete(ctx context.Context, r Runner, account string) error {
 	cmd := fmt.Sprintf("delete table inet %s", TableName(account))
 	if _, stderr, err := r.Run(ctx, cmd, "nft", "-f", "-"); err != nil {
 		return fmt.Errorf("nftables: delete table for account %q: %w: %s", account, err, stderr)
+	}
+	return nil
+}
+
+// DeleteBaseline removes ONLY the given account's baseline default-deny table
+// (`delete table inet anonctl_baseline_<account>`), so teardown removes the resting
+// deny alongside the forcing table and leaves every other table untouched. Like
+// Delete, an absent table is nft's own error; the idempotent teardown caller
+// ignores a not-found.
+func DeleteBaseline(ctx context.Context, r Runner, account string) error {
+	if account == "" {
+		return fmt.Errorf("nftables: delete baseline needs an account")
+	}
+	cmd := fmt.Sprintf("delete table inet %s", BaselineTableName(account))
+	if _, stderr, err := r.Run(ctx, cmd, "nft", "-f", "-"); err != nil {
+		return fmt.Errorf("nftables: delete baseline table for account %q: %w: %s", account, err, stderr)
 	}
 	return nil
 }

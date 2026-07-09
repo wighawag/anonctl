@@ -38,7 +38,7 @@ func TestGeneratedTemplateUnitIsWellFormed(t *testing.T) {
 	if store.UnitDir == systemd.DefaultUnitDir {
 		t.Fatal("test Store must not point at the real DefaultUnitDir")
 	}
-	if err := store.InstallCommon(systemd.TemplateParams{}, systemd.NftablesDropInParams{}); err != nil {
+	if err := store.InstallCommon(systemd.TemplateParams{}, systemd.LoaderParams{}); err != nil {
 		t.Fatalf("InstallCommon: %v", err)
 	}
 

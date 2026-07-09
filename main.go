@@ -80,8 +80,10 @@ func run(args []string) int {
 }
 
 // runAdd provisions the account + its dedicated shim UID, then INSTALLS the forcing
-// (nft rules + the persisted systemd shim unit + the nftables.service drop-in), so
-// the account is anonymized live AND across a reboot fail-closed. It must run as
+// (the standing baseline default-deny + the nft forcing rules + the persisted
+// systemd shim unit + anonctl's own early-boot loader unit), so the account is
+// anonymized live AND across a reboot fail-closed - and DROPPED, never free, even if
+// the forcing rules never load. It must run as
 // root (useradd/nft/systemctl); a non-root run surfaces the underlying command's
 // own permission error. Provisioning is idempotent and the forcing install is an
 // atomic replace, so re-running `add` cleanly re-applies.
