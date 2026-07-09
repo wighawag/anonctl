@@ -58,9 +58,9 @@ type Command struct {
 	Exemptions []lanexempt.Exempt
 }
 
-// verbs is the recognised verb set. add/rm/list/status are live in this task;
-// verify and update/reconfigure DISPATCH here as stubs (later tasks fill them),
-// so the verb surface is end-to-end from the start.
+// verbs is the recognised verb set. `use` is the verify-then-shell safe front
+// door (verify the resolved account, then exec its login shell only on green); it
+// takes an optional name like the other account-targeting verbs.
 var verbs = map[string]bool{
 	"add":         true,
 	"rm":          true,
@@ -69,6 +69,7 @@ var verbs = map[string]bool{
 	"verify":      true,
 	"update":      true,
 	"reconfigure": true,
+	"use":         true,
 }
 
 // takesName reports whether a verb accepts an account name. `list` enumerates ALL

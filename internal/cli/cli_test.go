@@ -66,6 +66,37 @@ func TestExplicitDefaultName(t *testing.T) {
 	}
 }
 
+// `use` is the verify-then-shell safe front door: it takes an optional name
+// (bare = the default `anon`, `<name>` = `anon-<name>`), exactly like the other
+// account-targeting verbs, so it must PARSE and resolve the account the same way.
+func TestUseVerbAndNameResolution(t *testing.T) {
+	cases := []struct {
+		args        []string
+		wantAccount string
+	}{
+		{[]string{"use"}, "anon"},
+		{[]string{"use", "work"}, "anon-work"},
+		{[]string{"use", "anon-media"}, "anon-media"},
+	}
+	for _, tc := range cases {
+		cmd, err := cli.Parse(tc.args)
+		if err != nil {
+			t.Fatalf("Parse(%v) error: %v", tc.args, err)
+		}
+		if cmd.Verb != "use" {
+			t.Errorf("verb = %q, want use", cmd.Verb)
+		}
+		if cmd.Account != tc.wantAccount {
+			t.Errorf("Parse(%v) account = %q, want %q", tc.args, cmd.Account, tc.wantAccount)
+		}
+	}
+
+	// `use` takes at most one account name, like the other targeting verbs.
+	if _, err := cli.Parse([]string{"use", "a", "b"}); err == nil {
+		t.Error("Parse(use a b) = nil error, want a too-many-names error")
+	}
+}
+
 // verify and update/reconfigure are STUBS filled by later tasks, but they must
 // still DISPATCH here so the verb surface is end-to-end.
 func TestStubVerbsDispatch(t *testing.T) {

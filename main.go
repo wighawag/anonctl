@@ -71,6 +71,8 @@ func run(args []string) int {
 		return runStatus(ctx, runner, cmd)
 	case "verify":
 		return runVerify(ctx, runner, cmd)
+	case "use":
+		return runUse(ctx, runner, cmd)
 	case "update", "reconfigure":
 		return runUpdate(ctx, runner, cmd)
 	default:
@@ -237,27 +239,7 @@ func runStatus(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 // the default build's fail-closed report and for the integration harness (which
 // supplies the live params directly).
 func runVerify(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
-	st, err := provision.Status(ctx, r, cmd.Account)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "anonctl: verify: %v\n", err)
-		return 1
-	}
-	p := verifyParams(accountconfig.DefaultStore(), cmd.Account, st)
-	rep := verify.RunVerify(ctx, p)
-
-	// WRITE-AFTER-VERIFY: the marker is a coordination CLAIM written strictly AFTER
-	// verify proves the account forced. On a passing report we write it (via the
-	// gate, so an unverified account can never be claimed); a failing verify writes
-	// nothing and leaves any prior claim to be cleared by `rm`. A marker-write
-	// failure does NOT flip a passing verify to a failure (the account IS proven
-	// forced); it is surfaced on stderr so the operator can retry.
-	if rep.Ok() {
-		m := marker.New(cmd.Account, st.UID, p.Class, resolveVersion(), time.Now())
-		if werr := marker.DefaultStore().WriteVerified(m, true); werr != nil {
-			fmt.Fprintf(os.Stderr, "anonctl: verify: writing marker: %v\n", werr)
-		}
-	}
-
+	rep := verifyAndMark(ctx, r, cmd)
 	if cmd.JSON {
 		blob, jerr := rep.JSON()
 		if jerr != nil {
@@ -269,6 +251,42 @@ func runVerify(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		fmt.Print(rep.Human())
 	}
 	return rep.ExitCode()
+}
+
+// verifyAndMark runs the LIVE verify assertion set for the command's account and,
+// on a GREEN report, writes the write-after-verify marker (the coordination CLAIM
+// an account is forced). It is the shared gate BOTH `verify` and `use` run: `use`
+// is a verify-then-shell front door, so it MUST make the identical verify decision
+// (same assertions, same marker-on-green side effect) and only differs in what it
+// does with the verdict (render + exit vs render + exec-or-refuse). Extracting it
+// keeps the two verbs from drifting into two different notions of "anonymized".
+//
+// A marker-write failure does NOT flip a passing verify to a failure (the account
+// IS proven forced); it is surfaced on stderr so the operator can retry.
+func verifyAndMark(ctx context.Context, r provision.Runner, cmd *cli.Command) verify.Report {
+	st, err := provision.Status(ctx, r, cmd.Account)
+	if err != nil {
+		// A status read failure yields a single failing assertion so the report is a
+		// clean RED (verify could not even read the account), never a silent pass.
+		return verify.Report{
+			Account:    cmd.Account,
+			Assertions: []verify.Assertion{{Name: "account-readable", Ok: false, Err: err}},
+		}
+	}
+	p := verifyParams(accountconfig.DefaultStore(), cmd.Account, st)
+	rep := verify.RunVerify(ctx, p)
+
+	// WRITE-AFTER-VERIFY: the marker is a coordination CLAIM written strictly AFTER
+	// verify proves the account forced. On a passing report we write it (via the
+	// gate, so an unverified account can never be claimed); a failing verify writes
+	// nothing and leaves any prior claim to be cleared by `rm`.
+	if rep.Ok() {
+		m := marker.New(cmd.Account, st.UID, p.Class, resolveVersion(), time.Now())
+		if werr := marker.DefaultStore().WriteVerified(m, true); werr != nil {
+			fmt.Fprintf(os.Stderr, "anonctl: verify: writing marker: %v\n", werr)
+		}
+	}
+	return rep
 }
 
 // verifyParams assembles the LIVE verify params for an account: the endpoint +
@@ -324,6 +342,70 @@ func firstExemptHostPort(raw []string) string {
 	}
 	return ""
 }
+
+// runUse is the verify-then-shell SAFE FRONT DOOR (a maintainer-requested
+// convenience): it verifies the resolved account and, ONLY on a GREEN verify,
+// execs an interactive login shell as that account (the kernel forcing already in
+// effect). On a RED verify it prints the failing assertions and exits non-zero
+// WITHOUT starting any shell, so `use` can never hand you an un-anonymized shell.
+//
+// HONESTY (see the help text + README): `use` is a session-start CONVENIENCE +
+// SAFETY gate, NOT the leak protection and NOT enforcement. It is a SNAPSHOT
+// (verify at login, not continuous: Tor could die or rules be flushed mid-session)
+// and it is BYPASSABLE (`su - <account>` / `sudo -iu <account>` / ssh / cron reach
+// the account without ever consulting `use`). The REAL protection is the kernel
+// forcing plus the standing per-UID default-deny; `use` just refuses to drop you
+// into a setup that is broken RIGHT NOW. A mandatory login-shell/PAM gate is a
+// separate idea (`mandatory-anonctl-gated-login`), not this verb.
+//
+// It requires root because it drops to the account (setpriv). The verify-gate
+// decision and the shell exec are behind package seams (useVerifyReport,
+// useExecLoginShell, useGeteuid) so the unit tests assert the gate polarity
+// without spawning a real shell or needing root; the real setpriv drop is
+// exercised under the `integration` tag.
+func runUse(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
+	if useGeteuid() != 0 {
+		fmt.Fprintf(os.Stderr, "anonctl: use: must be root to drop into %s (it changes UID via setpriv); re-run with sudo\n", cmd.Account)
+		return 1
+	}
+
+	rep := useVerifyReport(ctx, r, cmd)
+	if !rep.Ok() {
+		// RED: print the failing assertions and REFUSE. Do NOT exec a shell (you must
+		// never get an un-anonymized shell via `use`).
+		fmt.Print(rep.Human())
+		fmt.Fprintf(os.Stderr, "anonctl: use: %s did NOT verify as anonymized; refusing to open a shell (fix it, then `anonctl verify %s`)\n", cmd.Account, accountArg(cmd.Account))
+		return rep.ExitCode()
+	}
+
+	// GREEN: drop into the account's login shell. exec replaces this process, so on
+	// success useExecLoginShell never returns; a returned error means the drop itself
+	// failed (e.g. no setpriv, no such account) and is surfaced non-zero.
+	fmt.Printf("%s verified anonymized; opening a shell as %s (the kernel forcing is in effect for this session)\n", cmd.Account, cmd.Account)
+	if err := useExecLoginShell(ctx, r, cmd.Account); err != nil {
+		fmt.Fprintf(os.Stderr, "anonctl: use: opening shell as %s: %v\n", cmd.Account, err)
+		return 1
+	}
+	return 0 // unreachable on a real exec (it replaced the process)
+}
+
+// The `use` seams: package vars so the unit tests inject fakes (assert the gate
+// polarity without a live host or a real shell), mirroring provision's
+// WriteLoginEnv seam discipline. Production wires the real verify gate + the real
+// setpriv drop.
+var (
+	// useGeteuid reports the effective UID (os.Geteuid in production); a test can
+	// simulate a non-root run.
+	useGeteuid = os.Geteuid
+	// useVerifyReport runs the verify gate for the account and returns its report
+	// (the same gate `verify` runs, marker-on-green included).
+	useVerifyReport = verifyAndMark
+	// useExecLoginShell drops to the account and execs its interactive login shell.
+	// In the DEFAULT build this is a fail-loud stub: the real setpriv drop is
+	// compiled only under the `integration` tag (use_exec_integration.go), mirroring
+	// verify's build-tag split, so a stray unit path can never spawn a shell.
+	useExecLoginShell = execLoginShell
+)
 
 // runUpdate is `update`/`reconfigure`: it changes an already-forced account's
 // endpoint and RE-APPLIES the rules fail-closed, with no un-anonymized window
@@ -503,6 +585,12 @@ const usage = `usage:
   anonctl list   [--json]           list the anon accounts that exist on the box
   anonctl status [<name>] [--json]  show one account's state (machine-readable with --json)
   anonctl verify [<name>] [--json]  prove the account is anonymized (named assertions, non-zero exit on failure)
+  anonctl use    [<name>]           verify the account, then open a shell as it ONLY on green (root); refuses
+                                     (no shell) if it is not currently anonymized. A session-start SAFETY GATE,
+                                     NOT the leak protection: it is a snapshot (verify at login, not continuous)
+                                     and bypassable (su/sudo -iu/ssh/cron reach the account anyway). The real
+                                     protection is the kernel rules + the standing default-deny; a MANDATORY gate
+                                     is the separate mandatory-anonctl-gated-login idea.
   anonctl update|reconfigure --endpoint <socks5h://host:port> [--allow-direct <IP|CIDR[:port]>]... [<name>]
                                      change the account's endpoint and re-apply fail-closed (no leak window) (root)
                                      --allow-direct here REPLACES the account's LAN holes (omit to keep them)
