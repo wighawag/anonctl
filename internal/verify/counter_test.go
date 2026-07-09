@@ -2,6 +2,7 @@ package verify
 
 import (
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -20,12 +21,12 @@ import (
 // every redirected packet would look like a leak (the exact false-fail this task
 // closes).
 func TestEscapedLeakCounterRuleset_PlantedAfterNatSoItSeesThePostRedirectDaddr(t *testing.T) {
-	rs := escapedLeakCounterRuleset(1001, "192.0.2.1", "tcp", 0)
+	rs := escapedLeakCounterRuleset(escapedLeakCounterTable, 1001, "192.0.2.1", "tcp", 0)
 	if !strings.Contains(rs, "priority 50") {
 		t.Fatalf("counter chain must run at a filter priority AFTER nat_out (dstnat/-100); got:\n%s", rs)
 	}
 	if !strings.Contains(rs, "table inet "+escapedLeakCounterTable) {
-		t.Fatalf("counter must use the throwaway scratch table %q; got:\n%s", escapedLeakCounterTable, rs)
+		t.Fatalf("counter must use the given scratch table name; got:\n%s", rs)
 	}
 	if !strings.Contains(rs, "policy accept") {
 		t.Fatalf("counter chain must be observe-only (policy accept), never change forcing; got:\n%s", rs)
@@ -38,7 +39,7 @@ func TestEscapedLeakCounterRuleset_PlantedAfterNatSoItSeesThePostRedirectDaddr(t
 // means only a genuine clear escape is counted; this is what makes the probe
 // non-vacuous (it can still FAIL on a real leak).
 func TestEscapedLeakCounterRuleset_KeysOnTheOffBoxDaddr(t *testing.T) {
-	rs := escapedLeakCounterRuleset(1001, "192.0.2.1", "tcp", 0)
+	rs := escapedLeakCounterRuleset(escapedLeakCounterTable, 1001, "192.0.2.1", "tcp", 0)
 	if !strings.Contains(rs, "meta skuid 1001") {
 		t.Fatalf("counter must key on the anon UID; got:\n%s", rs)
 	}
@@ -61,7 +62,7 @@ func TestEscapedLeakCounterRuleset_KeysOnTheOffBoxDaddr(t *testing.T) {
 // so the closure assertions passed WITHOUT probing.
 func TestEscapedLeakCounterRuleset_NoPortEmitsValidWholeProtocolMatch(t *testing.T) {
 	for _, l4 := range []string{"tcp", "udp"} {
-		rs := escapedLeakCounterRuleset(1001, "192.0.2.1", l4, 0)
+		rs := escapedLeakCounterRuleset(escapedLeakCounterTable, 1001, "192.0.2.1", l4, 0)
 		if !strings.Contains(rs, "meta l4proto "+l4+" counter") {
 			t.Fatalf("a port-omitted counter must match the WHOLE protocol via `meta l4proto %s` (valid nft), not a bare `%s counter`; got:\n%s", l4, l4, rs)
 		}
@@ -77,7 +78,7 @@ func TestEscapedLeakCounterRuleset_NoPortEmitsValidWholeProtocolMatch(t *testing
 // specific off-box UDP port (recipe row 3's UDP4:...:9999 shape), so a positive
 // port pins the dport.
 func TestEscapedLeakCounterRuleset_PinsThePortWhenGiven(t *testing.T) {
-	rs := escapedLeakCounterRuleset(1001, "1.1.1.1", "udp", 9999)
+	rs := escapedLeakCounterRuleset(escapedLeakCounterTable, 1001, "1.1.1.1", "udp", 9999)
 	if !strings.Contains(rs, "udp dport 9999 counter") {
 		t.Fatalf("a positive port must be pinned as the dport; got:\n%s", rs)
 	}
@@ -86,11 +87,60 @@ func TestEscapedLeakCounterRuleset_PinsThePortWhenGiven(t *testing.T) {
 // TestEscapedLeakCounterRuleset_SelectsFamilyFromTheDaddr: a v6 off-box daddr must
 // emit an ip6 match (so the counter is never silently v4-only for a v6 probe).
 func TestEscapedLeakCounterRuleset_SelectsFamilyFromTheDaddr(t *testing.T) {
-	if rs := escapedLeakCounterRuleset(1001, "192.0.2.1", "tcp", 0); !strings.Contains(rs, "ip daddr") || strings.Contains(rs, "ip6 daddr") {
+	if rs := escapedLeakCounterRuleset(escapedLeakCounterTable, 1001, "192.0.2.1", "tcp", 0); !strings.Contains(rs, "ip daddr") || strings.Contains(rs, "ip6 daddr") {
 		t.Fatalf("a v4 daddr must emit an ip match; got:\n%s", rs)
 	}
-	if rs := escapedLeakCounterRuleset(1001, "2001:db8::1", "tcp", 0); !strings.Contains(rs, "ip6 daddr 2001:db8::1") {
+	if rs := escapedLeakCounterRuleset(escapedLeakCounterTable, 1001, "2001:db8::1", "tcp", 0); !strings.Contains(rs, "ip6 daddr 2001:db8::1") {
 		t.Fatalf("a v6 daddr must emit an ip6 match; got:\n%s", rs)
+	}
+}
+
+// TestUniqueEscapedLeakCounterTable_NamesAreDistinct pins the CONCURRENCY-safety
+// contract: `verify.Run` now runs the probes in PARALLEL, and several of them plant
+// an escaped-leak counter table. If they all used ONE fixed table name they would
+// collide (one probe's `delete table` tears down another's live counter, or the
+// second `nft -f` create fails on the existing table), so each concurrent probe
+// must plant a UNIQUELY-NAMED scratch table. Two successive names must DIFFER, and
+// each must keep the shared prefix (so it is still recognisably a verify scratch
+// table, tearable-down and never colliding with a real `anonctl_<account>` table).
+func TestUniqueEscapedLeakCounterTable_NamesAreDistinct(t *testing.T) {
+	const n = 64
+	seen := make(map[string]bool, n)
+	for i := 0; i < n; i++ {
+		name := uniqueEscapedLeakCounterTable()
+		if !strings.HasPrefix(name, escapedLeakCounterTable) {
+			t.Fatalf("a unique scratch-table name must keep the %q prefix (recognisable + never colliding with an account table); got %q", escapedLeakCounterTable, name)
+		}
+		if seen[name] {
+			t.Fatalf("scratch-table names must be UNIQUE per probe (parallel probes must not collide); %q repeated", name)
+		}
+		seen[name] = true
+	}
+}
+
+// TestUniqueEscapedLeakCounterTable_DistinctUnderConcurrency asserts the generator
+// is safe to call from PARALLEL goroutines (the actual usage: each concurrent probe
+// asks for its own name) and still hands out all-distinct names with no data race
+// (`go test -race`).
+func TestUniqueEscapedLeakCounterTable_DistinctUnderConcurrency(t *testing.T) {
+	const n = 100
+	names := make(chan string, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); names <- uniqueEscapedLeakCounterTable() }()
+	}
+	wg.Wait()
+	close(names)
+	seen := make(map[string]bool, n)
+	for name := range names {
+		if seen[name] {
+			t.Fatalf("concurrent scratch-table names must be UNIQUE; %q repeated", name)
+		}
+		seen[name] = true
+	}
+	if len(seen) != n {
+		t.Fatalf("expected %d distinct concurrent names; got %d", n, len(seen))
 	}
 }
 

@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/wighawag/anonctl/internal/endpoint"
 	"github.com/wighawag/anonctl/internal/socks5hfixture"
@@ -41,21 +44,89 @@ func TestReport_ExitCode(t *testing.T) {
 }
 
 func TestRun_ExecutesEveryCheckAndDoesNotShortCircuit(t *testing.T) {
+	var mu sync.Mutex
 	var ran []string
 	checks := []Check{
-		{Name: "a", Run: func(ctx context.Context) Assertion { ran = append(ran, "a"); return Assertion{Ok: true} }},
-		{Name: "b", Run: func(ctx context.Context) Assertion { ran = append(ran, "b"); return Assertion{Ok: false} }},
-		{Name: "c", Run: func(ctx context.Context) Assertion { ran = append(ran, "c"); return Assertion{Ok: true} }},
+		{Name: "a", Run: func(ctx context.Context) Assertion {
+			mu.Lock()
+			ran = append(ran, "a")
+			mu.Unlock()
+			return Assertion{Ok: true}
+		}},
+		{Name: "b", Run: func(ctx context.Context) Assertion {
+			mu.Lock()
+			ran = append(ran, "b")
+			mu.Unlock()
+			return Assertion{Ok: false}
+		}},
+		{Name: "c", Run: func(ctx context.Context) Assertion {
+			mu.Lock()
+			ran = append(ran, "c")
+			mu.Unlock()
+			return Assertion{Ok: true}
+		}},
 	}
 	rep := Run(context.Background(), checks)
-	if len(ran) != 3 || ran[0] != "a" || ran[2] != "c" {
-		t.Fatalf("every check must run in order even past a failure; ran=%v", ran)
+	// Every check runs (no short-circuit past a failure). Run is now CONCURRENT, so
+	// the completion order of `ran` is nondeterministic; sort before comparing. The
+	// deterministic guarantee is on the REPORT order (asserted below), not on which
+	// goroutine finished first.
+	mu.Lock()
+	got := append([]string(nil), ran...)
+	mu.Unlock()
+	sort.Strings(got)
+	if strings.Join(got, ",") != "a,b,c" {
+		t.Fatalf("every check must run even past a failure; ran=%v", got)
 	}
 	if rep.Ok() {
 		t.Fatal("report with a failing check must not be Ok")
 	}
-	if rep.Assertions[0].Name != "a" {
-		t.Fatalf("check Name should default onto the assertion; got %q", rep.Assertions[0].Name)
+	// The REPORT preserves the ORIGINAL check order regardless of completion order.
+	if len(rep.Assertions) != 3 || rep.Assertions[0].Name != "a" || rep.Assertions[1].Name != "b" || rep.Assertions[2].Name != "c" {
+		t.Fatalf("report must be in original check order with Name defaulted; got %+v", rep.Assertions)
+	}
+}
+
+// TestRun_RunsChecksConcurrentlyAndPreservesOrder is the CORE of the parallel-probe
+// speedup: the independent checks (the leak/closure probes PASS by TIMING OUT, so
+// each waits its full deadline) must run CONCURRENTLY, making wall time the MAX
+// single probe time, not the SUM. The report's assertion order stays deterministic
+// (original check order), even though a LATER check finishes FIRST.
+func TestRun_RunsChecksConcurrentlyAndPreservesOrder(t *testing.T) {
+	const delay = 150 * time.Millisecond
+	// slow(name, ms) returns a check that sleeps then reports; deliberately give the
+	// FIRST check the LONGEST sleep so completion order is the REVERSE of report order.
+	slow := func(name string, d time.Duration, ok bool) Check {
+		return Check{Name: name, Run: func(ctx context.Context) Assertion {
+			time.Sleep(d)
+			return Assertion{Ok: ok, Detail: name}
+		}}
+	}
+	checks := []Check{
+		slow("a", 3*delay, true),
+		slow("b", 2*delay, false),
+		slow("c", 1*delay, true),
+	}
+	start := time.Now()
+	rep := Run(context.Background(), checks)
+	elapsed := time.Since(start)
+
+	// Concurrent: wall time ~ MAX (3*delay), never the SUM (6*delay). Assert it is
+	// comfortably under the sum so the speedup is real (allow scheduling slack).
+	if elapsed >= 5*delay {
+		t.Fatalf("checks must run CONCURRENTLY (wall ~ max single probe, not the sum); elapsed=%v (sum would be ~%v)", elapsed, 6*delay)
+	}
+	// Deterministic REPORT order = original check order, NOT completion order (c
+	// finished first, a last).
+	if len(rep.Assertions) != 3 || rep.Assertions[0].Name != "a" || rep.Assertions[1].Name != "b" || rep.Assertions[2].Name != "c" {
+		t.Fatalf("report must be in ORIGINAL check order regardless of completion order; got %+v", rep.Assertions)
+	}
+	// Verdicts are carried per-check (not shuffled): a/c pass, b fails.
+	if !rep.Assertions[0].Ok || rep.Assertions[1].Ok || !rep.Assertions[2].Ok {
+		t.Fatalf("verdicts must stay with their check under concurrency; got %+v", rep.Assertions)
+	}
+	if rep.Assertions[1].Detail != "b" {
+		t.Fatalf("per-check detail must stay with its check; got %+v", rep.Assertions)
 	}
 }
 
@@ -68,15 +139,25 @@ func TestRunWith_ProgressFiresStartThenDoneForEveryCheckInOrder(t *testing.T) {
 		{Name: "a", Run: func(ctx context.Context) Assertion { return Assertion{Ok: true} }},
 		{Name: "b", Run: func(ctx context.Context) Assertion { return Assertion{Ok: false, Detail: "leak"} }},
 	}
-	var events []string
+	var mu sync.Mutex
+	var starts, dones []string
 	prog := Progress{
-		Start: func(name string) { events = append(events, "start:"+name) },
-		Done:  func(a Assertion) { events = append(events, "done:"+a.Name+":"+okmark(a.Ok)) },
+		Start: func(name string) { mu.Lock(); starts = append(starts, name); mu.Unlock() },
+		Done:  func(a Assertion) { mu.Lock(); dones = append(dones, a.Name+":"+okmark(a.Ok)); mu.Unlock() },
 	}
 	rep := RunWith(context.Background(), checks, prog)
-	want := []string{"start:a", "done:a:PASS", "start:b", "done:b:FAIL"}
-	if strings.Join(events, ",") != strings.Join(want, ",") {
-		t.Fatalf("progress must fire Start then Done per check, in order; got %v want %v", events, want)
+	// Checks now run CONCURRENTLY, so the strict start:a,done:a,start:b interleaving no
+	// longer holds. The contract is: EVERY check fires Start (in original order, up
+	// front) and Done (once each), the callbacks are never invoked concurrently (a
+	// single funnel, so no data race in a caller's writer), and the final report is
+	// deterministic. Assert Starts fire in original order for every check.
+	if strings.Join(starts, ",") != "a,b" {
+		t.Fatalf("Start must fire for every check in original order; got %v", starts)
+	}
+	// Done fires once per check (completion order may vary); assert the SET.
+	sort.Strings(dones)
+	if strings.Join(dones, ",") != "a:PASS,b:FAIL" {
+		t.Fatalf("Done must fire once per check with its final verdict; got %v", dones)
 	}
 	// The report itself is unchanged by the hook (same assertions, same order).
 	if len(rep.Assertions) != 2 || rep.Assertions[0].Name != "a" || rep.Assertions[1].Name != "b" {

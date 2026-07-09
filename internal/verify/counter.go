@@ -3,8 +3,10 @@ package verify
 import (
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // This file is the PURE (untagged, root-free) core of the escaped-leak counter
@@ -24,11 +26,31 @@ import (
 // no root; the live plant/probe/read wrapper is integration-tagged (needs nft +
 // setpriv) in probes_integration.go.
 
-// escapedLeakCounterTable is the fixed throwaway table name the escaped-leak
-// counter is planted in. It is a per-verify-run scratch table (create + delete
-// around one probe), distinct from any account table, so it never collides with a
-// real account's `anonctl_<account>` ruleset.
+// escapedLeakCounterTable is the PREFIX for the throwaway table name the
+// escaped-leak counter is planted in. It is a per-PROBE scratch table (create +
+// delete around one probe), distinct from any account table, so it never collides
+// with a real account's `anonctl_<account>` ruleset. Because `verify.Run` now runs
+// the probes CONCURRENTLY and several of them plant such a counter, a single fixed
+// name would collide (one probe's `delete table` would tear down another's live
+// counter, or the second create would fail on the existing table); each concurrent
+// probe therefore plants a UNIQUELY-NAMED table via uniqueEscapedLeakCounterTable.
 const escapedLeakCounterTable = "anonctl_verify_escapedleak"
+
+// escapedLeakCounterSeq makes each scratch-table name unique WITHIN this process.
+// It is incremented atomically so uniqueEscapedLeakCounterTable is safe to call
+// from the parallel probe goroutines with no data race.
+var escapedLeakCounterSeq atomic.Uint64
+
+// uniqueEscapedLeakCounterTable returns a scratch-table name unique to one probe:
+// the shared escapedLeakCounterTable prefix (so it is recognisable as a verify
+// scratch table and never collides with an `anonctl_<account>` table) plus this
+// process's pid and a monotonic per-process sequence. The pid guards against two
+// concurrent `anonctl verify` PROCESSES on the same host; the atomic sequence
+// guards against the parallel probes WITHIN one process. Each probe creates then
+// deletes its OWN table, so parallel probes never fight over one table name.
+func uniqueEscapedLeakCounterTable() string {
+	return fmt.Sprintf("%s_%d_%d", escapedLeakCounterTable, os.Getpid(), escapedLeakCounterSeq.Add(1))
+}
 
 // escapedLeakCounterRuleset renders the throwaway nft counter ruleset that catches
 // an anon-UID packet STILL carrying an off-box destination when it reaches the
@@ -51,7 +73,7 @@ const escapedLeakCounterTable = "anonctl_verify_escapedleak"
 // work/notes/findings/manual-per-uid-tor-recipe.md). Rendering the invalid bare
 // form was the latent false-green: the rule failed to plant and the swallowed
 // plant error read as "no leak", so the closure assertions passed WITHOUT probing.
-func escapedLeakCounterRuleset(anonUID int, daddr string, l4 string, port int) string {
+func escapedLeakCounterRuleset(table string, anonUID int, daddr string, l4 string, port int) string {
 	family := "ip"
 	if ip := net.ParseIP(daddr); ip != nil && ip.To4() == nil {
 		family = "ip6"
@@ -70,7 +92,7 @@ func escapedLeakCounterRuleset(anonUID int, daddr string, l4 string, port int) s
         %s counter
     }
 }
-`, escapedLeakCounterTable, match)
+`, table, match)
 }
 
 // counterMoved reports whether an nft `counter` line in a `nft list table` dump

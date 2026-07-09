@@ -303,8 +303,17 @@ func offBoxReachedAsAnon(ctx context.Context, p LiveParams, counterDaddr, l4 str
 // A probe that could NOT RUN (setpriv / shim probe binary missing) returns a LOUD
 // error, never a silent reached=false (which a drop assertion would read as a
 // PASS): a probe that could not run is not a pass.
+//
+// 3s deadline: the drop assertions that use this (leak-drop-v6, non-tcp-udp-drop)
+// PASS by the dial being DROPPED, which is knowable fast (an EPERM / an immediate
+// fail-closed on a v6 dial with no v6 redirect), so a long deadline only adds dead
+// wall time; it matches the hand recipe's snappy `ping -W 3` / `curl -m` closures
+// (work/notes/findings/manual-per-uid-tor-recipe.md). The one REACHABILITY use
+// (split-tunnel-tight's exemptReached) dials a DIRECT LAN host that answers well
+// inside 3s on a healthy host. The Tor-round-trip checks (anonymized-exit,
+// dns-remote) do NOT use this helper and keep their generous curl/http timeouts.
 func probeAsAnon(ctx context.Context, p LiveParams, network, addr string) (bool, error) {
-	pctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	reached, _, err := runSetprivProbe(pctx, p.AnonUID, network, addr)
 	return reached, err
