@@ -23,6 +23,100 @@ func sample() accountconfig.Config {
 	}
 }
 
+// List enumerates every written config (empty on a fresh/missing dir), and is the
+// claim-set source the endpoint Registry is built from. A corrupt config is a LOUD
+// error, never silently dropped (which would disable the cross-identification guard).
+func TestList(t *testing.T) {
+	store := accountconfig.Store{BaseDir: t.TempDir()}
+
+	// Missing/empty dir => empty, not an error.
+	if got, err := store.List(); err != nil || len(got) != 0 {
+		t.Fatalf("List on empty dir = %v, %v; want [], nil", got, err)
+	}
+
+	a := sample()
+	b := sample()
+	b.Account = "anon-work"
+	b.EndpointPort = 1080
+	b.EndpointClass = endpoint.ClassSocksPeruser
+	for _, c := range []accountconfig.Config{a, b} {
+		if err := store.Write(c); err != nil {
+			t.Fatalf("Write %s: %v", c.Account, err)
+		}
+	}
+	got, err := store.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("List returned %d configs, want 2", len(got))
+	}
+	accounts := map[string]bool{}
+	for _, c := range got {
+		accounts[c.Account] = true
+	}
+	if !accounts["anon"] || !accounts["anon-work"] {
+		t.Errorf("List accounts = %v, want anon + anon-work", accounts)
+	}
+}
+
+// A non-.json file in the config dir is ignored; a CORRUPT .json is a loud error.
+func TestListSkipsNonJSONAndFailsLoudOnCorrupt(t *testing.T) {
+	base := t.TempDir()
+	store := accountconfig.Store{BaseDir: base}
+	if err := store.Write(sample()); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	// A stray non-json file must be skipped, not parsed.
+	if err := os.WriteFile(filepath.Join(base, "README"), []byte("not a config"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.List(); err != nil || len(got) != 1 {
+		t.Fatalf("List with a stray file = %v, %v; want 1 config, nil", got, err)
+	}
+	// A corrupt .json aborts List (the guard must not be silently disabled).
+	if err := os.WriteFile(filepath.Join(base, "anon-bad.json"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.List(); err == nil {
+		t.Fatalf("List with a corrupt config = nil error, want a loud error")
+	}
+}
+
+// BuildRegistryExcluding folds sibling configs into a Registry that refuses a
+// SECOND account on a peruser endpoint but excludes the target account (so its own
+// re-add is idempotent) and never refuses a shared tor endpoint.
+func TestBuildRegistryExcluding(t *testing.T) {
+	peruser := sample()
+	peruser.Account = "anon-a"
+	peruser.EndpointPort = 1080
+	peruser.EndpointClass = endpoint.ClassSocksPeruser
+
+	tor := sample()
+	tor.Account = "anon-b" // tor-shared 9050
+
+	configs := []accountconfig.Config{peruser, tor}
+
+	// A DIFFERENT new account claiming anon-a's peruser endpoint is REFUSED.
+	reg := accountconfig.BuildRegistryExcluding(configs, "anon-new")
+	if err := reg.Claim("anon-new", peruser.Endpoint()); err == nil {
+		t.Errorf("a second account on anon-a's peruser endpoint must be refused")
+	}
+
+	// The SAME account re-claiming its own peruser endpoint is allowed because it is
+	// EXCLUDED from the built registry (self-idempotent re-add).
+	regSelf := accountconfig.BuildRegistryExcluding(configs, "anon-a")
+	if err := regSelf.Claim("anon-a", peruser.Endpoint()); err != nil {
+		t.Errorf("anon-a re-claiming its own peruser endpoint must be allowed: %v", err)
+	}
+
+	// A new account on the SHARED tor endpoint is never refused.
+	regTor := accountconfig.BuildRegistryExcluding(configs, "anon-new")
+	if err := regTor.Claim("anon-new", tor.Endpoint()); err != nil {
+		t.Errorf("a shared tor-shared endpoint must never be refused: %v", err)
+	}
+}
+
 func TestWriteFillsDefaultPortsAndStampsSchema(t *testing.T) {
 	store := accountconfig.Store{BaseDir: t.TempDir()}
 	if err := store.Write(sample()); err != nil {

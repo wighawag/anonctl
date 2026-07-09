@@ -145,6 +145,15 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		fmt.Fprintf(os.Stderr, "anonctl: add: %v\n", err)
 		return 1
 	}
+	// CROSS-IDENTIFICATION GUARD: refuse pointing THIS account at a socks-peruser
+	// endpoint already claimed by a DIFFERENT account (they would exit identically and
+	// become cross-identifiable). A tor-shared endpoint is share-safe and never
+	// refused. This runs BEFORE any nft/systemd mutation, so a refusal leaves the box
+	// untouched (the account is provisioned but not forced onto a colliding endpoint).
+	if err := claimEndpoint(cmd.Account, cfg.Endpoint()); err != nil {
+		fmt.Fprintf(os.Stderr, "anonctl: add: %v\n", err)
+		return 1
+	}
 	if err := forcing.Install(ctx, forcingDeps(), cfg, exemptions); err != nil {
 		fmt.Fprintf(os.Stderr, "anonctl: add: installing forcing: %v\n", err)
 		return 1
@@ -668,6 +677,14 @@ func runUpdate(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	cfg.EndpointHost = ep.Host
 	cfg.EndpointPort = atoiOr(ep.Port, 0)
 	cfg.EndpointClass = ep.Class
+	// CROSS-IDENTIFICATION GUARD (same as add): refuse re-pointing this account at a
+	// socks-peruser endpoint another account already owns, BEFORE the atomic
+	// re-apply. The account's OWN prior claim is excluded, so re-pointing it at its
+	// own endpoint (or a shared tor one) is never refused.
+	if err := claimEndpoint(cmd.Account, cfg.Endpoint()); err != nil {
+		fmt.Fprintf(os.Stderr, "anonctl: %s: %v\n", cmd.Verb, err)
+		return 1
+	}
 	// Overlay the exemptions the operator passed on THIS update: an update that
 	// names --allow-direct sets the account's exemptions, an update that names none
 	// leaves the persisted set intact (re-applying the same holes), so a plain
@@ -685,6 +702,28 @@ func runUpdate(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	fmt.Printf("reconfigured %s -> endpoint %s (re-applied fail-closed, no leak window)\n", cfg.Account, cfg.Endpoint().URL())
 	fmt.Printf("run `%s` to re-prove the account is anonymized\n", verifyHint(cmd.Account))
 	return 0
+}
+
+// configListStore is the store `claimEndpoint` reads the on-disk claim set from
+// (every account's persisted endpoint). It is a package var so a unit test points
+// its BaseDir at a scratch dir and never touches the real /etc/anonctl/accounts.
+var configListStore = accountconfig.DefaultStore()
+
+// claimEndpoint enforces the cross-identification guard for pointing `account` at
+// `ep`: it builds the endpoint Registry from every OTHER account's persisted
+// endpoint (accountconfig.List, excluding this account so a re-add/re-point is
+// idempotent) and Claims `ep`. A socks-peruser endpoint already owned by a
+// DIFFERENT account is refused (ErrPeruserAlreadyClaimed, naming the owner); a
+// tor-shared endpoint is share-safe and always passes (Tor's `<account>@`
+// isolation). A failure to READ the claim set is a loud error (a corrupt sibling
+// config must not silently disable the guard), NOT a silent pass.
+func claimEndpoint(account string, ep endpoint.Endpoint) error {
+	configs, err := configListStore.List()
+	if err != nil {
+		return fmt.Errorf("checking endpoint sharing: %w", err)
+	}
+	reg := accountconfig.BuildRegistryExcluding(configs, account)
+	return reg.Claim(account, ep)
 }
 
 // forcingDeps wires the real runners + stores for the forcing orchestration (the

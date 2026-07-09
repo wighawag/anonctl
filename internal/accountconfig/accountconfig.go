@@ -187,6 +187,31 @@ func Parse(data []byte) (Config, error) {
 	return c, nil
 }
 
+// BuildRegistryExcluding folds a set of account configs into an endpoint.Registry
+// (the claim set that enforces the socks-peruser sharing refusal), SKIPPING the
+// given account. It is the pure bridge between the on-disk claim set (List) and the
+// endpoint model's refusal: the caller lists the configs, excludes the target
+// account (so the target's OWN prior claim never trips its own re-add), builds the
+// Registry from the OTHERS, then Claims the target's chosen endpoint against it.
+//
+// A tor-shared config contributes nothing (Registry tracks only peruser owners, as
+// tor-shared is share-safe), so this only ever records the peruser claims that
+// could actually conflict. It is pure over the supplied configs, so it is
+// unit-testable with no filesystem.
+func BuildRegistryExcluding(configs []Config, exclude string) *endpoint.Registry {
+	reg := endpoint.NewRegistry()
+	for _, c := range configs {
+		if c.Account == exclude {
+			continue
+		}
+		// A sibling's own persisted endpoint is by construction a valid, credential-free
+		// claim; Claim only ever refuses a CONFLICTING future claim, never an existing
+		// one (each sibling owns a distinct account name), so this never errors here.
+		_ = reg.Claim(c.Account, c.Endpoint())
+	}
+	return reg
+}
+
 // Store is the filesystem seam for the per-account configs, isolating the shared
 // `/etc` write behind a configurable base directory, exactly as marker.Store does.
 // Production builds one with DefaultStore(); tests point BaseDir at a scratch dir
@@ -263,6 +288,42 @@ func (s Store) Read(account string) (Config, error) {
 		return Config{}, fmt.Errorf("read account config %q: %w", path, err)
 	}
 	return Parse(data)
+}
+
+// List enumerates every account config under BaseDir, returning the parsed
+// Configs (in lexical filename order for determinism). It is the "read the claim
+// set from disk" primitive the endpoint Registry is built from at `add`/`update`,
+// so a second account can never silently share a socks-peruser endpoint. A missing
+// BaseDir is a clean EMPTY result (no accounts configured yet), NOT an error. A
+// present-but-corrupt config IS a loud error (never silently dropped): a typo in
+// one account's record must not silently disable the cross-identification guard for
+// a new account. Only `<name>.json` files are considered; any other entry (a
+// stray file, a subdir) is skipped.
+func (s Store) List() ([]Config, error) {
+	entries, err := os.ReadDir(s.baseDir())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("list account configs in %q: %w", s.baseDir(), err)
+	}
+	var out []Config
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(s.baseDir(), e.Name())
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return nil, fmt.Errorf("read account config %q: %w", path, rerr)
+		}
+		c, perr := Parse(data)
+		if perr != nil {
+			return nil, fmt.Errorf("parse account config %q: %w", path, perr)
+		}
+		out = append(out, c)
+	}
+	return out, nil
 }
 
 // Remove deletes the config for an account (the teardown side: `rm` removes it). A
