@@ -58,15 +58,25 @@ func TestSeedCopiesTreeAndChownsToAccount(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(home, ".config", "app", "conf.toml")); err != nil || string(got) != "key=1\n" {
 		t.Errorf("nested conf content = %q, err %v", got, err)
 	}
-	// Every written file is chowned to account:account.
-	var chowns int
+	// Every written path (files AND the directories that hold them) is chowned to
+	// account:account. Chowning the dirs too is load-bearing: a root-run seed's
+	// MkdirAll leaves them root-owned, so the account could read the seeded files but
+	// not create new entries under a seeded dir (the `pi` EACCES on .pi/agent/).
+	chowned := map[string]bool{}
 	for _, c := range r.calls {
-		if len(c) >= 2 && c[0] == "chown" && c[1] == "anon:anon" {
-			chowns++
+		if len(c) >= 3 && c[0] == "chown" && c[1] == "anon:anon" {
+			chowned[c[2]] = true
 		}
 	}
-	if chowns != 2 {
-		t.Errorf("expected 2 chowns to anon:anon, got %d (calls: %v)", chowns, r.calls)
+	for _, want := range []string{
+		filepath.Join(home, ".bashrc"),
+		filepath.Join(home, ".config", "app", "conf.toml"),
+		filepath.Join(home, ".config"),          // the seeded dir must be account-owned
+		filepath.Join(home, ".config", "app"),   // nested seeded dir too
+	} {
+		if !chowned[want] {
+			t.Errorf("seeded path %q was not chowned to anon:anon (calls: %v)", want, r.calls)
+		}
 	}
 }
 

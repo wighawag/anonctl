@@ -138,8 +138,18 @@ func Seed(ctx context.Context, r Runner, templateDir, home, account string, forc
 	// walk's lexical order) so a file's parent always exists.
 	sort.Strings(dirs)
 	for _, rel := range dirs {
-		if err := os.MkdirAll(filepath.Join(home, rel), 0o755); err != nil {
+		dst := filepath.Join(home, rel)
+		if err := os.MkdirAll(dst, 0o755); err != nil {
 			return res, fmt.Errorf("seed-home: create dir %q: %w", rel, err)
+		}
+		// Chown the created directory to the account too, not just the files inside it.
+		// A root-run seed's os.MkdirAll leaves the dir owned by root, so the account
+		// could READ the seeded files but not CREATE new entries under the dir (locks,
+		// caches, session subdirs): the exact EACCES a tool like `pi` hits when it tries
+		// to mkdir under a seeded `.pi/agent/`. Directories are chowned before the files
+		// so every seeded path ends up account-owned.
+		if _, _, err := r.Run(ctx, "chown", account+":"+account, dst); err != nil {
+			return res, fmt.Errorf("seed-home: chown dir %q to %s: %w", dst, account, err)
 		}
 	}
 	sort.Strings(files)
