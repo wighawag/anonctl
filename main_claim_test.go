@@ -65,9 +65,9 @@ func TestClaimEndpointAllowsSharedTor(t *testing.T) {
 	}
 }
 
-// The SAME account re-pointing at its own peruser endpoint is idempotent (a re-add
-// / re-point must not trip on its own persisted claim), because it is excluded from
-// the built registry.
+// The SAME account re-pointing at its own peruser endpoint is idempotent (an
+// `update` re-point must not trip on its own persisted claim), because it is
+// excluded from the built registry.
 func TestClaimEndpointSelfRepointIdempotent(t *testing.T) {
 	s := swapConfigListStore(t)
 	writeConfig(t, s, "anon-a", 1080, endpoint.ClassSocksPeruser)

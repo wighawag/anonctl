@@ -123,9 +123,26 @@ func run(args []string) int {
 // anonymized live AND across a reboot fail-closed - and DROPPED, never free, even if
 // the forcing rules never load. It must run as
 // root (useradd/nft/systemctl); a non-root run surfaces the underlying command's
-// own permission error. Provisioning is idempotent and the forcing install is an
-// atomic replace, so re-running `add` cleanly re-applies.
+// own permission error.
+//
+// `add` is CREATE-ONLY: it refuses an account that already exists, up front, before
+// any mutation, so a second `add` never silently re-applies a (possibly different)
+// endpoint/config. Changing an existing account's endpoint or exemptions is
+// `update`'s job (which re-applies fail-closed with no leak window); recreating is
+// `rm` then `add`. This keeps one clear command per intent.
 func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
+	// Refuse an existing account BEFORE provisioning or resolving the endpoint, so a
+	// rejected re-add mutates nothing (a pure read) and never re-applies config. Point
+	// the operator at the verb that DOES change a live account (update) or at rm+add.
+	if st, serr := provision.Status(ctx, r, cmd.Account); serr != nil {
+		errorf("add: %v", serr)
+		return 1
+	} else if st.Exists {
+		errorf("add: %s already exists; `add` will not modify it. To change its endpoint or LAN exemptions run `%s`; to recreate it run `anonctl rm %s` first",
+			cmd.Account, updateHint(cmd.Account), accountArg(cmd.Account))
+		return 1
+	}
+
 	res, err := provision.Add(ctx, r, cmd.Account)
 	if err != nil {
 		errorf("add: %v", err)
@@ -195,11 +212,9 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		return 1
 	}
 
-	if res.Created {
-		fmt.Printf("%s %s (shim %s, endpoint %s)\n", outStyle.Green("provisioned + forced"), outStyle.Bold(res.Account), res.Shim, cfg.Endpoint().URL())
-	} else {
-		fmt.Printf("%s already existed; re-applied forcing (shim %s, endpoint %s)\n", outStyle.Bold(res.Account), res.Shim, cfg.Endpoint().URL())
-	}
+	// The account is always freshly created here: runAdd refuses an existing account
+	// up front, so this path is only ever reached for a genuinely new account.
+	fmt.Printf("%s %s (shim %s, endpoint %s)\n", outStyle.Green("provisioned + forced"), outStyle.Bold(res.Account), res.Shim, cfg.Endpoint().URL())
 	fmt.Printf("%s anonctl does NOT manage the endpoint's own service; enable your endpoint (e.g. `systemctl enable --now tor.service`) so it is up at boot\n", outStyle.Yellow("note:"))
 	fmt.Printf("run `%s` to prove the account is anonymized\n", outStyle.Cyan(verifyHint(cmd.Account)))
 	return 0
@@ -1022,6 +1037,18 @@ func verifyHint(account string) string {
 	return "anonctl verify"
 }
 
+// updateHint renders the `update` command that changes an existing account's
+// endpoint, in the shortest form the operator would type: `--endpoint` is required
+// by update, so the hint carries the placeholder, and the account arg is appended
+// only for a named account (mirroring verifyHint / accountArg).
+func updateHint(account string) string {
+	cmd := "anonctl update --endpoint <socks5h://host:port>"
+	if arg := accountArg(account); arg != "" {
+		return cmd + " " + arg
+	}
+	return cmd
+}
+
 // atoiOr parses s as an int, returning def on any error (an empty/absent UID for a
 // not-yet-provisioned account maps to the default rather than aborting: verify
 // still runs its assertions and reports the fail-closed verdict).
@@ -1047,7 +1074,9 @@ func emitJSON(v any) int {
 const usage = `usage:
   anonctl add    [--endpoint <socks5h://host:port>] [--allow-direct <IP|CIDR[:port]>]... [<name>]
                                      provision the account + shim UID, install fail-closed forcing that
-                                     survives reboot (default endpoint: the local Tor SocksPort) (root)
+                                     survives reboot (default endpoint: the local Tor SocksPort) (root).
+                                     CREATE-ONLY: refuses an existing account (use update to change its
+                                     endpoint/exemptions, or rm then add to recreate).
                                      --allow-direct punches a narrow private-only LAN hole (repeatable;
                                      RFC1918/link-local only, never :53)
   anonctl rm     [--purge-account] [<name>]
