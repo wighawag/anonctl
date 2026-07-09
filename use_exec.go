@@ -32,6 +32,14 @@ import (
 // non-interactive probes use); `-l` makes the shell a LOGIN shell so it reads the
 // account's minimal-PATH profile drop-in that `add` wrote.
 //
+// Before the exec it chdirs into the account's HOME (falling back to `/` if HOME is
+// unusable) so the login lands in the account's own directory, NOT the caller's CWD.
+// `use` is normally run from the operator's own home, which the anon account cannot
+// write; a shell left there but with HOME=/home/anon splits the environment (tools
+// key paths off $PWD yet write under HOME) and yields EACCES (e.g. `pi` trying to
+// mkdir a session dir named after the caller's path). Starting in HOME is what a
+// real login does.
+//
 // It exec-REPLACES this process (syscall.Exec), so on success it never returns and
 // the operator is now IN the anon account's shell with the kernel forcing in
 // effect. Any resolution/lookup failure returns an error (surfaced non-zero by
@@ -59,6 +67,25 @@ func execLoginShell(ctx context.Context, r provision.Runner, account string) err
 		"TERM=" + os.Getenv("TERM"),
 	}
 
+	// Land in the account's HOME before exec'ing the shell. syscall.Exec inherits the
+	// caller's CWD, and `use` is typically run from the operator's own home (e.g.
+	// /home/wighawag), which the anon account cannot write. A login shell that starts
+	// there but with HOME=/home/anon is a split environment: tools derive paths from
+	// $PWD (session dirs named after the caller's path) yet write under HOME, so they
+	// hit EACCES on the caller's dir or on a half-created /home/anon path. A real login
+	// starts in HOME, so chdir there first. If HOME is unreachable (missing/permission),
+	// fall back to `/` rather than leaving the session in the caller's unwritable dir;
+	// never silently keep the caller's CWD. Do the chdir AS the account (setpriv drops
+	// privilege for the shell but not for this pre-exec chdir, so a root-run `use` must
+	// not let root's reach mask a home the account itself cannot enter).
+	cwd := loginWorkingDir(home)
+	if err := os.Chdir(cwd); err != nil {
+		return fmt.Errorf("could not enter working dir %q for %s's session: %w", cwd, account, err)
+	}
+	// PWD must agree with the CWD we just set, since login shells and tools trust $PWD
+	// over a getcwd() syscall; leaving the inherited PWD would re-introduce the split.
+	env = append(env, "PWD="+cwd)
+
 	// argv0 of the shell is prefixed with `-` so it behaves as a LOGIN shell (the
 	// conventional login-shell signal), reinforcing the `-l` we pass setpriv.
 	argv := []string{
@@ -69,6 +96,20 @@ func execLoginShell(ctx context.Context, r provision.Runner, account string) err
 		shell, "-l",
 	}
 	return syscall.Exec(setpriv, argv, env)
+}
+
+// loginWorkingDir picks the directory the dropped login shell should start in: the
+// account's HOME when it is a usable absolute path, else `/`. It is the pure
+// decision half of the chdir (the actual os.Chdir + its permission check stays in
+// execLoginShell, since only the live filesystem can say whether the account can
+// enter it). It never returns the caller's inherited CWD: `use` must not leave the
+// anon session sitting in the operator's own (unwritable) home. A relative or empty
+// home is treated as unusable and falls back to `/`.
+func loginWorkingDir(home string) string {
+	if filepath.IsAbs(home) {
+		return home
+	}
+	return "/"
 }
 
 // accountLoginFields resolves an account's numeric UID, numeric GID, login shell,

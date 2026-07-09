@@ -70,6 +70,30 @@ func TestUseExecLoginShellDropsToAccount(t *testing.T) {
 	if got := strings.TrimSpace(out); got != strconv.Itoa(uid) {
 		t.Errorf("dropped shell ran as uid %q, want %d (the account's UID); the drop did not land in the account", got, uid)
 	}
+
+	// The session must land in the account's HOME, not the caller's CWD. Reproduce the
+	// production pre-exec chdir (loginWorkingDir + os.Chdir) from a FOREIGN starting
+	// dir, then assert a login shell reports HOME as its pwd. This is the regression
+	// for the split environment (`use` run from /home/wighawag left the anon shell
+	// there, so tools wrote under HOME=/home/anon and hit EACCES).
+	prevCwd, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(prevCwd) })
+	if err := os.Chdir("/tmp"); err != nil { // a foreign dir, standing in for the operator's own home
+		t.Fatalf("chdir to foreign dir: %v", err)
+	}
+	want := loginWorkingDir(home)
+	if err := os.Chdir(want); err != nil {
+		t.Fatalf("chdir to %s's login working dir %q: %v", account, want, err)
+	}
+	pwdOut, _, pErr := runCmd(ctx, "setpriv",
+		"--reuid", strconv.Itoa(uid), "--regid", strconv.Itoa(gid), "--init-groups",
+		shell, "-l", "-c", "pwd -P")
+	if pErr != nil {
+		t.Fatalf("setpriv drop (pwd) to %s failed: %v (out=%q)", account, pErr, pwdOut)
+	}
+	if got := strings.TrimSpace(pwdOut); got != want {
+		t.Errorf("dropped login shell started in %q, want the account's home %q (the session must not sit in the caller's CWD)", got, want)
+	}
 }
 
 // runCmd runs a command and returns trimmed stdout/stderr + the exec error.
