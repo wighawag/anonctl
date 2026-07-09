@@ -1024,12 +1024,16 @@ const usage = `usage:
                                      --allow-direct here REPLACES the account's LAN holes (omit to keep them)
   anonctl --version | version       print the anonctl version
 
-Box-wide add-time defaults live under ` + "`/etc/anonctl`" + `: create the directory
-` + "`/etc/anonctl/default-home/`" + ` (e.g. ` + "`sudo cp -r <src>/. /etc/anonctl/default-home/`" + `)
-and its contents seed every FRESH account's home; put default LAN exemptions in
-` + "`/etc/anonctl/defaults.json`" + ` (` + "`{\"allowDirect\":[\"192.168.1.50:11434\"]}`" + `) and a
-bare ` + "`add`" + ` applies them (a CLI ` + "`--allow-direct`" + ` overrides; a default is still
-validated, never a quieter leak path).
+Box-wide add-time defaults live under ` + "`/etc/anonctl`" + ` (create them yourself; a
+fresh install ships neither, so the directory-exists convention stays opt-in):
+  - Default home: create ` + "`/etc/anonctl/default-home/`" + ` (e.g.
+    ` + "`sudo cp -r <src>/. /etc/anonctl/default-home/`" + `) and its contents seed every
+    FRESH account's home. Its PRESENCE is the switch; there is no config key.
+  - Default LAN exemptions: put them in ` + "`/etc/anonctl/defaults.json`" + `, e.g.
+    ` + "`{\"allowDirect\": [\"192.168.1.150:8080\"]}`" + `. A bare ` + "`add`" + ` applies them (a CLI
+    ` + "`--allow-direct`" + ` overrides; a default is still validated, never a quieter leak
+    path). Use ` + "`{\"allowDirect\": []}`" + ` for a valid no-op starting point. This is
+    STRICT JSON: NO comments (a malformed defaults.json makes ` + "`add`" + ` fail loud).
 
 A bare verb targets the default account ` + "`anon`" + `; ` + "`<name>`" + ` targets ` + "`anon-<name>`" + `.
 Each account gets its OWN dedicated shim service account (` + "`<account>-shim`" + `), the
