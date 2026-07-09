@@ -71,8 +71,8 @@ func TestSeedCopiesTreeAndChownsToAccount(t *testing.T) {
 	for _, want := range []string{
 		filepath.Join(home, ".bashrc"),
 		filepath.Join(home, ".config", "app", "conf.toml"),
-		filepath.Join(home, ".config"),          // the seeded dir must be account-owned
-		filepath.Join(home, ".config", "app"),   // nested seeded dir too
+		filepath.Join(home, ".config"),        // the seeded dir must be account-owned
+		filepath.Join(home, ".config", "app"), // nested seeded dir too
 	} {
 		if !chowned[want] {
 			t.Errorf("seeded path %q was not chowned to anon:anon (calls: %v)", want, r.calls)
