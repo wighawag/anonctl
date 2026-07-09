@@ -1,28 +1,35 @@
 ---
-title: Fix the boot-invariant leak - forcing does not survive reboot because nftables.service is not enabled
+title: Standing per-UID default-deny so forcing-absent = dropped (fixes the reboot leak by construction)
 slug: fix-boot-invariant-nftables-not-enabled
 prd: per-uid-kernel-anonymized-egress
 blockedBy: []
-covers: [26, 27]
+covers: [7, 26, 27]
 ---
 
 ## What to build
 
-Close BUG 1 from the e2e validation (`work/notes/findings/e2e-binary-validation.md`): the SERIOUS real post-reboot leak. anonctl persists its ruleset via a drop-in on the host's `nftables.service`, but never enables that service, and Debian ships it DISABLED. Proven on a real host: after a systemd reboot the anon nft table was ABSENT and the anon UID egressed with the host's real public IP in the clear (`{"IsTor":false,"IP":"51.7.210.66"}`). The shim came back but the kernel forcing did not. This defeats the whole point of a fail-closed tool.
+Close BUG 1 from the e2e validation (`work/notes/findings/e2e-binary-validation.md`) - the SERIOUS real post-reboot leak - by fixing it at the RIGHT layer: a standing per-UID DEFAULT-DENY that is the anon account's resting state, independent of the forcing rules and any host-owned service.
 
-The persisted rule file is correct (a manual `nft -f` recovers it); this is purely a "who loads it at boot" gap. Fix so the boot invariant does NOT depend on a host service anonctl does not own. Prefer the robust option:
+The observed bug: anonctl persists the forcing ruleset via a drop-in on the host's `nftables.service`, which Debian ships DISABLED, so after a reboot the anon nft table was ABSENT and the anon UID egressed with the host's real public IP in the clear (`{"IsTor":false,"IP":"51.7.210.66"}`). The shipped design tries to guarantee the boot invariant by "loading the forcing (allow-through-shim) rules early enough". That is the wrong invariant to chase: it means "un-forced" can mean "free" during any window where the rules are not (yet) loaded.
 
-- **Ship anonctl's OWN loader unit** (e.g. `anonctl-nftables.service`, `WantedBy=sysinit.target`, ordered early - `Before=network-pre.target` / `DefaultDependencies=no` as appropriate) that loads `/etc/anonctl/nftables/*.nft` at boot, INDEPENDENT of whether the host's `nftables.service` is enabled. `add` installs + enables it; `rm`/last-account teardown disables + removes it. This is self-contained and does not silently mutate a host-owned service.
-- (Alternative, weaker: have `add` run `systemctl enable nftables.service` idempotently. Rejected-leaning because it mutates a host-owned unit's enablement as a side effect, and a host that later `systemctl disable nftables` re-opens the leak silently. If you choose this instead, justify it in the ADR.)
-- **Correct ADR-0005:** it currently ASSERTS the boot invariant "holds by construction" because "nftables.service loads early". That assumption is FALSE on a default Debian host. Update the ADR to record the real mechanism (anonctl's own loader unit) and why the drop-in-on-host-service approach was insufficient.
+**Invert it (the design upgrade the maintainer asked for): the anon UID's RESTING STATE is DROP, and forcing is what OPENS a path (only through the shim).** So the ABSENCE of forcing = dropped, never free. Concretely:
+
+- **A standing baseline default-deny for anon UIDs**, applied at `add`-time and persisted as its OWN minimal, always-loaded artifact (a tiny nft rule: for each anon UID, drop all egress), loaded at boot by anonctl's OWN early-ordered loader unit (`WantedBy=sysinit.target`, ordered before the network is up, `DefaultDependencies=no` as appropriate) so it does NOT depend on the host's `nftables.service` being enabled. If NOTHING else loads (the full per-account forcing rules fail, the shim is down, Tor is down), the account is still DROPPED.
+- **The per-account forcing rules layer ON TOP** of the baseline: they add the redirect-into-shim (the only way egress is granted) plus the closures. Forcing present => egress goes through the shim; forcing absent/failed => the baseline default-deny still denies. There must be no ordering window where the baseline deny is not yet present but the account can act.
+- **Endpoint-down is already safe and stays so:** the persisted forcing ruleset already carries `policy drop` for the UID, so Tor/proxy down => dropped (proven). This task ensures the STRONGER property: even the forcing rules themselves being absent => still dropped, via the standing baseline.
+- **Correct ADR-0005** (and/or a new ADR): replace the false "boot invariant holds by construction because nftables.service loads early" with the real mechanism - a standing per-UID default-deny loaded by anonctl's own early unit, forcing layered on top - and why the drop-in-on-a-host-service approach was insufficient on a default host. Record the invariant precisely: "an anon UID with no anonctl forcing loaded is DROPPED, not free; forcing only ever OPENS the shim path."
+
+Do NOT use the weaker `systemctl enable nftables.service` approach: it mutates a host-owned unit and a later `systemctl disable nftables` silently re-opens the leak. anonctl owns its own deny + loader.
 
 ## Acceptance criteria
 
-- [ ] anonctl installs a boot-time loader for its persisted per-account nft rules that does NOT depend on the host's `nftables.service` being enabled; `add` enables it, teardown removes it.
-- [ ] After a reboot (or a reboot-equivalent early-boot simulation), the anon nft table is PRESENT and the anon UID's egress is forced/dropped, never the host's real IP in the clear. This is the boot invariant the finding proved broken.
-- [ ] The boot-invariant integration test (`internal/systemd`) is updated to reproduce the ORIGINAL failure (rules absent at boot when relying on a disabled host service) and prove the fix (rules present at boot via anonctl's own loader). Behind the `integration` tag, isolated.
-- [ ] ADR-0005 is corrected: the "holds by construction / nftables.service loads early" assertion is replaced with the real mechanism and the reason the host-service drop-in was insufficient on a default host.
-- [ ] Tests cover the new behaviour (unit-test the loader-unit GENERATION; the boot behaviour is integration-tested, isolated, host untouched).
+- [ ] A standing per-UID default-deny for anon accounts is applied at `add` and persisted as its own always-loaded artifact, loaded at boot by an anonctl-owned early unit that does NOT depend on the host's `nftables.service` enablement.
+- [ ] Invariant proven: with the anon account provisioned but the FORCING rules NOT loaded (simulate: only the baseline deny present, or flush the forcing table), the anon UID's egress is DROPPED, never the host's real IP. And with forcing loaded, egress goes through the shim as before.
+- [ ] After a reboot (or a reboot-equivalent early-boot simulation) on a host where `nftables.service` is DISABLED, the anon UID is dropped-or-forced at every point, never free. This is the boot invariant the finding proved broken.
+- [ ] `rm` / last-account teardown removes the baseline deny + the loader unit cleanly (and only when the last anon account goes, if the deny is shared).
+- [ ] The `internal/systemd` + `internal/nftables` integration tests are updated: reproduce the ORIGINAL failure (forcing rules absent at boot => leak under the old design) and prove the new invariant (baseline deny present => dropped even with forcing absent). Behind the `integration` tag, isolated, host untouched.
+- [ ] ADR-0005 corrected (or a new ADR added) recording the standing-default-deny mechanism and the precise inverted invariant.
+- [ ] Tests cover the new behaviour (unit-test the baseline-deny + loader-unit GENERATION; boot/deny behaviour integration-tested).
 
 ## Blocked by
 
@@ -30,12 +37,12 @@ The persisted rule file is correct (a manual `nft -f` recovers it); this is pure
 
 ## Prompt
 
-> Goal: make anonctl's forcing survive a reboot fail-closed on a DEFAULT host, not just one where `nftables.service` happens to be enabled. BUG 1 of `work/notes/findings/e2e-binary-validation.md` (a real post-reboot leak, proven on a real host: after reboot the table was gone and the anon UID egressed with the host's real IP). Stories 26/27 (persistence + boot invariant).
+> Goal: make "the anon UID has no anonctl forcing loaded" mean DROPPED, not free - fixing the reboot leak (BUG 1 of `work/notes/findings/e2e-binary-validation.md`) at the right layer. The maintainer's framing: the account's RESTING STATE is deny; forcing is what OPENS a path (only through the shim), so the ABSENCE of forcing can never leak. This is strictly safer than the shipped "load the allow-rules early enough" approach. Stories 7 (fail-closed default-DROP), 26/27 (persistence + boot invariant).
 >
-> FIRST, read the finding's BUG 1 in full (it has the observed leak + the fix options), then `internal/systemd/systemd.go` (the current `nftables.service` DROP-IN approach + `NftablesDropIn`), `internal/forcing/forcing.go` (Install/Reconfigure - where enable/persist happens), and ADR-0005 (the false "holds by construction" claim to correct). The persisted rule file itself is fine; only the boot loader is missing.
+> FIRST, read the finding's BUG 1 in full (the observed real-IP leak after reboot + the fix options), then `internal/nftables/nftables.go` (the forcing ruleset - the filter chain already has `policy drop`, but it is part of the PER-ACCOUNT forcing table that was absent at boot; the baseline deny must be a SEPARATE, minimal, always-loaded artifact), `internal/systemd/systemd.go` (the current `nftables.service` drop-in - replace with anonctl's own early loader unit), `internal/forcing/forcing.go` (Install/Reconfigure/teardown), and ADR-0005 (the false "holds by construction" claim).
 >
-> Domain vocabulary: the boot invariant is "at no point during boot does the anon UID have direct egress" - it must hold because the nft default-DROP loads EARLY. The bug is that the drop-in extends a host service (`nftables.service`) that Debian ships disabled, so nothing loads the rules at boot. Ship anonctl's OWN early-ordered loader unit so the invariant does not depend on a host-owned service's enablement (the robust fix; the weaker `systemctl enable nftables.service` mutates a host unit and can be silently re-disabled - if you pick it, justify in the ADR).
+> Domain vocabulary: the boot invariant is "at no point does the anon UID have direct egress". The shipped design chased it by loading the forcing (allow-through-shim) rules early; the bug is those rules were not loaded at boot at all (host `nftables.service` disabled). The fix inverts it: a standing per-UID default-DENY is the resting state (its own tiny always-loaded rule + anonctl's own early loader unit), forcing layers on top to OPEN the shim path. Un-forced = dropped, by construction. Do NOT rely on `systemctl enable nftables.service` (host-owned, silently re-disableable).
 >
-> Where to look / seams: unit/loader GENERATION is pure text (unit-test it); the enable/persist/reboot behaviour is integration-tested behind the `integration` tag, isolated to throwaway units/tables that leave the host untouched. UPDATE the boot-invariant integration test to reproduce the original failure and prove the fix. "Done" = after a reboot(-equivalent) the anon table is present and forcing holds, on a host where `nftables.service` is disabled. RECORD the mechanism decision in the corrected ADR-0005.
+> Where to look / seams: the baseline-deny + loader-unit GENERATION is pure text (unit-test it); the deny/boot behaviour is integration-tested behind the `integration` tag, isolated to throwaway UIDs/tables/units that leave the host untouched. Prove BOTH: forcing-absent => dropped (the new guarantee) and forcing-present => shim path works. RECORD the inverted invariant in the corrected/updated ADR.
 >
-> NOTE: the definitive proof of this fix is a REAL reboot on a real host (as the finding did); the integration test is a reboot-equivalent early-boot simulation. Flag in the done-record that a real-host reboot re-validation is the final gate (a human re-run of the e2e validation's step 5).
+> NOTE: the definitive proof is a REAL reboot on a real host (as the finding did). The integration test is a reboot-equivalent early-boot simulation. Flag in the done-record that a real-host reboot re-validation (a human re-run of the e2e validation's step 5, PLUS a "flush the forcing table, confirm still dropped" check) is the final gate.
