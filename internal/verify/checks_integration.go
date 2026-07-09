@@ -30,6 +30,18 @@ const (
 	udpRawProbePort = 9999
 )
 
+// offBoxProbeV4 is the OFF-BOX v4 destination the leak/closure probes dial AS the
+// anon UID and key their escaped-leak counter on. It is a TEST-NET-1 (RFC 5737)
+// documentation address, safe to name and never a real host: the probe never needs
+// it to REPLY (a completed loopback handshake with the transparent relay proves
+// nothing). It only needs to observe, via the counter, whether an anon-UID packet
+// escaped the box STILL carrying this off-box daddr (a leak) vs was redirected into
+// the shim / dropped (the PASS). offBoxProbePort is an arbitrary high TCP port.
+const (
+	offBoxProbeV4   = "192.0.2.1"
+	offBoxProbePort = 9999
+)
+
 // LiveChecks (integration build) is the REAL assertion set: it stands up live
 // probes AS the anon UID against the fail-closed ruleset the nftables task
 // installed, and feeds their outcomes to the PURE assertion decisions in
@@ -38,15 +50,22 @@ const (
 // fails honestly instead of silently passing.
 //
 // It runs EVERY probe (RunVerify does not short-circuit) so the report is
-// complete: the load-bearing leak drop (v4 AND v6), both bypass closures (a
-// non-shim loopback dial, a direct endpoint dial), and, when a LAN exemption is
-// active (p.Exempt != ""), the split-tunnel-tight assertion. The anonymized-exit
-// and dns-remote assertions dial THROUGH the shim relay/DNS ports (as the anon UID
-// would) and compare against the host baseline.
+// complete: the load-bearing leak drop (v4 AND v6), both bypass closures, and,
+// when a LAN exemption is active (p.Exempt != ""), the split-tunnel-tight
+// assertion. The anonymized-exit and dns-remote assertions egress AS THE ANON UID
+// (setpriv + curl, transparently redirected into the shim) and compare against the
+// host baseline, NOT by dialling the relay port as a SOCKS proxy (the relay is a
+// transparent SO_ORIGINAL_DST relay, not a SOCKS server).
 //
-// The probes key on `meta skuid`, so they are run under setpriv --reuid to the
-// anon UID; a dropped connection (fail-closed / closure) times out or is refused
-// => reached=false, which the pure drop decision reads as a PASS.
+// CRITICAL probe polarity (the transparent-relay subtlety, BUG 2 of
+// work/notes/findings/e2e-binary-validation.md): the shim relay is reached via the
+// nat redirect, so a LOOPBACK TCP handshake with it ALWAYS completes (the relay
+// accepts, then fail-closed-drops upstream). "handshake completed" is therefore
+// NEVER "reached the target". The leak/closure probes read OFF-BOX reachability
+// instead: a raw non-53 UDP EPERM, an IPv6 dial that fails-closed (no v6 redirect),
+// or the escaped-leak counter (offBoxReachedAsAnon) keyed on an OFF-BOX daddr that
+// only a genuine clear escape increments. The probes key on `meta skuid`, so they
+// run under setpriv --reuid to the anon UID.
 func LiveChecks(ctx context.Context, p LiveParams) []Check {
 	checks := []Check{
 		{Name: AssertAnonymizedExit, Run: func(ctx context.Context) Assertion {
@@ -68,18 +87,40 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 			return DNSRemoteAssertion(probe, proxyResolved, hostSaw)
 		}},
 		{Name: AssertLeakDropV4, Run: func(ctx context.Context) Assertion {
-			return LeakDropAssertion("v4", probeAsAnon(ctx, p, "tcp4", "127.0.0.1:1"))
+			// A direct v4 LEAK is an anon-UID packet leaving the box with an OFF-BOX v4
+			// daddr in the clear. A loopback TCP dial can NOT prove this (the transparent
+			// relay always completes the handshake), so we read the escaped-leak counter
+			// for a raw non-53 UDP datagram to an off-box v4 host: nat redirects only
+			// tcp + udp/53, so raw UDP falls through to the policy DROP (recipe row 3's
+			// `socat UDP4:1.1.1.1:9999` EPERM). If the v4 drop were broken the datagram
+			// would escape with the off-box daddr and move the counter (a real leak).
+			return LeakDropAssertion("v4", offBoxReachedAsAnon(ctx, p, offBoxProbeV4, "udp", offBoxProbePort))
 		}},
 		{Name: AssertLeakDropV6, Run: func(ctx context.Context) Assertion {
 			return LeakDropAssertion("v6", probeAsAnon(ctx, p, "tcp6", "[::1]:1"))
 		}},
 		{Name: AssertBypassLoopbackClosure, Run: func(ctx context.Context) Assertion {
-			nonShim := net.JoinHostPort("127.0.0.1", strconv.Itoa(p.RelayPort+100))
-			return BypassLoopbackClosureAssertion(probeAsAnon(ctx, p, "tcp4", nonShim))
+			// Closure (a): the anon UID must not reach an arbitrary destination directly.
+			// Since ALL of its TCP is redirected into the shim, a loopback dial completes
+			// the handshake with the relay and proves nothing; the honest, non-vacuous
+			// signal is that NO anon-UID TCP escapes the box carrying an OFF-BOX daddr in
+			// the clear. We dial an off-box TCP host and watch the escaped-leak counter
+			// keyed on that daddr: a redirected packet has its daddr rewritten to the shim
+			// (no match, PASS); a genuine escape keeps the off-box daddr (FAIL).
+			return BypassLoopbackClosureAssertion(offBoxReachedAsAnon(ctx, p, offBoxProbeV4, "tcp", 0))
 		}},
 		{Name: AssertBypassEndpointClosure, Run: func(ctx context.Context) Assertion {
+			// Closure (b): the anon UID dialling the upstream endpoint directly must not
+			// escape the box to the endpoint's address:PORT in the clear. We dial the
+			// endpoint AS the anon UID and watch the escaped-leak counter keyed on the
+			// endpoint daddr AND its ORIGINAL port: the nat redirect rewrites BOTH daddr
+			// and dport (to the shim relay port), so a redirected packet no longer matches
+			// the endpoint port and the counter stays 0 (PASS). Keying on the endpoint PORT
+			// (not any-port) is load-bearing for a LOOPBACK endpoint: an any-port 127.0.0.1
+			// counter would also catch the anon UID's legitimate (redirected) shim traffic.
+			// A genuine direct escape to the endpoint keeps daddr:port and moves it (FAIL).
 			endpointAddr := net.JoinHostPort(p.EndpointHost, strconv.Itoa(p.EndpointPort))
-			return BypassEndpointClosureAssertion(probeAsAnon(ctx, p, "tcp4", endpointAddr))
+			return BypassEndpointClosureAssertion(offBoxReachedAsAnon(ctx, p, p.EndpointHost, "tcp", p.EndpointPort, "tcp4", endpointAddr))
 		}},
 		{Name: AssertICMPDrop, Run: func(ctx context.Context) Assertion {
 			// Tails leak-catalogue row 4: an ICMP echo from the anon UID to an off-box
@@ -112,8 +153,18 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 	}
 	if p.Exempt != "" {
 		checks = append(checks, Check{Name: AssertSplitTunnelTight, Run: func(ctx context.Context) Assertion {
+			// The exempted target is RETURNed from the nat chain (not redirected), so it
+			// egresses DIRECTLY: a real handshake to it is a truthful reachability signal.
 			exemptReached := probeAsAnon(ctx, p, "tcp4", p.Exempt)
-			nonExemptReached := probeAsAnon(ctx, p, "tcp4", nonExemptLANOf(p.Exempt))
+			// A NON-exempt sibling in the same LAN is NOT returned: its TCP is redirected
+			// into the shim, so a loopback handshake with the relay would false-"reach".
+			// Read the escaped-leak counter keyed on the sibling's off-box daddr instead:
+			// it stays 0 (redirected) unless the exemption widened into a real direct hole.
+			nonExempt := nonExemptLANOf(p.Exempt)
+			nonExemptReached := false
+			if host, _, err := net.SplitHostPort(nonExempt); err == nil {
+				nonExemptReached = offBoxReachedAsAnon(ctx, p, host, "tcp", 0, "tcp4", nonExempt)
+			}
 			return SplitTunnelTightAssertion(p.Exempt, exemptReached, nonExemptReached)
 		}})
 		checks = append(checks, Check{Name: AssertLANExemptionNotADNSHole, Run: func(ctx context.Context) Assertion {
@@ -159,8 +210,38 @@ func exemptHost(exempt string) string {
 // recipe row-5 signal). It is a thin twin of probeAsAnon: the shared probe helper
 // WRITES a datagram for a udp network so a connectionless Dial cannot false-pass a
 // dropped path. A dropped datagram (fail-closed) reads as reached=false, the PASS.
+//
+// This is used only for the non-tcp-udp-drop assertion, which dials an OFF-BOX UDP
+// destination (nat redirects only udp/53, so any other UDP falls through to the
+// policy DROP and the EPERM is a truthful off-box drop signal, no counter needed).
 func udpSendAsAnon(ctx context.Context, p LiveParams, addr string) bool {
 	return probeAsAnon(ctx, p, "udp4", addr)
+}
+
+// offBoxReachedAsAnon is the closure/leak probes' single entry point onto the
+// escaped-leak counter (offBoxLeakReached, probes_integration.go): it reports
+// whether an anon-UID packet ESCAPED the box still carrying the OFF-BOX daddr (a
+// real leak) vs was redirected into the shim / dropped (the PASS). It reads the
+// counter, NEVER a completed loopback handshake with the transparent relay.
+//
+// counterDaddr/l4/port describe the escaped-leak counter; the OPTIONAL trailing
+// probeNetwork,probeAddr override what the anon UID actually dials (used by the
+// loopback-endpoint closure: dial 127.0.0.1:<endpoint>, watch its daddr). Omitted,
+// the probe dials counterDaddr on port (or a default high port for a port-omitted
+// TCP closure) over l4 directly.
+func offBoxReachedAsAnon(ctx context.Context, p LiveParams, counterDaddr, l4 string, port int, probe ...string) bool {
+	var probeNetwork, probeAddr string
+	if len(probe) == 2 {
+		probeNetwork, probeAddr = probe[0], probe[1]
+	} else {
+		probeNetwork = l4 + "4"
+		dialPort := port
+		if dialPort <= 0 {
+			dialPort = offBoxProbePort // a port-omitted TCP closure still needs a concrete dial port
+		}
+		probeAddr = net.JoinHostPort(counterDaddr, strconv.Itoa(dialPort))
+	}
+	return offBoxLeakReached(ctx, p, counterDaddr, l4, port, probeNetwork, probeAddr)
 }
 
 // probeAsAnon dials addr AS the anon UID (setpriv drops to it) with a short

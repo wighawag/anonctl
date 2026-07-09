@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/proxy"
+	"github.com/wighawag/anonctl/internal/lanexempt"
 )
 
 // clearLANDNSReached reports whether a DIRECT clear-DNS query from the anon UID to
@@ -28,17 +28,14 @@ import (
 // cannot be read from the dig result; it must be read from a packet counter keyed
 // on the ORIGINAL (un-rewritten) destination.
 //
-// It plants a throwaway counter table whose output chain runs AFTER the account's
-// nat_out (a LATER filter priority), counting anon-UID packets STILL destined to
-// exemptHost:53 (a redirected packet has had its daddr rewritten to the shim, so
-// it no longer matches; only a NON-redirected "hole" packet keeps the LAN daddr
-// and is counted). It then dials exemptHost:53 as the anon UID and reports whether
-// the counter moved. A missing nft/setpriv, or any error, yields reached=false
-// (the safe reading: no observed clear-DNS egress), never a false leak.
+// It is one caller of the shared escaped-leak counter primitive (offBoxLeakReached,
+// counter.go): the counter is keyed on exemptHost:53 (a redirected packet has had
+// its daddr rewritten to the shim, so it no longer matches; only a NON-redirected
+// "hole" packet keeps the LAN daddr and is counted), then it dials exemptHost:53 as
+// the anon UID and reports whether the counter moved. A missing nft/setpriv, or any
+// error, yields reached=false (the safe reading: no observed clear-DNS egress),
+// never a false leak.
 func clearLANDNSReached(ctx context.Context, p LiveParams, network, addr string) bool {
-	if _, err := exec.LookPath("nft"); err != nil {
-		return false
-	}
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil || net.ParseIP(host).To4() == nil {
 		return false // only the v4 LAN-resolver case is probed here
@@ -47,26 +44,44 @@ func clearLANDNSReached(ctx context.Context, p LiveParams, network, addr string)
 	if strings.HasPrefix(network, "udp") {
 		l4 = "udp"
 	}
-	const counterTable = "anonctl_verify_dnsleak"
-	ruleset := fmt.Sprintf(`table inet %s {
-    chain out {
-        type filter hook output priority 50; policy accept;
-        meta skuid %d ip daddr %s %s dport 53 counter
-    }
+	return offBoxLeakReached(ctx, p, host, l4, lanexempt.DNSPort, network, addr)
 }
-`, counterTable, p.AnonUID, host, l4)
+
+// offBoxLeakReached is the SHARED live probe behind every fail-closed / bypass
+// closure assertion on the transparent relay: it reports whether an anon-UID
+// packet ESCAPED the box still carrying an OFF-BOX destination (a real leak) as
+// opposed to being redirected into the shim or dropped. Because the transparent
+// SO_ORIGINAL_DST relay makes a loopback TCP handshake ALWAYS complete, "reached"
+// can NEVER be read from a completed handshake; it is read from the escaped-leak
+// counter (counter.go): a throwaway nft counter planted at a filter priority AFTER
+// the account's nat_out (dstnat/-100), keyed on the OFF-BOX daddr(+optional port),
+// which only a non-redirected clear escape increments.
+//
+// counterDaddr/l4/port describe what the counter watches for; probeNetwork/probeAddr
+// are what the anon UID actually dials to try to produce that escape. They differ
+// only for the loopback-endpoint closure case (dial the loopback endpoint, watch
+// its off-box-form daddr) and are identical for the off-box leak/closure probes. A
+// missing nft, a plant/list error, or a missing helper yields reached=false (the
+// fail-closed-safe reading: no observed escape), never a false leak.
+func offBoxLeakReached(ctx context.Context, p LiveParams, counterDaddr, l4 string, port int, probeNetwork, probeAddr string) bool {
+	if _, err := exec.LookPath("nft"); err != nil {
+		return false
+	}
+	ruleset := escapedLeakCounterRuleset(p.AnonUID, counterDaddr, l4, port)
 	if _, _, err := nftRun(ctx, ruleset, "nft", "-f", "-"); err != nil {
 		return false
 	}
-	defer func() { _, _, _ = nftRun(ctx, "delete table inet "+counterTable, "nft", "-f", "-") }()
+	defer func() { _, _, _ = nftRun(ctx, "delete table inet "+escapedLeakCounterTable, "nft", "-f", "-") }()
 
-	// Dial exemptHost:53 AS the anon UID; a clear-DNS hole would let the packet keep
-	// its LAN daddr and hit the counter, a redirect/drop would not.
+	// Dial the off-box destination AS the anon UID; a genuine leak keeps the off-box
+	// daddr and hits the counter, a redirect/drop does not. We ignore whether the
+	// dial "succeeded" (a loopback handshake with the relay always does); only the
+	// counter is decisive.
 	pctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
-	_, _, _ = runSetprivProbe(pctx, p.AnonUID, network, addr)
+	_, _, _ = runSetprivProbe(pctx, p.AnonUID, probeNetwork, probeAddr)
 
-	out, _, err := nftRun(ctx, "", "nft", "list", "table", "inet", counterTable)
+	out, _, err := nftRun(ctx, "", "nft", "list", "table", "inet", escapedLeakCounterTable)
 	if err != nil {
 		return false
 	}
@@ -86,26 +101,6 @@ func nftRun(ctx context.Context, stdin, name string, args ...string) (string, st
 	cmd.Stderr = &errb
 	err := cmd.Run()
 	return strings.TrimSpace(out.String()), strings.TrimSpace(errb.String()), err
-}
-
-// counterMoved reports whether an nft `counter` line shows a non-zero packet
-// count (`counter packets N ...` with N > 0). A parse miss reads as not-moved (no
-// observed leak), the safe outcome.
-func counterMoved(listed string) bool {
-	for _, line := range strings.Split(listed, "\n") {
-		if !strings.Contains(line, "counter packets") {
-			continue
-		}
-		fields := strings.Fields(line)
-		for i, f := range fields {
-			if f == "packets" && i+1 < len(fields) {
-				if n, err := strconv.Atoi(fields[i+1]); err == nil && n > 0 {
-					return true
-				}
-			}
-		}
-	}
-	return false
 }
 
 // This file is the IMPURE live-probe machinery behind checks_integration.go's
@@ -237,33 +232,54 @@ func hostExitIP(ctx context.Context) (string, error) {
 	return httpGetTrimmed(cctx, http.DefaultClient, ipEchoURL)
 }
 
-// forcedExitIP fetches the exit IP OBSERVED THROUGH the shim relay (the forced
-// path), and, for a tor-shared endpoint, whether check.torproject.org reports a
-// Tor exit. It dials the shim's SOCKS relay port as a socks5h proxy so the fetch
-// egresses the forced way. Any error feeds a failing anonymized-exit decision.
+// forcedExitIP fetches the exit IP OBSERVED THROUGH the forced path, and, for a
+// tor-shared endpoint, whether check.torproject.org reports a Tor exit. It egresses
+// AS THE ANON UID (setpriv + curl), so the nat chain transparently redirects the
+// fetch into the shim relay and its DNS through the shim DNS forwarder, exactly like
+// the hand recipe's `sudo -u anon curl https://check.torproject.org/api/ip` that
+// proves anonymization. It does NOT dial the relay port as a SOCKS proxy: the relay
+// is a TRANSPARENT SO_ORIGINAL_DST relay (internal/shim/relay.go), NOT a SOCKS
+// server, so a direct SOCKS handshake to it would read the relay's own listen addr
+// and reset. Any error feeds a failing anonymized-exit decision (never a false pass).
 func forcedExitIP(ctx context.Context, p LiveParams) (exitIP string, isTor bool, err error) {
-	relay := net.JoinHostPort("127.0.0.1", strconv.Itoa(p.RelayPort))
-	dialer, derr := proxy.SOCKS5("tcp", relay, nil, proxy.Direct)
-	if derr != nil {
-		return "", false, fmt.Errorf("build shim socks dialer: %w", derr)
-	}
-	client := &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: &http.Transport{DialContext: func(_ context.Context, network, addr string) (net.Conn, error) { return dialer.Dial(network, addr) }},
-	}
-	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	exitIP, err = httpGetTrimmed(cctx, client, ipEchoURL)
+	exitIP, err = curlAsAnon(ctx, p, ipEchoURL)
 	if err != nil {
 		return "", false, err
 	}
 	if p.Class == "tor-shared" {
-		body, terr := httpGetTrimmed(cctx, client, torCheckURL)
-		if terr == nil {
+		if body, terr := curlAsAnon(ctx, p, torCheckURL); terr == nil {
 			isTor = strings.Contains(body, "\"IsTor\":true") || strings.Contains(body, "\"IsTor\": true")
 		}
 	}
 	return exitIP, isTor, nil
+}
+
+// curlAsAnon fetches url AS THE ANON UID via `curl` under setpriv, so the fetch
+// egresses the forced way (the nat chain redirects its TCP into the shim relay and
+// its DNS through the shim DNS forwarder). It returns the trimmed body or an error;
+// a missing curl/setpriv, or a non-zero curl exit (a failed-closed fetch), is an
+// error that feeds a FAILING pure decision, never a false pass. curl is the recipe's
+// own tool for this proof and resolves the name remotely (the anon UID's :53 is
+// transparently redirected to the shim), so no host-side DNS leak is introduced.
+func curlAsAnon(ctx context.Context, p LiveParams, url string) (string, error) {
+	if _, err := exec.LookPath("setpriv"); err != nil {
+		return "", fmt.Errorf("setpriv unavailable: cannot egress as the anon UID")
+	}
+	if _, err := exec.LookPath("curl"); err != nil {
+		return "", fmt.Errorf("curl unavailable: cannot fetch the forced-path exit")
+	}
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "setpriv",
+		"--reuid", strconv.Itoa(p.AnonUID), "--clear-groups",
+		"curl", "-s", "--max-time", "25", url)
+	var out, errb strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &errb
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("forced-path curl as anon UID failed: %w (%s)", err, strings.TrimSpace(errb.String()))
+	}
+	return strings.TrimSpace(out.String()), nil
 }
 
 // dnsRemoteEvidence gathers the dns-remote evidence: a unique probe name resolved
@@ -275,23 +291,18 @@ func forcedExitIP(ctx context.Context, p LiveParams) (exitIP string, isTor bool,
 // feeds a failing dns-remote decision.
 func dnsRemoteEvidence(ctx context.Context, p LiveParams) (probe string, proxyResolved []string, hostSaw bool, err error) {
 	probe = "check.torproject.org"
-	relay := net.JoinHostPort("127.0.0.1", strconv.Itoa(p.RelayPort))
-	dialer, derr := proxy.SOCKS5("tcp", relay, nil, proxy.Direct)
-	if derr != nil {
-		return probe, nil, false, fmt.Errorf("build shim socks dialer: %w", derr)
-	}
-	client := &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: &http.Transport{DialContext: func(_ context.Context, network, addr string) (net.Conn, error) { return dialer.Dial(network, addr) }},
-	}
-	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	if _, err := httpGetTrimmed(cctx, client, "https://"+probe+"/"); err != nil {
+	// Fetch the name AS THE ANON UID: the anon UID's :53 is transparently redirected
+	// to the shim's DNS-over-SOCKS forwarder, so a successful HTTPS fetch of a NAME
+	// (never a bare IP) proves the name was resolved REMOTELY via the endpoint, not by
+	// a local/plaintext lookup. This does NOT dial the relay port as a SOCKS proxy
+	// (the relay is transparent, not a SOCKS server); it egresses the forced way, like
+	// the recipe's `sudo -u anon curl` that resolves through the shim.
+	if _, err := curlAsAnon(ctx, p, "https://"+probe+"/"); err != nil {
 		return probe, nil, false, err
 	}
-	// A socks5h fetch resolves the name PROXY-SIDE by construction; success means
-	// the endpoint resolved it. The host resolver was never asked (the shim path
-	// carries the name to the proxy), so hostSaw stays false.
+	// The anon UID cannot do plaintext DNS off-box (udp/53 is redirected to the shim,
+	// tcp/53 too), so the name was resolved proxy-side and the host resolver was never
+	// asked; hostSaw stays false.
 	return probe, []string{probe}, false, nil
 }
 
