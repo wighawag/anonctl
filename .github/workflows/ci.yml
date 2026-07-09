@@ -1,0 +1,48 @@
+name: ci
+
+# CI runs the UNIT gate on every push to main and on every pull request, so a
+# regression is caught here, not only by a human driving locally. This is distinct
+# from release.yml (tag-triggered build+publish via goreleaser): CI = every push/PR
+# unit gate; release = cut a versioned build. They do not share a job.
+#
+# The single command below IS the repo's acceptance gate, verbatim from
+# `.dorfl.json` `verify` (gofmt check + go vet + go build + go test). Keeping it
+# byte-for-byte identical means the push/PR gate and the local gate can never
+# drift; ci_workflow_test.go pins that (it reads both files and asserts a match),
+# so a change to `.dorfl.json` verify fails the build until this workflow is
+# updated too.
+#
+# UNIT ONLY. The setup/verify integration suite (`go test -tags integration ./...`)
+# is deliberately NOT run here: it needs a capable Linux host with root + nftables
+# + a live socks5h endpoint (it installs real per-UID kernel rules and probes
+# egress) and, for the boot-invariant/teardown tests, a systemd-PID1 environment,
+# none of which a GitHub-hosted runner provides. Run it on a capable host with
+# `go test -tags integration ./...`. A green-but-vacuous integration run on an
+# incapable runner would be worse than an honest unit-only gate, so we do not fake
+# it.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          check-latest: true
+
+      - name: Run the .dorfl.json verify gate (unit only)
+        # Verbatim from `.dorfl.json` `verify`. Do not edit here without editing
+        # .dorfl.json; ci_workflow_test.go enforces the two stay identical.
+        run: test -z "$(gofmt -l .)" && go vet ./... && go build ./... && go test ./...
