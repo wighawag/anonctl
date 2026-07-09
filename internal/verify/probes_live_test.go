@@ -3,9 +3,14 @@ package verify
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/wighawag/anonctl/internal/shim"
 )
 
 // TestPkexecPolicyQueryCommand_QueriesPolkitNeverRunsPkexec proves the core of this
@@ -262,5 +267,101 @@ func TestProbeAsAnonPropagatesTheLoudError(t *testing.T) {
 	}
 	if _, err := udpSendAsAnon(context.Background(), LiveParams{AnonUID: 12345}, "192.0.2.1:9999"); err == nil {
 		t.Fatalf("udpSendAsAnon must propagate the loud probe error, got nil")
+	}
+}
+
+// TestProbeAsAnonBudgetInvariant is the always-running guard on the fix: whatever
+// outer deadline probeAsAnon grants, it MUST exceed shim.ProbeTimeout, or a
+// full-window silently-dropped dial (leak-drop-v6's PASS) races the exec SIGKILL
+// and false-fails. We assert the source invariant directly (no setpriv needed) by
+// measuring the budget probeAsAnon would hand a probe that records its context
+// deadline. It fails if anyone re-collapses the two timeouts to be equal.
+func TestProbeAsAnonBudgetInvariant(t *testing.T) {
+	// probeExecBudget is the SAME value probeAsAnon puts on the exec context (not a
+	// recomputation), so this breaks the moment anyone re-collapses it to equal.
+	if probeExecBudget <= shim.ProbeTimeout {
+		t.Fatalf("probeAsAnon's outer budget (%v) must EXCEED shim.ProbeTimeout (%v), else the exec SIGKILL races the shim's DROPPED print and false-fails a healthy leak-drop-v6/split-tunnel-tight", probeExecBudget, shim.ProbeTimeout)
+	}
+}
+
+// TestProbeAsAnonOuterDeadlineExceedsShimDialTimeout locks in the fix for the
+// equal-timeout race that FALSE-FAILED leak-drop-v6 and split-tunnel-tight on a
+// HEALTHY host: probeAsAnon used a 3s outer context while the shim dials for
+// shim.ProbeTimeout (also 3s), so a silently-dropped SYN (no fast RST) burned the
+// full shim window and the outer context SIGKILLed the shim before it could print
+// its DROPPED verdict -> empty output the harness misread as "the probe could not
+// run". The outer deadline MUST exceed shim.ProbeTimeout so the shim always gets to
+// print. We measure the effective outer budget probeAsAnon grants by pointing the
+// probe at a stub that sleeps past shim.ProbeTimeout then prints a token: the fix
+// (margin > 0) lets it print; the old equal-timeout code would kill it first.
+func TestProbeAsAnonOuterDeadlineExceedsShimDialTimeout(t *testing.T) {
+	if _, err := exec.LookPath("setpriv"); err != nil {
+		t.Skip("setpriv not on PATH; this probe path is unrunnable here")
+	}
+	self := os.Getuid()
+	// setpriv --reuid to our OWN uid needs no privilege (no drop), so this runs
+	// unprivileged. If the host refuses even that, skip rather than false-fail.
+	if out, err := exec.Command("setpriv", "--reuid", fmt.Sprint(self), "--clear-groups", "true").CombinedOutput(); err != nil {
+		t.Skipf("setpriv --reuid self unavailable here (%v: %s); cannot exercise the exec path", err, strings.TrimSpace(string(out)))
+	}
+
+	// A stub "shim" that sleeps just past shim.ProbeTimeout, then prints DROPPED:
+	// exactly the behaviour of a real silently-dropped dial that runs the full window
+	// and only then reports. With the margin fix probeAsAnon must let it finish; with
+	// the old equal 3s/3s it would be SIGKILLed with empty output.
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "anonctl-shim")
+	sleep := (shim.ProbeTimeout + 200*time.Millisecond).Seconds()
+	script := fmt.Sprintf("#!/bin/sh\nsleep %.2f\nprintf DROPPED:stub-timeout\n", sleep)
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	orig := probeShimBinary
+	probeShimBinary = stub
+	defer func() { probeShimBinary = orig }()
+
+	reached, err := probeAsAnon(context.Background(), LiveParams{AnonUID: self}, "tcp6", "[::1]:1")
+	if err != nil {
+		t.Fatalf("probeAsAnon killed the shim before it could print (the equal-timeout race is back): the outer deadline must exceed shim.ProbeTimeout so a full-window dropped dial still prints its verdict; got err=%v", err)
+	}
+	if reached {
+		t.Fatalf("stub reported DROPPED, so reached must be false; got reached=true")
+	}
+}
+
+// TestRunSetprivProbeReportsTimeoutHonestly proves the error is HONEST when OUR
+// deadline (not a privdrop failure) truncates the probe: a killed-mid-dial probe is
+// named a timeout, NOT "setpriv could not drop to uid" (which sent past diagnosis
+// down the wrong path). It gives runSetprivProbe a context far shorter than the
+// stub's sleep so the deadline is what fires.
+func TestRunSetprivProbeReportsTimeoutHonestly(t *testing.T) {
+	if _, err := exec.LookPath("setpriv"); err != nil {
+		t.Skip("setpriv not on PATH; this probe path is unrunnable here")
+	}
+	self := os.Getuid()
+	if out, err := exec.Command("setpriv", "--reuid", fmt.Sprint(self), "--clear-groups", "true").CombinedOutput(); err != nil {
+		t.Skipf("setpriv --reuid self unavailable here (%v: %s)", err, strings.TrimSpace(string(out)))
+	}
+
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "anonctl-shim")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nsleep 5\nprintf DROPPED:late\n"), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	orig := probeShimBinary
+	probeShimBinary = stub
+	defer func() { probeShimBinary = orig }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	reached, _, err := runSetprivProbe(ctx, self, "tcp6", "[::1]:1")
+	if err == nil {
+		t.Fatalf("a probe killed by our own deadline must return an error, got nil (reached=%v)", reached)
+	}
+	if strings.Contains(err.Error(), "could not run") || strings.Contains(err.Error(), "could not drop") {
+		t.Fatalf("a deadline-killed probe must be reported as a TIMEOUT, not misdiagnosed as a privdrop failure; got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("the honest error must name the timeout; got %q", err.Error())
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/wighawag/anonctl/internal/lanexempt"
+	"github.com/wighawag/anonctl/internal/shim"
 )
 
 // icmpProbeTarget is the off-box address the icmp-drop probe pings AS the anon
@@ -15,6 +16,16 @@ import (
 // PASS) and an unreachable-but-not-dropped host both yield no reply, so the probe
 // reads whether the anon UID could EMIT ICMP at all, which the policy DROP forbids.
 const icmpProbeTarget = "192.0.2.1"
+
+// probeExecBudget is the outer deadline probeAsAnon puts on the setpriv+shim exec.
+// It MUST exceed shim.ProbeTimeout (the shim's own dial timeout): a silently-dropped
+// SYN with no fast RST (the leak-drop-v6 PASS) burns the shim's FULL dial window,
+// and an EQUAL outer deadline SIGKILLs the shim before it prints its DROPPED verdict
+// -> empty output the harness misreads as "the probe could not run" (the false FAIL
+// this margin closes). The +1s covers the setpriv fork/exec + privdrop that runs
+// BEFORE the shim's dialer even starts its clock, mirroring the icmp-drop probe's
+// `ping -W 2` under a 3s context.
+var probeExecBudget = shim.ProbeTimeout + 1*time.Second
 
 // udpProbeHost / udpRawProbePort are the off-box UDP destination the non-tcp-udp-drop
 // probe dials AS the anon UID: a public resolver IP on a raw high port (row 5's
@@ -304,16 +315,22 @@ func offBoxReachedAsAnon(ctx context.Context, p LiveParams, counterDaddr, l4 str
 // error, never a silent reached=false (which a drop assertion would read as a
 // PASS): a probe that could not run is not a pass.
 //
-// 3s deadline: the drop assertions that use this (leak-drop-v6, non-tcp-udp-drop)
-// PASS by the dial being DROPPED, which is knowable fast (an EPERM / an immediate
-// fail-closed on a v6 dial with no v6 redirect), so a long deadline only adds dead
-// wall time; it matches the hand recipe's snappy `ping -W 3` / `curl -m` closures
-// (work/notes/findings/manual-per-uid-tor-recipe.md). The one REACHABILITY use
-// (split-tunnel-tight's exemptReached) dials a DIRECT LAN host that answers well
-// inside 3s on a healthy host. The Tor-round-trip checks (anonymized-exit,
-// dns-remote) do NOT use this helper and keep their generous curl/http timeouts.
+// The outer deadline MUST exceed the shim's own dial timeout (shim.ProbeTimeout),
+// or the two race: a dropped SYN with no fast RST (the leak-drop-v6 PASS) burns the
+// shim's FULL dial window, and if OUR context fires at the same instant exec would
+// SIGKILL the shim before it printed its DROPPED verdict, yielding empty output the
+// harness then MISREADS as "the probe could not run" (a false FAIL of a healthy
+// host: the equal 3s/3s collision). We give a 1s margin over shim.ProbeTimeout for
+// the setpriv fork/exec + privdrop that runs BEFORE the shim's dialer even starts
+// its clock, mirroring the icmp-drop probe's `ping -W 2` under a 3s context. The
+// drop assertions still resolve fast when the path is a quick EPERM/RST; the margin
+// only matters for the genuinely-silent-drop case that must be allowed to time out
+// and PRINT its DROPPED. The one REACHABILITY use (split-tunnel-tight's
+// exemptReached) dials a DIRECT LAN host that answers well inside the window on a
+// healthy host. The Tor-round-trip checks (anonymized-exit, dns-remote) do NOT use
+// this helper and keep their generous curl/http timeouts.
 func probeAsAnon(ctx context.Context, p LiveParams, network, addr string) (bool, error) {
-	pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	pctx, cancel := context.WithTimeout(ctx, probeExecBudget)
 	defer cancel()
 	reached, _, err := runSetprivProbe(pctx, p.AnonUID, network, addr)
 	return reached, err

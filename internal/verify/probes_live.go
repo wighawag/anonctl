@@ -191,15 +191,28 @@ func runSetprivProbe(ctx context.Context, uid int, network, addr string) (reache
 	cmd := exec.CommandContext(ctx, "setpriv",
 		"--reuid", strconv.Itoa(uid), "--clear-groups",
 		probeShimBinary, "-probe", network, addr)
-	out, _ := cmd.CombinedOutput()
+	out, runErr := cmd.CombinedOutput()
 	s := string(out)
 	// The shim probe ALWAYS prints exactly `REACHED` or `DROPPED:<reason>`. If we
-	// see neither, the probe binary never ran under the anon UID (e.g. setpriv could
-	// not drop: not root, or the anon UID does not exist), so this is an UN-RUNNABLE
-	// probe, NOT a dropped connection: fail LOUD (a probe that could not run is not a
-	// pass), never a silent reached=false the drop assertions would read as a PASS.
+	// see neither, the probe binary never ran to completion under the anon UID, so
+	// this is an UN-RUNNABLE probe, NOT a dropped connection: fail LOUD (a probe that
+	// could not run is not a pass), never a silent reached=false the drop assertions
+	// would read as a PASS.
 	if !strings.Contains(s, "REACHED") && !strings.Contains(s, "DROPPED") {
-		return false, s, fmt.Errorf("the anon-UID probe could not run (setpriv could not drop to uid %d, or the shim probe did not execute): %s", uid, strings.TrimSpace(s))
+		// Distinguish the two ways empty output happens, so the error is HONEST
+		// (misdiagnosing a killed-mid-dial probe as "setpriv could not drop" sent past
+		// diagnosis down the wrong path). If OUR context deadline fired, exec SIGKILLed
+		// the shim before it could print its verdict: the outer window is too tight for
+		// this dial, not a privdrop failure. `probeAsAnon` gives the shim a margin over
+		// shim.ProbeTimeout so a real full-timeout dial (a silently-dropped SYN, the
+		// leak-drop-v6 PASS) always prints before this can trigger; if it still does,
+		// name the timeout truthfully.
+		if ctx.Err() == context.DeadlineExceeded {
+			return false, s, fmt.Errorf("the anon-UID probe timed out before printing a verdict (the shim dial to %s %s outran the probe deadline): %s", network, addr, strings.TrimSpace(s))
+		}
+		// Otherwise the process itself failed before printing (setpriv could not drop:
+		// not root, or the anon UID does not exist; or the shim probe did not execute).
+		return false, s, fmt.Errorf("the anon-UID probe could not run (setpriv could not drop to uid %d, or the shim probe did not execute): %v: %s", uid, runErr, strings.TrimSpace(s))
 	}
 	return strings.Contains(s, "REACHED"), s, nil
 }
