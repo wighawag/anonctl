@@ -244,6 +244,75 @@ func TestRemoveKeepsLoaderWhileAnotherAccountRemains(t *testing.T) {
 	}
 }
 
+// On the LAST account's teardown, Remove ALSO removes the SHARED account-agnostic
+// artifacts (the @-template shim unit + the loader unit + the now-empty
+// shim/nftables/accounts dirs), so a fully torn-down host leaves no anonctl residue
+// (the e2e finding, BUG 4).
+func TestRemoveLastAccountRemovesSharedInfraAndDirs(t *testing.T) {
+	d, ev := testDeps(t)
+	if err := forcing.Install(context.Background(), d, sampleConfig(), nil); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if err := forcing.Remove(context.Background(), d, "anon"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	// The shared template + loader units are gone, and systemd is reloaded so the
+	// removed units are forgotten.
+	if _, err := os.Stat(filepath.Join(d.SystemdStore.UnitDir, systemd.UnitName)); !os.IsNotExist(err) {
+		t.Errorf("Remove of the last account left the shared template unit behind")
+	}
+	if _, err := os.Stat(filepath.Join(d.SystemdStore.UnitDir, systemd.LoaderUnitName)); !os.IsNotExist(err) {
+		t.Errorf("Remove of the last account left the loader unit behind")
+	}
+	if firstIndexOf(*ev, "systemctl", "daemon-reload") < 0 {
+		t.Errorf("Remove of the last account did not daemon-reload after removing the units; events: %+v", *ev)
+	}
+	// The now-empty anonctl dirs (shim env + nftables rules + account configs) are
+	// removed too: no empty /etc/anonctl/{shim,nftables,accounts} residue.
+	for _, dir := range []string{d.SystemdStore.EnvDir, d.SystemdStore.RulesDir} {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("Remove of the last account left the empty dir %q behind", dir)
+		}
+	}
+	if _, err := os.Stat(d.ConfigStore.BaseDir); !os.IsNotExist(err) {
+		t.Errorf("Remove of the last account left the empty account-config dir behind")
+	}
+}
+
+// Purging ONE account among several must NOT rip out the shared infra the survivor
+// still needs: the template unit, the loader unit, and the shared dirs all survive
+// while another account remains (the same last-account guard that keeps the loader).
+func TestRemoveKeepsSharedInfraWhileAnotherAccountRemains(t *testing.T) {
+	d, _ := testDeps(t)
+	if err := forcing.Install(context.Background(), d, sampleConfig(), nil); err != nil {
+		t.Fatalf("Install anon: %v", err)
+	}
+	second := sampleConfig()
+	second.Account = "anon-work"
+	second.AnonUID = 41000
+	second.ShimUID = 990
+	if err := forcing.Install(context.Background(), d, second, nil); err != nil {
+		t.Fatalf("Install anon-work: %v", err)
+	}
+	if err := forcing.Remove(context.Background(), d, "anon"); err != nil {
+		t.Fatalf("Remove anon: %v", err)
+	}
+	// The survivor still needs the shared template unit, the loader unit, and the
+	// shared dirs (its rule files + env + config live under them).
+	if _, err := os.Stat(filepath.Join(d.SystemdStore.UnitDir, systemd.UnitName)); err != nil {
+		t.Errorf("Remove ripped out the shared template unit while a survivor remains: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(d.SystemdStore.UnitDir, systemd.LoaderUnitName)); err != nil {
+		t.Errorf("Remove ripped out the loader unit while a survivor remains: %v", err)
+	}
+	if _, err := os.Stat(d.SystemdStore.RulesDir); err != nil {
+		t.Errorf("Remove ripped out the shared rules dir while a survivor remains: %v", err)
+	}
+	if _, err := d.ConfigStore.Read("anon-work"); err != nil {
+		t.Errorf("Remove of anon destroyed the survivor's config: %v", err)
+	}
+}
+
 // readEnv reads the per-account env file the SystemdStore wrote (a small helper so
 // the reconfigure test can assert the rewritten isolation username).
 func readEnv(d forcing.Deps, account string) (string, error) {

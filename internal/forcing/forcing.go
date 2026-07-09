@@ -155,6 +155,12 @@ func Reconfigure(ctx context.Context, d Deps, c accountconfig.Config, exemptions
 // (leaving every other table untouched), removes the per-account systemd files (env
 // + forcing + baseline rule files) and the at-rest config, and disables anonctl's
 // early-boot loader unit ONLY when this was the LAST account (no rule files remain).
+// On that LAST-account teardown it ALSO removes the SHARED account-agnostic
+// artifacts (the @-template shim unit + the loader unit + the now-empty
+// `/etc/anonctl/{shim,nftables,accounts}` dirs), so a fully torn-down host leaves no
+// anonctl residue (the e2e finding, BUG 4). All of that is guarded by the SAME
+// last-account check, so purging ONE account among several never rips out the shared
+// infra the survivors still need.
 // It is idempotent: a not-enabled instance, an absent table's delete, and a missing
 // file are all clean no-ops (a torn-down account leaves no residue). The marker
 // removal stays in the caller (rm already removes it), so this focuses on the
@@ -191,6 +197,21 @@ func Remove(ctx context.Context, d Deps, account string) error {
 	}
 	if !hasAccounts {
 		if err := systemd.DisableLoader(ctx, d.SystemdRunner); err != nil {
+			return err
+		}
+		// LAST account: also remove the SHARED account-agnostic artifacts (the template
+		// shim unit + the loader unit + the now-empty anonctl dirs), then reload systemd
+		// so the removed units are forgotten. RemoveCommon only deletes the dirs it owns
+		// WHEN empty and RemoveBaseDirIfEmpty the same, so a survivor's files are never
+		// touched (belt-and-braces on top of the !hasAccounts guard). A fully torn-down
+		// host is left with no anonctl residue (the e2e finding, BUG 4).
+		if err := d.SystemdStore.RemoveCommon(); err != nil {
+			return fmt.Errorf("forcing: remove shared systemd artifacts: %w", err)
+		}
+		if err := d.ConfigStore.RemoveBaseDirIfEmpty(); err != nil {
+			return fmt.Errorf("forcing: remove empty account-config dir: %w", err)
+		}
+		if err := systemd.DaemonReload(ctx, d.SystemdRunner); err != nil {
 			return err
 		}
 	}

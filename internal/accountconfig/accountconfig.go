@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/wighawag/anonctl/internal/endpoint"
 )
@@ -273,6 +274,21 @@ func (s Store) Remove(account string) error {
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove account config %q: %w", path, err)
+	}
+	return nil
+}
+
+// RemoveBaseDirIfEmpty removes the config dir ONLY when it holds no configs, used
+// on the LAST account's teardown so a fully torn-down host leaves no empty
+// `/etc/anonctl/accounts` dir (the e2e finding, BUG 4). os.Remove refuses a
+// non-empty dir, so a survivor account's config is never ripped out; an absent dir
+// is a clean no-op. The caller guards on the last-account condition regardless.
+func (s Store) RemoveBaseDirIfEmpty() error {
+	if err := os.Remove(s.baseDir()); err != nil &&
+		!errors.Is(err, os.ErrNotExist) &&
+		!errors.Is(err, syscall.ENOTEMPTY) &&
+		!errors.Is(err, syscall.EEXIST) {
+		return fmt.Errorf("remove account config dir %q: %w", s.baseDir(), err)
 	}
 	return nil
 }

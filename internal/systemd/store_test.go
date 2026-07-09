@@ -107,6 +107,70 @@ func TestHasForcedAccountsTracksRuleFiles(t *testing.T) {
 	}
 }
 
+// RemoveCommon tears down the SHARED, account-agnostic artifacts InstallCommon
+// wrote: the @-template shim unit, anonctl's early-boot loader unit, and the (now
+// empty) shim/rules dirs. It is used on the LAST account's teardown so a fully
+// torn-down host leaves no anonctl residue (the e2e finding, BUG 4). It is a clean
+// no-op when the artifacts are already gone (rm idempotency), and it must NEVER
+// remove a NON-empty dir (a survivor account's files stay put).
+func TestRemoveCommonRemovesSharedUnitsAndEmptyDirs(t *testing.T) {
+	s := scratchStore(t)
+	if err := s.InstallCommon(systemd.TemplateParams{}, systemd.LoaderParams{}); err != nil {
+		t.Fatalf("InstallCommon: %v", err)
+	}
+	// Create the private dirs too (WriteAccount would; here we just want them empty).
+	if err := os.MkdirAll(s.EnvDir, 0o700); err != nil {
+		t.Fatalf("mkdir env: %v", err)
+	}
+	if err := os.MkdirAll(s.RulesDir, 0o700); err != nil {
+		t.Fatalf("mkdir rules: %v", err)
+	}
+	if err := s.RemoveCommon(); err != nil {
+		t.Fatalf("RemoveCommon: %v", err)
+	}
+	// The shared template + loader units are gone.
+	if _, err := os.Stat(filepath.Join(s.UnitDir, systemd.UnitName)); !os.IsNotExist(err) {
+		t.Errorf("RemoveCommon left the template unit behind")
+	}
+	if _, err := os.Stat(filepath.Join(s.UnitDir, systemd.LoaderUnitName)); !os.IsNotExist(err) {
+		t.Errorf("RemoveCommon left the loader unit behind")
+	}
+	// The now-empty private dirs are removed too (no empty /etc/anonctl/{shim,nftables}).
+	if _, err := os.Stat(s.EnvDir); !os.IsNotExist(err) {
+		t.Errorf("RemoveCommon left the empty shim env dir behind")
+	}
+	if _, err := os.Stat(s.RulesDir); !os.IsNotExist(err) {
+		t.Errorf("RemoveCommon left the empty nftables rules dir behind")
+	}
+}
+
+// RemoveCommon is idempotent (a second call, or a call before InstallCommon ever
+// ran, is a clean no-op).
+func TestRemoveCommonIdempotent(t *testing.T) {
+	s := scratchStore(t)
+	if err := s.RemoveCommon(); err != nil {
+		t.Errorf("RemoveCommon on a pristine host = %v, want nil", err)
+	}
+}
+
+// RemoveCommon must NOT delete a NON-empty private dir: it only removes the shared
+// units and the dirs it owns WHEN they are empty. A survivor account whose rule
+// files still live under the rules dir keeps its dir (this can happen only via a
+// misuse, since the caller guards on HasForcedAccounts, but the Store must be safe
+// regardless).
+func TestRemoveCommonKeepsNonEmptyDirs(t *testing.T) {
+	s := scratchStore(t)
+	if err := s.WriteAccount(sampleConfig(), "table inet anonctl_anon {}\n"); err != nil {
+		t.Fatalf("WriteAccount: %v", err)
+	}
+	if err := s.RemoveCommon(); err != nil {
+		t.Fatalf("RemoveCommon: %v", err)
+	}
+	if _, err := os.Stat(s.RulesDir); err != nil {
+		t.Errorf("RemoveCommon removed a non-empty rules dir (a survivor's files): %v", err)
+	}
+}
+
 func TestRemoveAccountDeletesEnvAndRuleFileIdempotently(t *testing.T) {
 	s := scratchStore(t)
 	// Removing before writing is a clean no-op (rm idempotency).

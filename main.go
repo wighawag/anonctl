@@ -114,7 +114,7 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		fmt.Printf("%s already existed; re-applied forcing (shim %s, endpoint %s)\n", res.Account, res.Shim, cfg.Endpoint().URL())
 	}
 	fmt.Printf("note: anonctl does NOT manage the endpoint's own service; enable your endpoint (e.g. `systemctl enable --now tor.service`) so it is up at boot\n")
-	fmt.Printf("run `anonctl verify %s` to prove the account is anonymized\n", accountArg(cmd.Account))
+	fmt.Printf("run `%s` to prove the account is anonymized\n", verifyHint(cmd.Account))
 	return 0
 }
 
@@ -374,7 +374,7 @@ func runUse(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		// RED: print the failing assertions and REFUSE. Do NOT exec a shell (you must
 		// never get an un-anonymized shell via `use`).
 		fmt.Print(rep.Human())
-		fmt.Fprintf(os.Stderr, "anonctl: use: %s did NOT verify as anonymized; refusing to open a shell (fix it, then `anonctl verify %s`)\n", cmd.Account, accountArg(cmd.Account))
+		fmt.Fprintf(os.Stderr, "anonctl: use: %s did NOT verify as anonymized; refusing to open a shell (fix it, then `%s`)\n", cmd.Account, verifyHint(cmd.Account))
 		return rep.ExitCode()
 	}
 
@@ -447,7 +447,7 @@ func runUpdate(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		return 1
 	}
 	fmt.Printf("reconfigured %s -> endpoint %s (re-applied fail-closed, no leak window)\n", cfg.Account, cfg.Endpoint().URL())
-	fmt.Printf("run `anonctl verify %s` to re-prove the account is anonymized\n", accountArg(cmd.Account))
+	fmt.Printf("run `%s` to re-prove the account is anonymized\n", verifyHint(cmd.Account))
 	return 0
 }
 
@@ -550,6 +550,18 @@ func accountArg(account string) string {
 		return ""
 	}
 	return strings.TrimPrefix(account, cli.DefaultAccount+"-")
+}
+
+// verifyHint renders the exact `anonctl verify [<name>]` command an operator would
+// type next, with NO trailing space for the default account (whose CLI argument is
+// empty): `anonctl verify` for the default, `anonctl verify <name>` for a named one.
+// It exists so the follow-up hint never prints a stray `verify ` (the e2e finding,
+// BUG 5); callers wrap it in backticks in the message.
+func verifyHint(account string) string {
+	if arg := accountArg(account); arg != "" {
+		return "anonctl verify " + arg
+	}
+	return "anonctl verify"
 }
 
 // atoiOr parses s as an int, returning def on any error (an empty/absent UID for a
