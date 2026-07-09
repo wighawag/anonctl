@@ -180,10 +180,10 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	// endpoint already in use by another account), and fall back fail-closed
 	// non-interactively (Tor-if-confirmed, else refuse) rather than blindly
 	// configuring a dead 9050. An empty result means "use the plain Tor default"
-	// (chooseEndpointForAdd never returns "" without an error).
+	// (chooseEndpointInteractive never returns "" without an error).
 	endpointArg := cmd.Endpoint
 	if endpointArg == "" {
-		chosen, cerr := chooseEndpointForAdd(cmd.Account)
+		chosen, cerr := chooseEndpointInteractive(cmd.Account, "add")
 		if cerr != nil {
 			errorf("add: %v", cerr)
 			return 1
@@ -741,16 +741,33 @@ var (
 // default-DROP never absent) BEFORE restarting the shim, so egress is
 // dropped-or-forced throughout. It runs as root (nft/systemctl).
 func runUpdate(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
-	if cmd.Endpoint == "" {
-		errorf("%s: --endpoint is required (the new socks5h endpoint to point the account at)", cmd.Verb)
-		return 2
-	}
+	// Read the persisted config FIRST (the account must already be provisioned +
+	// forced), so a bare `update` on a non-existent account fails with that, not a
+	// confusing endpoint prompt.
 	cfg, err := accountconfig.DefaultStore().Read(cmd.Account)
 	if err != nil {
 		errorf("%s: %s is not provisioned/forced (run `anonctl add %s` first): %v", cmd.Verb, cmd.Account, accountArg(cmd.Account), err)
 		return 1
 	}
-	ep, err := resolveEndpoint(cmd.Endpoint)
+	// Resolve the new endpoint. With --endpoint, use it as typed. WITHOUT it, scan the
+	// local socks5h ports and PROMPT (interactive), exactly like `add`, so a bare
+	// `update` is usable to re-point an account without hand-typing the URL. Kept
+	// fail-closed non-interactively: with no TTY and no --endpoint the chooser refuses
+	// (rather than silently pick), so scripts must still name the endpoint.
+	endpointArg := cmd.Endpoint
+	if endpointArg == "" {
+		if !stdinIsTTY() {
+			errorf("%s: --endpoint is required non-interactively (the new socks5h endpoint to point the account at); run `anonctl %s %s` on a terminal to scan and choose", cmd.Verb, cmd.Verb, accountArg(cmd.Account))
+			return 2
+		}
+		chosen, cerr := chooseEndpointInteractive(cmd.Account, cmd.Verb)
+		if cerr != nil {
+			errorf("%s: %v", cmd.Verb, cerr)
+			return 1
+		}
+		endpointArg = chosen.URL()
+	}
+	ep, err := resolveEndpoint(endpointArg)
 	if err != nil {
 		errorf("%s: %v", cmd.Verb, err)
 		return 1
@@ -857,13 +874,15 @@ func peruserOwners() (map[string]string, error) {
 	return owners, nil
 }
 
-// chooseEndpointForAdd is the no-`--endpoint` resolution: scan the local ports,
-// decorate the offers with the default (confirmed Tor) selection and the
-// in-use-by-another-account annotation, then either PROMPT (interactive) or pick
-// the fail-closed non-interactive outcome (Tor-if-confirmed, else refuse). The
-// returned endpoint still flows through claimEndpoint before any mutation (the
-// annotation is advisory; the Claim is the enforcement).
-func chooseEndpointForAdd(account string) (endpoint.Endpoint, error) {
+// chooseEndpointInteractive is the no-`--endpoint` resolution shared by `add` and
+// `update`/`reconfigure`: scan the local ports, decorate the offers with the default
+// (confirmed Tor) selection and the in-use-by-another-account annotation, then either
+// PROMPT (interactive) or pick the fail-closed non-interactive outcome
+// (Tor-if-confirmed, else refuse). The returned endpoint still flows through
+// claimEndpoint before any mutation (the annotation is advisory; the Claim is the
+// enforcement). verb names the caller so the non-interactive refusal points at the
+// right command to re-run interactively.
+func chooseEndpointInteractive(account, verb string) (endpoint.Endpoint, error) {
 	owners, err := peruserOwners()
 	if err != nil {
 		return endpoint.Endpoint{}, err
@@ -874,7 +893,7 @@ func chooseEndpointForAdd(account string) (endpoint.Endpoint, error) {
 	if !stdinIsTTY() {
 		chosen, cerr := endpoint.ChooseNonInteractive(offers)
 		if cerr != nil {
-			return endpoint.Endpoint{}, fmt.Errorf("%w (or run `anonctl add` interactively to choose)", cerr)
+			return endpoint.Endpoint{}, fmt.Errorf("%w (or run `anonctl %s` interactively to choose)", cerr, verb)
 		}
 		return chosen, nil
 	}
@@ -1104,8 +1123,10 @@ const usage = `usage:
                                      is the separate mandatory-anonctl-gated-login idea. Run from your NORMAL
                                      (sudo-capable) account: inside an anon session use cannot re-elevate
                                      (anon has no sudo), so switching accounts means exit first, then re-run.
-  anonctl update|reconfigure --endpoint <socks5h://host:port> [--allow-direct <IP|CIDR[:port]>]... [<name>]
-                                     change the account's endpoint and re-apply fail-closed (no leak window) (root)
+  anonctl update|reconfigure [--endpoint <socks5h://host:port>] [--allow-direct <IP|CIDR[:port]>]... [<name>]
+                                     change the account's endpoint and re-apply fail-closed (no leak window) (root).
+                                     With no --endpoint on a terminal it scans local socks5h ports and prompts
+                                     (like add); non-interactively --endpoint is required.
                                      --allow-direct here REPLACES the account's LAN holes (omit to keep them)
   anonctl --version | version       print the anonctl version
 

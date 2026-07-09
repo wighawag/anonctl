@@ -55,15 +55,18 @@ func TestNoArgsExit(t *testing.T) {
 	}
 }
 
-// update/reconfigure are now IMPLEMENTED (persistence task): they change an
-// account's endpoint and re-apply fail-closed. A bare `update` (no --endpoint) is a
-// usage error (exit 2, the required flag is missing), NOT the old not-implemented
-// stub (exit 3): the verb is implemented, so it must never exit 3.
-func TestUpdateRequiresEndpoint(t *testing.T) {
+// update/reconfigure are IMPLEMENTED (persistence task): they change an account's
+// endpoint and re-apply fail-closed. A bare `update` (no --endpoint) now scans+prompts
+// on a TTY; NON-interactively (as the test runs, stdin is not a terminal) it is a
+// clean error, never a success and never the old not-implemented stub (exit 3). The
+// exact non-zero code depends on which precondition fails first in the test env (the
+// account is not provisioned there, so config-read errors), so we assert the STABLE
+// contract: non-zero, and specifically not 0 and not 3.
+func TestUpdateBareIsAnErrorNotAStub(t *testing.T) {
 	for _, v := range []string{"update", "reconfigure"} {
 		code := run([]string{v})
-		if code != 2 {
-			t.Errorf("run(%q) = %d, want 2 (missing required --endpoint)", v, code)
+		if code == 0 {
+			t.Errorf("run(%q) = 0, want non-zero (bare, non-interactive, no --endpoint must not succeed)", v)
 		}
 		if code == 3 {
 			t.Errorf("run(%q) = 3 (not-implemented stub); the verb must be implemented", v)
