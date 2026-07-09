@@ -128,6 +128,12 @@ var (
 	rmForcingRemove = forcing.Remove
 	// rmProvisionRm userdels the login + shim accounts (only under --purge-account).
 	rmProvisionRm = provision.Rm
+	// rmMarkerStore is the marker Store runRm removes the stale claim through. It is
+	// a package var (like the seams above) so the unit tests point it at a scratch
+	// t.TempDir() instead of the real `/etc/anonctl` (the shared-write isolation
+	// discipline the marker's own tests use via Store.BaseDir). Production wires the
+	// real DefaultStore (`/etc/anonctl`).
+	rmMarkerStore = marker.DefaultStore()
 )
 
 // runRm tears an account's forcing down and, only under --purge-account, deletes
@@ -169,7 +175,7 @@ func runRm(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	}
 	// 3. Remove the marker (idempotent: a missing marker is a clean no-op), so a
 	// torn-down account never leaves a stale "already forced" claim behind.
-	if err := marker.DefaultStore().Remove(cmd.Account); err != nil {
+	if err := rmMarkerStore.Remove(cmd.Account); err != nil {
 		fail("removing marker", err)
 	}
 
