@@ -3,6 +3,8 @@ package nftables
 import (
 	"fmt"
 	"strings"
+
+	"github.com/wighawag/anonctl/internal/lanexempt"
 )
 
 // The BASELINE default-deny is the security INVERSION at the heart of the boot
@@ -52,7 +54,21 @@ func BaselineTableName(account string) string {
 // The emitted table is self-contained and idempotent: create-if-absent then DELETE
 // then define fresh, so a re-load cleanly replaces ONLY this account's baseline
 // table and never touches the forcing table or any other table on the host.
-func GenerateBaseline(account string, anonUID int) (string, error) {
+//
+// exemptions are the SAME narrow LAN exemptions the forcing table opens (story 25).
+// The baseline must RETURN them, exactly as it returns loopback, BEFORE its broad
+// non-loopback drop: an exempted destination is deliberately NOT redirected into the
+// shim (forcing's nat chain `return`s it), so it reaches this baseline chain still
+// carrying its real LAN daddr. Without a matching baseline `return`, the baseline's
+// `ip daddr != 127.0.0.0/8 drop` (a TERMINAL verdict, and the baseline shares the
+// output/filter hook with the forcing chain) KILLS the exempted flow before the
+// forcing chain's exemption `accept` (non-terminal) can take effect: the split hole
+// is generated correctly yet never completes. Returning the exemptions here hands
+// them on to the forcing table's `accept`, so the direct LAN hole actually works,
+// and it is consistent with the exemption's contract (a private-only, guardrail-
+// restricted destination that is reachable DIRECTLY regardless of the anonymizer's
+// state, since it is explicitly carved out of the forced path).
+func GenerateBaseline(account string, anonUID int, exemptions []lanexempt.Exempt) (string, error) {
 	if strings.TrimSpace(account) == "" {
 		return "", fmt.Errorf("nftables: empty account for baseline")
 	}
@@ -87,6 +103,15 @@ func GenerateBaseline(account string, anonUID int) (string, error) {
 	// no such loopback traffic, so this simply does not match the real egress below.
 	w("        meta skuid %d ip daddr 127.0.0.0/8 return", anonUID)
 	w("        meta skuid %d ip6 daddr ::1 return", anonUID)
+	// LAN exemptions: RETURN each exempted destination BEFORE the broad drop, exactly
+	// as loopback is returned, so the forcing chain's exemption `accept` governs it
+	// (the baseline's terminal drop would otherwise kill the un-redirected LAN flow).
+	// The match is exemptMatch (SHARED with the forcing return+accept) so all three
+	// target byte-identical traffic and can never diverge.
+	for _, e := range exemptions {
+		w("        # LAN exemption (direct, not forced): %s", e.Raw)
+		w("        meta skuid %d %s return", anonUID, exemptMatch(e))
+	}
 	// The resting-state DROP: every NON-loopback destination for the anon UID (v4
 	// AND v6) is dropped. This is the whole point: un-forced = dropped.
 	w("        meta skuid %d ip daddr != 127.0.0.0/8 drop", anonUID)

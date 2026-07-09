@@ -85,6 +85,28 @@ func TestWriteAccountPersistsEnvAndRuleFile(t *testing.T) {
 	}
 }
 
+// TestWriteAccountBaselineCarriesExemptionReturn proves WriteAccount threads the
+// account's persisted exemptions into the baseline file: the baseline must RETURN an
+// exempted destination (so the forcing accept can complete the direct hole), not
+// just drop all non-loopback egress. Without this, the persisted baseline loaded at
+// boot would drop the split-tunnel hole even though the forcing table opens it.
+func TestWriteAccountBaselineCarriesExemptionReturn(t *testing.T) {
+	s := scratchStore(t)
+	c := sampleConfig()
+	c.Exemptions = []string{"192.168.1.150:8080"}
+	if err := s.WriteAccount(c, "table inet anonctl_anon {}\n"); err != nil {
+		t.Fatalf("WriteAccount: %v", err)
+	}
+	baseline, err := os.ReadFile(filepath.Join(s.RulesDir, "anon.baseline.nft"))
+	if err != nil {
+		t.Fatalf("baseline rule file not written: %v", err)
+	}
+	want := "meta skuid 30034 ip daddr 192.168.1.150 tcp dport 8080 return"
+	if !strings.Contains(string(baseline), want) {
+		t.Errorf("persisted baseline must RETURN the exempted destination; missing %q:\n%s", want, string(baseline))
+	}
+}
+
 func TestHasForcedAccountsTracksRuleFiles(t *testing.T) {
 	s := scratchStore(t)
 	// No rules dir yet => no forced accounts (a clean negative, never an error). This

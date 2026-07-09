@@ -3,6 +3,8 @@ package nftables
 import (
 	"context"
 	"fmt"
+
+	"github.com/wighawag/anonctl/internal/lanexempt"
 )
 
 // Runner abstracts the `nft` shell-out so Apply/Delete are unit-testable without
@@ -38,9 +40,11 @@ func Apply(ctx context.Context, r Runner, p Params) error {
 // moment forcing is being installed: there is no window where the account can act
 // with neither the baseline nor the forcing present. The load is idempotent (the
 // baseline table is create-if-absent, deleted, then defined fresh) and touches only
-// the baseline table.
-func ApplyBaseline(ctx context.Context, r Runner, account string, anonUID int) error {
-	ruleset, err := GenerateBaseline(account, anonUID)
+// the baseline table. The exemptions are threaded through so the baseline RETURNs
+// each exempted (un-redirected) LAN destination before its broad drop, letting the
+// forcing chain's exemption accept actually complete the direct hole.
+func ApplyBaseline(ctx context.Context, r Runner, account string, anonUID int, exemptions []lanexempt.Exempt) error {
+	ruleset, err := GenerateBaseline(account, anonUID, exemptions)
 	if err != nil {
 		return err
 	}

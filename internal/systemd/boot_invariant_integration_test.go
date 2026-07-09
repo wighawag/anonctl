@@ -101,7 +101,7 @@ func TestBootInvariantAnonUIDHasNoDirectEgressBeforeShim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate persisted ruleset: %v", err)
 	}
-	baseline, err := nftables.GenerateBaseline(cfg.Account, cfg.AnonUID)
+	baseline, err := nftables.GenerateBaseline(cfg.Account, cfg.AnonUID, nil)
 	if err != nil {
 		t.Fatalf("generate persisted baseline: %v", err)
 	}

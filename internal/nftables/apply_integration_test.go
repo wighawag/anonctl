@@ -216,6 +216,27 @@ func TestRealApplyWithLANExemptionStaysTight(t *testing.T) {
 		t.Errorf("exemption widened to the whole /24 (should be the exact host):\n%s", listed)
 	}
 
+	// (4) The BASELINE must RETURN the same exempted destination (the split-tunnel fix):
+	// the exemption is deliberately NOT redirected, so it reaches the baseline chain
+	// with its real LAN daddr; without a baseline return, the baseline's terminal
+	// non-loopback drop kills the direct hole before the forcing accept completes it
+	// (the live symptom: the anon UID timed out on the EXEMPTED host while reaching
+	// non-exempt ones). Load the baseline WITH the exemption and assert the return is
+	// present and precedes the broad drop.
+	baselineTable := nftables.BaselineTableName(account)
+	t.Cleanup(func() { _, _, _ = r.Run(ctx, "delete table inet "+baselineTable, "nft", "-f", "-") })
+	if err := nftables.ApplyBaseline(ctx, r, account, p.AnonUID, []lanexempt.Exempt{exempt}); err != nil {
+		t.Fatalf("ApplyBaseline with exemption on a real host: %v", err)
+	}
+	listedBaseline := listTable(t, r, baselineTable)
+	exemptReturn := "meta skuid 424244 ip daddr 192.168.1.150 tcp dport 8080 return"
+	if !strings.Contains(listedBaseline, exemptReturn) {
+		t.Errorf("baseline must RETURN the exempted destination so the forcing accept can complete it; missing %q:\n%s", exemptReturn, listedBaseline)
+	}
+	if strings.Index(listedBaseline, exemptReturn) > strings.Index(listedBaseline, "ip daddr != 127.0.0.0/8 drop") {
+		t.Errorf("the baseline exemption return must precede the broad non-loopback drop:\n%s", listedBaseline)
+	}
+
 	// Idempotent re-Apply, then Delete only the account table; the sentinel survives.
 	if err := nftables.Apply(ctx, r, p); err != nil {
 		t.Fatalf("re-Apply with exemption (idempotency): %v", err)

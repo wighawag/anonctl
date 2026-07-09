@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/wighawag/anonctl/internal/accountconfig"
+	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anonctl/internal/nftables"
 )
 
@@ -136,7 +137,20 @@ func (s Store) WriteAccount(c accountconfig.Config, ruleset string) error {
 	if err := validAccount(c.Account); err != nil {
 		return err
 	}
-	baseline, err := nftables.GenerateBaseline(c.Account, c.AnonUID)
+	// Parse the account's persisted raw exemptions so the baseline RETURNs them (the
+	// forcing chain accepts the same destinations; the baseline must not drop the
+	// un-redirected LAN flow before that accept). A raw value that no longer parses is
+	// skipped (it was validated at config time; a corrupt record must not fail the
+	// persist), mirroring verify's tolerant re-parse.
+	baselineExempt := make([]lanexempt.Exempt, 0, len(c.Exemptions))
+	for _, raw := range c.Exemptions {
+		e, perr := lanexempt.Parse(raw)
+		if perr != nil {
+			continue
+		}
+		baselineExempt = append(baselineExempt, e)
+	}
+	baseline, err := nftables.GenerateBaseline(c.Account, c.AnonUID, baselineExempt)
 	if err != nil {
 		return fmt.Errorf("systemd: generate baseline default-deny: %w", err)
 	}

@@ -111,7 +111,7 @@ func TestRealRmDisablesShimBeforeUserdelLeavesNoResidue(t *testing.T) {
 	baselineTable := nftables.BaselineTableName(account)
 	const sentinel = "anonctl_rmteardown_sentinel"
 	mustNft(t, ctx, "add table inet "+sentinel)
-	if err := nftables.ApplyBaseline(ctx, nftExecRunner{}, account, atoiOr(st.UID, 0)); err != nil {
+	if err := nftables.ApplyBaseline(ctx, nftExecRunner{}, account, atoiOr(st.UID, 0), nil); err != nil {
 		t.Fatalf("apply baseline: %v", err)
 	}
 	if err := nftables.Apply(ctx, nftExecRunner{}, nftables.Params{

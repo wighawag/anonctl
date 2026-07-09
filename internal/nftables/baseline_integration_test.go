@@ -66,7 +66,7 @@ func TestBaselineDropsWhenForcingAbsent(t *testing.T) {
 	// resting state (and the exact state at boot before forcing, or after the forcing
 	// table is flushed). The anon UID's direct dial to a PUBLIC address must be
 	// DROPPED: a REACHED here would be a real external leak of the host's IP.
-	if err := nftables.ApplyBaseline(ctx, r, account, anonUID); err != nil {
+	if err := nftables.ApplyBaseline(ctx, r, account, anonUID, nil); err != nil {
 		t.Fatalf("ApplyBaseline: %v", err)
 	}
 	if !tableExists(t, r, baselineTable) {

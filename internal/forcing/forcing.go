@@ -87,7 +87,7 @@ func Install(ctx context.Context, d Deps, c accountconfig.Config, exemptions []l
 	// Apply the standing BASELINE default-deny FIRST, so the anon UID's resting state
 	// is DROP before either the forcing rules or the shim exist: there is no window
 	// where the account can act with neither present. Forcing then layers on top.
-	if err := nftables.ApplyBaseline(ctx, d.NftRunner, c.Account, c.AnonUID); err != nil {
+	if err := nftables.ApplyBaseline(ctx, d.NftRunner, c.Account, c.AnonUID, exemptions); err != nil {
 		return fmt.Errorf("forcing: apply baseline default-deny: %w", err)
 	}
 	if err := applyRuleset(ctx, d.NftRunner, c, exemptions); err != nil {
@@ -136,6 +136,14 @@ func Reconfigure(ctx context.Context, d Deps, c accountconfig.Config, exemptions
 	// Re-apply the rules FIRST (atomic table replace: the default-DROP is never
 	// gone), so the new endpoint's closure (b) is in force before the shim is
 	// pointed at it. Persist the new rule file so a reboot re-applies the new state.
+	// Re-apply the BASELINE too, so a changed exemption set (an `update --allow-direct`)
+	// updates the LIVE baseline's exemption RETURNs, not just the persisted file: the
+	// baseline must RETURN the same exempted destinations the forcing chain accepts,
+	// or the direct hole is dropped by the stale baseline. It stays a scoped, atomic
+	// replace of only the baseline table, so the resting deny never lapses.
+	if err := nftables.ApplyBaseline(ctx, d.NftRunner, c.Account, c.AnonUID, exemptions); err != nil {
+		return fmt.Errorf("forcing: re-apply baseline default-deny: %w", err)
+	}
 	if err := applyRuleset(ctx, d.NftRunner, c, exemptions); err != nil {
 		return err
 	}

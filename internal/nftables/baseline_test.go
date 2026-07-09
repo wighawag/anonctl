@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anonctl/internal/nftables"
 )
 
@@ -17,7 +18,7 @@ import (
 // GENERATION; the drop/boot behaviour is proven in the integration test.
 
 func TestGenerateBaselineIsItsOwnInetTable(t *testing.T) {
-	out, err := nftables.GenerateBaseline("anon", 30034)
+	out, err := nftables.GenerateBaseline("anon", 30034, nil)
 	if err != nil {
 		t.Fatalf("GenerateBaseline: %v", err)
 	}
@@ -41,7 +42,7 @@ func TestGenerateBaselineIsItsOwnInetTable(t *testing.T) {
 }
 
 func TestGenerateBaselineDropsAnonDirectEgress(t *testing.T) {
-	out, err := nftables.GenerateBaseline("anon", 30034)
+	out, err := nftables.GenerateBaseline("anon", 30034, nil)
 	if err != nil {
 		t.Fatalf("GenerateBaseline: %v", err)
 	}
@@ -63,7 +64,7 @@ func TestGenerateBaselineDropsAnonDirectEgress(t *testing.T) {
 }
 
 func TestGenerateBaselineLoopbackReturnPrecedesDrop(t *testing.T) {
-	out, err := nftables.GenerateBaseline("anon", 30034)
+	out, err := nftables.GenerateBaseline("anon", 30034, nil)
 	if err != nil {
 		t.Fatalf("GenerateBaseline: %v", err)
 	}
@@ -79,8 +80,57 @@ func TestGenerateBaselineLoopbackReturnPrecedesDrop(t *testing.T) {
 	}
 }
 
+// TestGenerateBaselineReturnsExemptionsBeforeDrop is the regression for the broken
+// split-tunnel: an exempted LAN destination is deliberately NOT redirected into the
+// shim (forcing's nat chain returns it), so it reaches the baseline chain still
+// carrying its real LAN daddr. The baseline MUST RETURN it (exactly as it returns
+// loopback) BEFORE its broad `ip daddr != 127.0.0.0/8 drop`, or that terminal drop
+// kills the flow before the forcing chain's exemption accept can complete it. Live,
+// this manifested as: the anon UID reached non-exempt LAN hosts (redirected -> shim)
+// but TIMED OUT on the one exempted host (dropped by the stale baseline).
+func TestGenerateBaselineReturnsExemptionsBeforeDrop(t *testing.T) {
+	e, err := lanexempt.Parse("192.168.1.150:8080")
+	if err != nil {
+		t.Fatalf("lanexempt.Parse: %v", err)
+	}
+	out, err := nftables.GenerateBaseline("anon", 30034, []lanexempt.Exempt{e})
+	if err != nil {
+		t.Fatalf("GenerateBaseline: %v", err)
+	}
+	// The exempted destination is RETURNED for the anon UID, matching the exact same
+	// clause the forcing table's return+accept use (ip daddr 192.168.1.150 tcp dport 8080).
+	returnRule := "meta skuid 30034 ip daddr 192.168.1.150 tcp dport 8080 return"
+	if !strings.Contains(out, returnRule) {
+		t.Fatalf("baseline must RETURN the exempted destination so the forcing accept can complete it; missing %q:\n%s", returnRule, out)
+	}
+	// It must PRECEDE the broad non-loopback drop, else the terminal drop kills it first.
+	if strings.Index(out, returnRule) > strings.Index(out, "ip daddr != 127.0.0.0/8 drop") {
+		t.Errorf("the exemption return must precede the broad non-loopback drop; got:\n%s", out)
+	}
+}
+
+// TestGenerateBaselineNoExemptionsIsByteIdenticalToBefore proves the exemption
+// threading is inert when there are none: an empty/nil exemption set emits NO extra
+// rule, so a non-exempt account's baseline is unchanged (the hole is strictly opt-in).
+func TestGenerateBaselineNoExemptionsIsByteIdenticalToBefore(t *testing.T) {
+	withNil, err := nftables.GenerateBaseline("anon", 30034, nil)
+	if err != nil {
+		t.Fatalf("GenerateBaseline(nil): %v", err)
+	}
+	withEmpty, err := nftables.GenerateBaseline("anon", 30034, []lanexempt.Exempt{})
+	if err != nil {
+		t.Fatalf("GenerateBaseline(empty): %v", err)
+	}
+	if withNil != withEmpty {
+		t.Errorf("nil and empty exemptions must produce identical baseline text")
+	}
+	if strings.Contains(withNil, "LAN exemption") {
+		t.Errorf("a baseline with no exemptions must emit no exemption rule:\n%s", withNil)
+	}
+}
+
 func TestGenerateBaselineGovernsOnlyTheAnonUID(t *testing.T) {
-	out, err := nftables.GenerateBaseline("anon", 30034)
+	out, err := nftables.GenerateBaseline("anon", 30034, nil)
 	if err != nil {
 		t.Fatalf("GenerateBaseline: %v", err)
 	}
@@ -98,7 +148,7 @@ func TestGenerateBaselineGovernsOnlyTheAnonUID(t *testing.T) {
 }
 
 func TestGenerateBaselineParameterises(t *testing.T) {
-	out, err := nftables.GenerateBaseline("work", 41000)
+	out, err := nftables.GenerateBaseline("work", 41000, nil)
 	if err != nil {
 		t.Fatalf("GenerateBaseline: %v", err)
 	}
@@ -119,13 +169,13 @@ func TestGenerateBaselineTableName(t *testing.T) {
 }
 
 func TestGenerateBaselineRejectsBadParams(t *testing.T) {
-	if _, err := nftables.GenerateBaseline("", 30034); err == nil {
+	if _, err := nftables.GenerateBaseline("", 30034, nil); err == nil {
 		t.Errorf("expected GenerateBaseline to reject an empty account")
 	}
-	if _, err := nftables.GenerateBaseline("anon", 0); err == nil {
+	if _, err := nftables.GenerateBaseline("anon", 0, nil); err == nil {
 		t.Errorf("expected GenerateBaseline to reject a zero anon UID")
 	}
-	if _, err := nftables.GenerateBaseline("anon", -1); err == nil {
+	if _, err := nftables.GenerateBaseline("anon", -1, nil); err == nil {
 		t.Errorf("expected GenerateBaseline to reject a negative anon UID")
 	}
 }
