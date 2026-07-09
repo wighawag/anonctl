@@ -103,3 +103,8 @@ changelog:
 release:
   draft: false
   prerelease: auto
+  # Upload the installer as a standalone release asset, so it is served from
+  # stable release object storage (no raw.githubusercontent branch-cache lag):
+  #   curl -fsSL https://github.com/wighawag/anonctl/releases/latest/download/install.sh | sudo sh
+  extra_files:
+    - glob: ./install.sh
