@@ -3,6 +3,7 @@ package verify
 import (
 	"context"
 	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -112,6 +113,73 @@ func TestSetuidWrapperVector_UnattendedEscalationIsEscaped(t *testing.T) {
 	}
 	if v.Detail == "" {
 		t.Fatalf("an escaping vector must carry a detail line; got %+v", v)
+	}
+}
+
+// TestSudoListCommand_IsNonInteractive proves the core of this task: the sudo
+// UID-transition vector is built to run STRICTLY NON-INTERACTIVELY, so a real
+// `sudo anonctl verify` never pops a polkit/sudo password dialog from the sudo
+// vector. sudoListCommand must build `sudo -n -l -U <account>`: the `-n` is what
+// makes sudo print "a password is required" instead of prompting when listing
+// another user's privileges requires auth.
+func TestSudoListCommand_IsNonInteractive(t *testing.T) {
+	argv := sudoListCommand("anon")
+	want := []string{"sudo", "-n", "-l", "-U", "anon"}
+	if fmt.Sprint(argv) != fmt.Sprint(want) {
+		t.Fatalf("sudo vector argv = %v, want %v", argv, want)
+	}
+	if !contains(argv, "-n") {
+		t.Fatalf("the sudo vector MUST pass -n so it never prompts for interactive auth; got %v", argv)
+	}
+}
+
+// TestRunSudoList_ExecsTheNonInteractiveArgv proves runSudoList drives the exec
+// seam with the non-interactive argv (`sudo -n -l -U <account>`) and returns the
+// probe output. No real sudo runs; the seam is scripted, so the unit suite never
+// prompts.
+func TestRunSudoList_ExecsTheNonInteractiveArgv(t *testing.T) {
+	orig := runSudoListCmd
+	defer func() { runSudoListCmd = orig }()
+	var gotArgv []string
+	runSudoListCmd = func(_ context.Context, argv []string) (string, string) {
+		gotArgv = argv
+		return "", "sudo: a password is required\n"
+	}
+
+	stdout, stderr := runSudoList(context.Background(), "anon")
+	want := []string{"sudo", "-n", "-l", "-U", "anon"}
+	if fmt.Sprint(gotArgv) != fmt.Sprint(want) {
+		t.Fatalf("runSudoList exec'd %v, want %v", gotArgv, want)
+	}
+	// The auth-blocked output flows back untouched; sudoprobe.ParseOutput reads it as
+	// the honest Unknown (proven in internal/sudoprobe), never a false grant/denial.
+	if !strings.Contains(stdout+stderr, "a password is required") {
+		t.Fatalf("runSudoList must return the probe output; got stdout=%q stderr=%q", stdout, stderr)
+	}
+}
+
+// TestSudoVector_AuthBlockedIsInconclusive proves the end-to-end sudo vector
+// behaviour when the `-n` probe cannot list unattended: sudo prints "a password is
+// required", which flows through sudoprobe.ParseOutput to Unknown, which
+// sudoVectorFromVerdict maps to honestly NOT-conclusive (Inconclusive=true), NEVER
+// a false Escaped (a false alarm) nor a false conclusive not-escaped (which would
+// hide a real grant). Scripted via the exec seam; no real sudo, no prompt.
+func TestSudoVector_AuthBlockedIsInconclusive(t *testing.T) {
+	if _, err := exec.LookPath("sudo"); err != nil {
+		t.Skip("sudo not on PATH: sudoVector short-circuits before the probe")
+	}
+	orig := runSudoListCmd
+	defer func() { runSudoListCmd = orig }()
+	runSudoListCmd = func(_ context.Context, _ []string) (string, string) {
+		return "", "sudo: a password is required\n"
+	}
+
+	v := sudoVector(context.Background(), LiveParams{Account: "anon", AnonUID: 30001, ShimUID: 995})
+	if v.Escaped {
+		t.Fatalf("an auth-blocked (-n) sudo probe must NOT false-alarm as an escape; got %+v", v)
+	}
+	if !v.Inconclusive {
+		t.Fatalf("an auth-blocked (-n) sudo probe must be honestly NOT-conclusive; got %+v", v)
 	}
 }
 

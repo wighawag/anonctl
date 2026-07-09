@@ -1,0 +1,3 @@
+# provision `sudoRights` runs `sudo -l -U` without `-n` (same prompt vector as verify)
+
+2026-07-09: While fixing the verify sudo vector (`sudo -n -l -U`, task sudo-vector-must-be-noninteractive), noticed `internal/provision/provision.go` `sudoRights` (used by the `status`/provision side) still runs `sudo -l -U <account>` WITHOUT `-n`. On a desktop, listing another user's sudo privileges can trigger a polkit/sudo prompt exactly like the verify vector did. Out of this task's scope (verify probes), but `anonctl status` may still pop a GNOME auth dialog. Likely fix: add `-n` there too (mirror sudoListCommand).
