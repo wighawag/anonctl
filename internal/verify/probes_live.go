@@ -114,6 +114,21 @@ func nftRun(ctx context.Context, stdin, name string, args ...string) (string, st
 	return strings.TrimSpace(out.String()), strings.TrimSpace(errb.String()), err
 }
 
+// INVARIANT (load-bearing UX + correctness contract): NO `anonctl verify` probe in
+// this file may trigger an interactive password/polkit prompt. `verify` is a
+// leak-test the operator runs unattended (`sudo anonctl verify`); a probe that pops
+// a GNOME/CLI auth dialog is a bug, whatever its verdict. The two prompting vectors
+// are both closed strictly non-interactively: the pkexec setuid-wrapper probe runs
+// with --disable-internal-agent AND a scrubbed env (setuidWrapperCommand, so it
+// cannot reach the session polkit agent), and the sudo vector runs `sudo -n -l -U`
+// (sudoListCommand, so sudo prints "a password is required" instead of prompting).
+// The remaining probes cannot prompt: setpriv (--reuid drops privilege, never
+// asks), the shim `-probe` binary, nft, curl, and ping are all non-interactive
+// tools invoked without any auth-eliciting flag. A future probe author MUST
+// preserve this: any new auth-gated tool has to be invoked in a mode that fails
+// unattended rather than prompting (a probe that could not run is honestly
+// not-conclusive, never a prompt).
+//
 // This file is the IMPURE live-probe machinery behind checks_live.go's
 // LiveChecks: standing up real connections AS the anon UID (setpriv), fetching the
 // forced-path exit IP through the shim relay, and gathering the dns-remote
@@ -388,8 +403,9 @@ func uidTransitionVectors(ctx context.Context, p LiveParams) []UIDTransitionVect
 
 // sudoVector probes the sudo escape: whether the anon account has ANY sudo rights
 // (a sudo'd command runs as a DIFFERENT, typically root, uid and its socket
-// escapes the `meta skuid` forcing). It runs `sudo -l -U <account>` (list the
-// account's permitted sudo commands) and decides from the OUTPUT, NOT the exit
+// escapes the `meta skuid` forcing). It runs `sudo -n -l -U <account>` (list the
+// account's permitted sudo commands, STRICTLY non-interactively so it never
+// prompts) and decides from the OUTPUT, NOT the exit
 // code: some sudo builds (observed: 1.9.16p2,
 // work/notes/findings/e2e-binary-revalidation-2.md) print the not-allowed text yet
 // exit 0 for a no-rights account, so an exit-code-only read false-alarms a sudo
@@ -409,18 +425,42 @@ func sudoVector(ctx context.Context, p LiveParams) UIDTransitionVector {
 	return sudoVectorFromVerdict(sudoprobe.ParseOutput(stdout + "\n" + stderr))
 }
 
-// runSudoList shells out to `sudo -l -U <account>` and returns its stdout+stderr
-// (the exit code is DELIBERATELY ignored: the verdict is read from the OUTPUT via
+// sudoListCommand is the PURE construction of the sudo-vector probe's argv: it
+// returns `sudo -n -l -U <account>`. The `-n` (non-interactive) is LOAD-BEARING:
+// listing ANOTHER user's sudo privileges (`-U <account>`) requires the CALLER to
+// be authorized, and on a desktop that authorization goes through a polkit/sudo
+// prompt (a GNOME password popup) BEFORE any output is produced. With `-n`, sudo
+// NEVER prompts: when auth is required it prints `sudo: a password is required`
+// and returns non-interactively (which sudoprobe.ParseOutput reads as the honest
+// Unknown, never a false grant/denial); when no auth is needed it lists the
+// privileges as before. Keeping the argv construction pure lets the unit suite
+// assert the non-interactive contract (the `-n` flag) with NO real sudo and NO
+// prompt, while the runSudoListCmd seam actually execs it.
+func sudoListCommand(account string) []string {
+	return []string{"sudo", "-n", "-l", "-U", account}
+}
+
+// runSudoListCmd is the INJECTABLE exec seam for the sudo-vector probe: it execs
+// the argv under the deadline and returns its stdout+stderr (the exit code is
+// DELIBERATELY ignored: the verdict is read from the OUTPUT via
 // sudoprobe.ParseOutput, robust to lenient builds that exit 0 for a no-rights
-// account). It is the sudoVector's ONLY sudo access; the live probe needs a real
-// sudo on the host at runtime.
-func runSudoList(ctx context.Context, account string) (stdout, stderr string) {
-	cmd := exec.CommandContext(ctx, "sudo", "-l", "-U", account)
+// account). It is a package var so the unit suite can assert the argv (and script
+// the output) WITHOUT a real sudo or any prompt; production points it at the real
+// exec. The live probe needs a real sudo on the host at runtime.
+var runSudoListCmd = func(ctx context.Context, argv []string) (stdout, stderr string) {
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	var out, errb strings.Builder
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
 	_ = cmd.Run()
 	return out.String(), errb.String()
+}
+
+// runSudoList runs the sudo-vector probe strictly NON-INTERACTIVELY (`sudo -n -l
+// -U <account>`, see sudoListCommand) and returns its stdout+stderr. It is the
+// sudoVector's ONLY sudo access.
+func runSudoList(ctx context.Context, account string) (stdout, stderr string) {
+	return runSudoListCmd(ctx, sudoListCommand(account))
 }
 
 // pkexecScrubbedEnvVars are the session-agent handles the pkexec probe DROPS so it
