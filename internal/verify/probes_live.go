@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -347,11 +348,15 @@ func nonExemptLANOf(exempt string) string {
 // another uid" network-adjacent wrappers the audit
 // (work/notes/findings/uid-transition-escape-surface.md) tested by hand and found
 // do NOT hand the anon account a non-anon-owned egress on this class of host:
-// pkexec (exits non-zero with no polkit agent in the realistic no-seat case) and
+// pkexec (exits non-zero unattended, with no reachable polkit agent) and
 // mullvad-exclude (runs the target as the CALLER, so the socket stays anon-owned).
 // The no-uid-transition-egress probe re-asserts that empirically: it runs each
 // present wrapper AS the anon UID to execute `id -u` and reads whether the
 // resulting euid TRANSITIONED to a uid that is neither the anon nor the shim uid.
+// The pkexec run is forced STRICTLY NON-INTERACTIVE (--disable-internal-agent +
+// a scrubbed env, see setuidWrapperCommand) so it reproduces the audited
+// unattended/no-agent case and never prompts, rather than depending on the
+// operator happening to have no seat.
 // It is a documented list, NOT an invented one; extend it only from a fresh audit.
 //
 // ping and pppd from the finding are deliberately NOT in this run-a-command list:
@@ -418,31 +423,113 @@ func runSudoList(ctx context.Context, account string) (stdout, stderr string) {
 	return out.String(), errb.String()
 }
 
+// pkexecScrubbedEnvVars are the session-agent handles the pkexec probe DROPS so it
+// runs strictly non-interactively: with none of these in the env pkexec cannot
+// reach the session polkit authentication agent, so unattended it fails "Request
+// dismissed" (or "No authentication agent found") INSTEAD of popping a GNOME/CLI
+// password dialog. This is the fix for the v0.1.2 bug where the probe inherited the
+// operator's session and false-flagged an escape iff a HUMAN authenticated the
+// prompt (measuring the operator's interactive auth, not the account's capability).
+// A permissive/NOPASSWD polkit rule that escalates with NO auth is unaffected: it
+// still escalates unattended and is still caught as a real escape.
+var pkexecScrubbedEnvVars = []string{
+	"DBUS_SESSION_BUS_ADDRESS",
+	"XDG_RUNTIME_DIR",
+	"DISPLAY",
+	"WAYLAND_DISPLAY",
+}
+
+// setuidWrapperCommand is the PURE construction of one setuid-wrapper UID-transition
+// probe: it returns the argv to exec (always `setpriv --reuid <anon> --clear-groups
+// <wrapper> [flags] id -u`) and the env to run it in. For pkexec it appends
+// --disable-internal-agent AND returns a SCRUBBED env (ambient env minus
+// pkexecScrubbedEnvVars), the two-part guarantee that the probe cannot reach an
+// authentication agent and therefore never prompts. For every other wrapper it
+// returns nil for env, meaning "inherit the ambient env unchanged" (those wrappers
+// run the target as the caller or fail without prompting, so no scrubbing applies).
+//
+// Keeping the argv+env construction pure (and passing the ambient env in) is what
+// lets the unit suite assert the non-interactive contract - the --disable-internal-agent
+// flag and the scrubbed env - with NO real pkexec and NO prompt, while the live
+// runSetuidWrapper seam actually execs it. This is the seam the task's acceptance
+// tests bind to.
+func setuidWrapperCommand(uid int, bin string, ambientEnv []string) (argv []string, env []string) {
+	argv = []string{"setpriv", "--reuid", strconv.Itoa(uid), "--clear-groups", bin}
+	if bin == "pkexec" {
+		// pkexec-only: refuse the internal textual agent, and run with the session
+		// agent handles removed, so it is strictly non-interactive.
+		argv = append(argv, "--disable-internal-agent")
+		env = scrubEnv(ambientEnv, pkexecScrubbedEnvVars)
+	}
+	argv = append(argv, "id", "-u")
+	return argv, env
+}
+
+// scrubEnv returns env with every KEY=... entry whose key is in drop removed,
+// keeping the rest in order. It never mutates the input slice.
+func scrubEnv(env, drop []string) []string {
+	banned := make(map[string]bool, len(drop))
+	for _, k := range drop {
+		banned[k] = true
+	}
+	out := make([]string, 0, len(env))
+	for _, e := range env {
+		key := e
+		if i := strings.IndexByte(e, '='); i >= 0 {
+			key = e[:i]
+		}
+		if banned[key] {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// runSetuidWrapper is the INJECTABLE exec seam for the setuid-wrapper probe: it
+// execs argv (in env, or the ambient env when env is nil) under a short deadline
+// and returns the combined output. It is a package var so the unit suite can script
+// the wrapper's output (an unattended fail, a fixtured unattended escalation)
+// WITHOUT a real pkexec or any prompt; production points it at the real exec.
+var runSetuidWrapper = func(ctx context.Context, argv, env []string) string {
+	cctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, argv[0], argv[1:]...)
+	if env != nil {
+		cmd.Env = env
+	}
+	out, _ := cmd.CombinedOutput()
+	return string(out)
+}
+
 // setuidWrapperVector probes one setuid "run a command as another uid" wrapper
 // (e.g. pkexec, mullvad-exclude): it runs the wrapper AS the anon UID to execute
 // `id -u` and reads whether the reported euid TRANSITIONED to a uid that is
 // neither the anon nor the shim uid. A non-anon (and non-shim) euid means the
 // wrapper handed the account a process running as a different uid, whose sockets
 // would escape the `meta skuid` forcing (Escaped=true). A run that stays anon
-// (mullvad-exclude), that fails to authorize (pkexec with no agent -> non-zero,
-// no euid line), or that cannot run at all reads as NOT escaped (the audited safe
-// outcome). It runs under setpriv --reuid so the wrapper is invoked exactly as the
-// anon account would invoke it.
+// (mullvad-exclude), that fails to authorize (pkexec unattended -> non-zero, no
+// euid line), or that cannot run at all reads as NOT escaped (the audited safe
+// outcome).
+//
+// It is STRICTLY NON-INTERACTIVE: the command is built by setuidWrapperCommand,
+// which for pkexec passes --disable-internal-agent and a scrubbed env so pkexec
+// cannot reach an authentication agent and never prompts. So the probe measures
+// the ACCOUNT's unattended escape capability (a permissive/NOPASSWD policy that
+// escalates with no auth is still caught), NOT the operator's interactive auth
+// (the v0.1.2 false-positive is gone). It runs under setpriv --reuid so the wrapper
+// is invoked exactly as the anon account would invoke it.
 func setuidWrapperVector(ctx context.Context, p LiveParams, bin string) UIDTransitionVector {
 	v := UIDTransitionVector{Name: "setuid:" + bin}
 	if _, err := exec.LookPath("setpriv"); err != nil {
 		return v // cannot invoke as the anon UID: report checked-not-escaped (safe)
 	}
-	cctx, cancel := context.WithTimeout(ctx, 8*time.Second)
-	defer cancel()
-	// `<wrapper> id -u` under setpriv --reuid <anon>: if the wrapper transitions uid,
-	// `id -u` prints the TARGET euid; if it runs the target as the caller (or fails
-	// to authorize), it prints the anon uid or nothing.
-	cmd := exec.CommandContext(cctx, "setpriv",
-		"--reuid", strconv.Itoa(p.AnonUID), "--clear-groups",
-		bin, "id", "-u")
-	out, _ := cmd.CombinedOutput()
-	euid, ok := parseFirstUID(string(out))
+	// `<wrapper> id -u` under setpriv --reuid <anon>, built non-interactively: if the
+	// wrapper transitions uid, `id -u` prints the TARGET euid; if it runs the target
+	// as the caller (or fails to authorize unattended), it prints the anon uid or
+	// nothing.
+	argv, env := setuidWrapperCommand(p.AnonUID, bin, os.Environ())
+	euid, ok := parseFirstUID(runSetuidWrapper(ctx, argv, env))
 	if !ok {
 		return v // no euid line (the wrapper did not run the target): not an escape
 	}
