@@ -1,0 +1,3 @@
+# TestRmDisablesShimBeforeUserdel fails when /etc/anonctl exists and is not writable
+
+2026-07-09: `go test .` (root package) fails `TestRmDisablesShimBeforeUserdel` with `removing marker: remove /etc/anonctl/anon.json: permission denied`. The test drives `rm --purge-account` through a fake Runner but the marker store still points at the real `/etc/anonctl` (marker.DefaultStore), so on a host where `/etc/anonctl` exists with restrictive perms the marker-remove errors and `rm` returns exit 1. Reproduces on the base branch (HEAD) too, so it is pre-existing and unrelated to the verify/use un-gating work. The marker path in this test is not isolated to a tmp dir the way the fake Runner is.

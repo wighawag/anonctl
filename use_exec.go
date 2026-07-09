@@ -1,6 +1,3 @@
-//go:build integration
-// +build integration
-
 package main
 
 import (
@@ -16,8 +13,11 @@ import (
 	"github.com/wighawag/anonctl/internal/provision"
 )
 
-// execLoginShell (integration build) is the REAL shell drop behind `anonctl use`:
-// it resolves the account's UID / GID / login shell / home from its passwd entry
+// execLoginShell is the REAL shell drop behind `anonctl use`. It is compiled into
+// EVERY build (dropping to the account is runtime behaviour needing setpriv +
+// root, like `add`/`rm`, not a test): the previous default-build stub that refused
+// to open a shell is gone. It resolves the account's UID / GID / login shell /
+// home from its passwd entry
 // (via the Runner, the same read-only truth the rest of provisioning uses) and
 // REPLACES the anonctl process with the account's interactive login shell dropped
 // to that UID.
