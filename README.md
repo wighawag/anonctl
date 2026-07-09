@@ -64,6 +64,7 @@ sudo install -m 0755 anonctl-shim /usr/local/bin/anonctl-shim
 ```
 anonctl add    [--endpoint <socks5h://host:port>] [<name>]   provision + force an account (root)
 anonctl rm     [--purge-account] [<name>]                    remove forcing; --purge-account also deletes the account (root)
+anonctl seed-home [--from <dir>] [--force] [<name>]          copy a template dir into the account's home (root)
 anonctl list   [--json]                                      list the anon accounts on the box
 anonctl status [<name>] [--json]                             show one account's state
 anonctl verify [<name>] [--json]                             PROVE the account is anonymized (non-zero exit on failure)
@@ -81,6 +82,23 @@ sudo anonctl add --endpoint socks5h://127.0.0.1:1080 work   # a second account t
 ```
 
 The `sudo` prefix above is optional: the root-requiring verbs (`add`, `rm`, `verify`, `use`, `update`/`reconfigure`) **self-elevate**. Run a bare `anonctl verify` and it re-execs itself via `sudo` and prompts for your password **inline in the terminal** (not a GUI dialog), then runs the verb and hands back its exit code exactly. Already-root (you typed `sudo anonctl ...`) runs directly with no second prompt; the read-only verbs (`list`, `status`) and `--version` never elevate; and if `sudo` is not installed you get the plain "must be root" error, never a polkit/GUI popup.
+
+## Seeding a home and box-wide add-time defaults
+
+A fresh anon account lands with a near-empty home. `anonctl seed-home [--from <dir>] [--force] [<name>]` copies a **template directory** into an existing account's home so you can pre-populate it (dotfiles, a tool config). A per-file collision is a loud error unless `--force`, and anonctl **strips the setuid/setgid bits off every copied file**: a template must never introduce a setuid binary, because a setuid file the account can run opens a socket owned by a *different* UID (the uid-transition escape this tool's threat model calls out as its sharpest residual). Symlinks in a template are refused.
+
+Two **box-wide defaults** under `/etc/anonctl/` let a bare `anonctl add <name>` land a ready-to-use account with no flags:
+
+- **Default home is a directory-exists convention.** If `/etc/anonctl/default-home/` exists, `add` seeds every FRESH account's home from it (never overwriting; `add` is create-only and has no `--force`). Populate it with a plain `sudo cp -r <src>/. /etc/anonctl/default-home/`.
+- **Default LAN exemptions** live in `/etc/anonctl/defaults.json` (`{"allowDirect":["192.168.1.50:11434"]}`, root-owned). `add` applies them when you pass no `--allow-direct`. A CLI flag overrides the file, and a **default exemption is validated through the same guardrail as the flag** (public / hostname / `:53` rejected loudly): a default is never a quieter path to a leak.
+
+```sh
+sudo cp -r ~/anon-home/. /etc/anonctl/default-home/          # seed template (once)
+sudo tee /etc/anonctl/defaults.json <<<'{"allowDirect":["192.168.1.50:11434"]}'   # default LAN hole (once)
+sudo anonctl add work                                        # seeded + LAN-exempted, zero flags
+```
+
+anonctl stays **generic** here: it seeds arbitrary files and punches a LAN hole, and knows nothing about any specific tool. Deriving a tool's config from the exempted endpoint (e.g. a coding agent's model settings pointed at your LAN model) is a sibling tool's job, not anonctl's. See [ADR-0006](docs/adr/0006-seed-home-and-box-wide-add-time-defaults.md).
 
 ## verify is the trust anchor
 

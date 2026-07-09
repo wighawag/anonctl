@@ -386,6 +386,14 @@ func writeLoginEnv(ctx context.Context, r Runner, account, content string) error
 	return nil
 }
 
+// AccountHome returns the account's home directory from its passwd entry through
+// the Runner (the same seam the rest of provisioning uses to read account state).
+// It is the exported entry point the `seed-home` wiring uses to locate where to
+// copy a template; it errors if the account has no resolvable home.
+func AccountHome(ctx context.Context, r Runner, account string) (string, error) {
+	return accountHome(ctx, r, account)
+}
+
 // accountHome returns the account's home directory from its passwd entry (field
 // 6). It errors if the account has no resolvable home, so writeLoginEnv never
 // writes to a wrong/empty path.

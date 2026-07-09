@@ -41,6 +41,16 @@ type Command struct {
 	// it false, so it never silently deletes a user's home.
 	PurgeAccount bool
 
+	// SeedFrom is the template directory `seed-home` copies into the account's home
+	// (`--from <dir>`). Empty means the directory-exists default
+	// `/etc/anonctl/default-home/`. Meaningful only for `seed-home`.
+	SeedFrom string
+
+	// Force lets `seed-home` OVERWRITE a file that already exists in the home
+	// (`--force`). Without it, a collision is a loud error. It lives ONLY on
+	// `seed-home`: `add` is create-only and never overwrites, so it has no --force.
+	Force bool
+
 	// Endpoint is the socks5h endpoint the account is forced through, as typed by
 	// the operator (`--endpoint socks5h://host:port` or a bare `host:port`). It is
 	// the RAW value; internal/endpoint parses + classifies it. Empty means the
@@ -70,6 +80,7 @@ var verbs = map[string]bool{
 	"update":      true,
 	"reconfigure": true,
 	"use":         true,
+	"seed-home":   true,
 }
 
 // takesName reports whether a verb accepts an account name. `list` enumerates ALL
@@ -101,11 +112,17 @@ func Parse(args []string) (*Command, error) {
 	// state for the repeatable `--allow-direct` (space form).
 	var wantEndpointValue bool
 	var wantExemptValue bool
+	// wantSeedFromValue is the pending state for `--from <dir>` (space form) on
+	// `seed-home`, mirroring the endpoint/exempt pending states.
+	var wantSeedFromValue bool
 	for _, a := range args[1:] {
 		switch {
 		case wantEndpointValue:
 			cmd.Endpoint = a
 			wantEndpointValue = false
+		case wantSeedFromValue:
+			cmd.SeedFrom = a
+			wantSeedFromValue = false
 		case wantExemptValue:
 			if err := cmd.addExemption(verb, a); err != nil {
 				return nil, err
@@ -115,6 +132,12 @@ func Parse(args []string) (*Command, error) {
 			cmd.JSON = true
 		case a == "--purge-account":
 			cmd.PurgeAccount = true
+		case a == "--force":
+			cmd.Force = true
+		case a == "--from":
+			wantSeedFromValue = true
+		case strings.HasPrefix(a, "--from="):
+			cmd.SeedFrom = strings.TrimPrefix(a, "--from=")
 		case a == "--endpoint":
 			wantEndpointValue = true
 		case strings.HasPrefix(a, "--endpoint="):
@@ -136,6 +159,9 @@ func Parse(args []string) (*Command, error) {
 	}
 	if wantExemptValue {
 		return nil, fmt.Errorf("%s: --allow-direct needs a value (an RFC1918/link-local IP or CIDR, optionally :port)", verb)
+	}
+	if wantSeedFromValue {
+		return nil, fmt.Errorf("%s: --from needs a value (the template directory to seed the home from)", verb)
 	}
 
 	if !takesName(verb) {

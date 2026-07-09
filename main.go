@@ -27,12 +27,14 @@ import (
 
 	"github.com/wighawag/anonctl/internal/accountconfig"
 	"github.com/wighawag/anonctl/internal/cli"
+	"github.com/wighawag/anonctl/internal/defaults"
 	"github.com/wighawag/anonctl/internal/endpoint"
 	"github.com/wighawag/anonctl/internal/forcing"
 	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anonctl/internal/marker"
 	"github.com/wighawag/anonctl/internal/nftables"
 	"github.com/wighawag/anonctl/internal/provision"
+	"github.com/wighawag/anonctl/internal/seedhome"
 	"github.com/wighawag/anonctl/internal/systemd"
 	"github.com/wighawag/anonctl/internal/verify"
 )
@@ -86,6 +88,8 @@ func run(args []string) int {
 		return runVerify(ctx, runner, cmd)
 	case "use":
 		return runUse(ctx, runner, cmd)
+	case "seed-home":
+		return runSeedHome(ctx, runner, cmd)
 	case "update", "reconfigure":
 		return runUpdate(ctx, runner, cmd)
 	default:
@@ -109,14 +113,39 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		return 1
 	}
 
-	// Build the at-rest config from the just-provisioned UIDs and the chosen
-	// endpoint (default Tor SocksPort when none named), then install the forcing.
-	cfg, err := buildConfig(ctx, r, cmd.Account, cmd.Endpoint, cmd.Exemptions)
+	// Resolve the effective LAN exemptions: the ones the operator named on THIS
+	// invocation when any were given, else the box-wide defaults from
+	// /etc/anonctl/defaults.json. A default exemption is re-validated through the
+	// SAME lanexempt guardrail the CLI flag uses (resolveDefaultExemptions), so a
+	// default can never be a quieter path to a leak than the flag.
+	exemptions, err := resolveAddExemptions(cmd)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "anonctl: add: %v\n", err)
 		return 1
 	}
-	if err := forcing.Install(ctx, forcingDeps(), cfg, cmd.Exemptions); err != nil {
+
+	// On FRESH creation only, seed the home from the directory-exists default
+	// /etc/anonctl/default-home/ when present (never overwriting: add is create-only,
+	// so it uses force=false). A re-add (Created=false) never re-seeds, mirroring the
+	// login-env write. Seeding failure is a real add failure (the account did not land
+	// as configured), surfaced non-zero.
+	if res.Created {
+		if n, serr := seedDefaultHome(ctx, r, cmd.Account); serr != nil {
+			fmt.Fprintf(os.Stderr, "anonctl: add: seeding home: %v\n", serr)
+			return 1
+		} else if n > 0 {
+			fmt.Printf("seeded %d file(s) into %s's home from %s\n", n, cmd.Account, defaultsStore.DefaultHomeDir())
+		}
+	}
+
+	// Build the at-rest config from the just-provisioned UIDs and the chosen
+	// endpoint (default Tor SocksPort when none named), then install the forcing.
+	cfg, err := buildConfig(ctx, r, cmd.Account, cmd.Endpoint, exemptions)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "anonctl: add: %v\n", err)
+		return 1
+	}
+	if err := forcing.Install(ctx, forcingDeps(), cfg, exemptions); err != nil {
 		fmt.Fprintf(os.Stderr, "anonctl: add: installing forcing: %v\n", err)
 		return 1
 	}
@@ -128,6 +157,107 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	}
 	fmt.Printf("note: anonctl does NOT manage the endpoint's own service; enable your endpoint (e.g. `systemctl enable --now tor.service`) so it is up at boot\n")
 	fmt.Printf("run `%s` to prove the account is anonymized\n", verifyHint(cmd.Account))
+	return 0
+}
+
+// The seed-home seams: package vars so the unit tests drive the add/seed-home
+// wiring without a real home or a real /etc read. Production wires the real
+// seedhome.Seed and the real defaults Store.
+var (
+	// seedHomeSeed copies a template dir into an account's home (chowning, stripping
+	// setuid). Tests replace it to capture the call without touching a real home.
+	seedHomeSeed = seedhome.Seed
+	// defaultsStore reads the box-wide add-time defaults (default-home presence +
+	// default exemptions). Tests point its BaseDir at a scratch dir.
+	defaultsStore = defaults.DefaultStore()
+)
+
+// seedDefaultHome seeds the account's home from the directory-exists default
+// /etc/anonctl/default-home/ when it is present, returning the number of files
+// copied (0 when there is no default-home dir: a clean no-op, not an error). It
+// resolves the account's home through provision.AccountHome and copies with
+// force=false (add never overwrites). It is used ONLY on fresh creation.
+func seedDefaultHome(ctx context.Context, r provision.Runner, account string) (int, error) {
+	if !defaultsStore.DefaultHomePresent() {
+		return 0, nil
+	}
+	home, err := provision.AccountHome(ctx, r, account)
+	if err != nil {
+		return 0, err
+	}
+	res, err := seedHomeSeed(ctx, r, defaultsStore.DefaultHomeDir(), home, account, false)
+	if err != nil {
+		return 0, err
+	}
+	return res.Copied, nil
+}
+
+// resolveAddExemptions returns the exemptions `add` should apply: the ones named on
+// THIS invocation when any were given, else the box-wide defaults from
+// defaults.json (re-validated through the same lanexempt guardrail the CLI flag
+// uses, so a default is never a quieter leak path). A missing/empty defaults file
+// yields no exemptions (the pre-feature behaviour).
+func resolveAddExemptions(cmd *cli.Command) ([]lanexempt.Exempt, error) {
+	if len(cmd.Exemptions) > 0 {
+		return cmd.Exemptions, nil
+	}
+	d, err := defaultsStore.Read()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]lanexempt.Exempt, 0, len(d.AllowDirect))
+	for _, raw := range d.AllowDirect {
+		e, perr := lanexempt.Parse(raw)
+		if perr != nil {
+			return nil, fmt.Errorf("default exemption %q in defaults.json is invalid: %w", raw, perr)
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// runSeedHome is the explicit, re-runnable home-seeding verb: it copies a template
+// directory (`--from <dir>`, else the directory-exists default
+// /etc/anonctl/default-home/) into an EXISTING account's home. A per-file collision
+// is a loud error unless `--force`. It copies as root (chown to the account), so it
+// self-elevates like the other mutating verbs. It refuses on a non-existent account
+// (it seeds a home, it does not create one).
+func runSeedHome(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
+	st, err := provision.Status(ctx, r, cmd.Account)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "anonctl: seed-home: %v\n", err)
+		return 1
+	}
+	if !st.Exists {
+		fmt.Fprintf(os.Stderr, "anonctl: seed-home: %s is not provisioned (run `anonctl add %s` first)\n", cmd.Account, accountArg(cmd.Account))
+		return 1
+	}
+
+	template := cmd.SeedFrom
+	if template == "" {
+		if !defaultsStore.DefaultHomePresent() {
+			fmt.Fprintf(os.Stderr, "anonctl: seed-home: no --from given and no default home at %s; nothing to seed\n", defaultsStore.DefaultHomeDir())
+			return 1
+		}
+		template = defaultsStore.DefaultHomeDir()
+	}
+
+	home, err := provision.AccountHome(ctx, r, cmd.Account)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "anonctl: seed-home: %v\n", err)
+		return 1
+	}
+	res, err := seedHomeSeed(ctx, r, template, home, cmd.Account, cmd.Force)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "anonctl: seed-home: %v\n", err)
+		return 1
+	}
+	if len(res.Overwrote) > 0 {
+		fmt.Printf("seeded %d file(s) into %s's home from %s (overwrote %d: %s)\n",
+			res.Copied, cmd.Account, template, len(res.Overwrote), strings.Join(res.Overwrote, ", "))
+	} else {
+		fmt.Printf("seeded %d file(s) into %s's home from %s\n", res.Copied, cmd.Account, template)
+	}
 	return 0
 }
 
@@ -700,6 +830,11 @@ const usage = `usage:
                                      RFC1918/link-local only, never :53)
   anonctl rm     [--purge-account] [<name>]
                                      remove forcing; --purge-account also deletes the account (root)
+  anonctl seed-home [--from <dir>] [--force] [<name>]
+                                     copy a template dir into the account's home (default source:
+                                     the directory-exists /etc/anonctl/default-home/); a per-file
+                                     collision errors unless --force. Setuid/setgid bits are stripped
+                                     on copy. add also seeds from default-home on fresh creation (root)
   anonctl list   [--json]           list the anon accounts that exist on the box
   anonctl status [<name>] [--json]  show one account's state (machine-readable with --json)
   anonctl verify [<name>] [--json]  prove the account is anonymized (named assertions, non-zero exit on failure)
@@ -713,6 +848,13 @@ const usage = `usage:
                                      change the account's endpoint and re-apply fail-closed (no leak window) (root)
                                      --allow-direct here REPLACES the account's LAN holes (omit to keep them)
   anonctl --version | version       print the anonctl version
+
+Box-wide add-time defaults live under ` + "`/etc/anonctl`" + `: create the directory
+` + "`/etc/anonctl/default-home/`" + ` (e.g. ` + "`sudo cp -r <src>/. /etc/anonctl/default-home/`" + `)
+and its contents seed every FRESH account's home; put default LAN exemptions in
+` + "`/etc/anonctl/defaults.json`" + ` (` + "`{\"allowDirect\":[\"192.168.1.50:11434\"]}`" + `) and a
+bare ` + "`add`" + ` applies them (a CLI ` + "`--allow-direct`" + ` overrides; a default is still
+validated, never a quieter leak path).
 
 A bare verb targets the default account ` + "`anon`" + `; ` + "`<name>`" + ` targets ` + "`anon-<name>`" + `.
 Each account gets its OWN dedicated shim service account (` + "`<account>-shim`" + `), the

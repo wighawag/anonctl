@@ -149,6 +149,44 @@ func TestRmSafetyFlag(t *testing.T) {
 	}
 }
 
+// `seed-home` parses its verb, resolves the account, and reads --from (both forms)
+// and --force. Flag order must not swallow the account name.
+func TestSeedHomeParse(t *testing.T) {
+	bare, err := cli.Parse([]string{"seed-home", "work"})
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if bare.Verb != "seed-home" || bare.Account != "anon-work" {
+		t.Errorf("verb/account = %q/%q, want seed-home/anon-work", bare.Verb, bare.Account)
+	}
+	if bare.SeedFrom != "" || bare.Force {
+		t.Errorf("bare seed-home must have empty SeedFrom and Force=false, got %q / %v", bare.SeedFrom, bare.Force)
+	}
+
+	full, err := cli.Parse([]string{"seed-home", "--from", "/tmp/tmpl", "--force", "work"})
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if full.SeedFrom != "/tmp/tmpl" || !full.Force || full.Account != "anon-work" {
+		t.Errorf("parsed = from %q force %v account %q", full.SeedFrom, full.Force, full.Account)
+	}
+
+	eq, err := cli.Parse([]string{"seed-home", "--from=/tmp/tmpl"})
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if eq.SeedFrom != "/tmp/tmpl" || eq.Account != "anon" {
+		t.Errorf("--from= form parsed = %q / %q", eq.SeedFrom, eq.Account)
+	}
+}
+
+// A dangling `--from` with no value is a loud usage error, never a silent misparse.
+func TestSeedHomeDanglingFrom(t *testing.T) {
+	if _, err := cli.Parse([]string{"seed-home", "--from"}); err == nil {
+		t.Fatal("seed-home --from with no value must error")
+	}
+}
+
 // Each anon account gets its OWN dedicated shim service account, derived by the
 // `-shim` suffix so that name resolution is pure and idempotent: `anon` ->
 // `anon-shim` (matching the validated recipe), `anon-<name>` -> `anon-<name>-shim`.
