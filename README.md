@@ -90,15 +90,93 @@ A fresh anon account lands with a near-empty home. `anonctl seed-home [--from <d
 Two **box-wide defaults** under `/etc/anonctl/` let a bare `anonctl add <name>` land a ready-to-use account with no flags:
 
 - **Default home is a directory-exists convention.** If `/etc/anonctl/default-home/` exists, `add` seeds every FRESH account's home from it (never overwriting; `add` is create-only and has no `--force`). Populate it with a plain `sudo cp -r <src>/. /etc/anonctl/default-home/`.
-- **Default LAN exemptions** live in `/etc/anonctl/defaults.json` (`{"allowDirect":["192.168.1.50:11434"]}`, root-owned). `add` applies them when you pass no `--allow-direct`. A CLI flag overrides the file, and a **default exemption is validated through the same guardrail as the flag** (public / hostname / `:53` rejected loudly): a default is never a quieter path to a leak.
+- **Default LAN exemptions** live in `/etc/anonctl/defaults.json` (`{"allowDirect":["192.168.1.150:8080"]}`, root-owned). `add` applies them when you pass no `--allow-direct`. A CLI flag overrides the file, and a **default exemption is validated through the same guardrail as the flag** (public / hostname / `:53` rejected loudly): a default is never a quieter path to a leak.
 
 ```sh
 sudo cp -r ~/anon-home/. /etc/anonctl/default-home/          # seed template (once)
-sudo tee /etc/anonctl/defaults.json <<<'{"allowDirect":["192.168.1.50:11434"]}'   # default LAN hole (once)
+sudo tee /etc/anonctl/defaults.json <<<'{"allowDirect":["192.168.1.150:8080"]}'   # default LAN hole (once)
 sudo anonctl add work                                        # seeded + LAN-exempted, zero flags
 ```
 
 anonctl stays **generic** here: it seeds arbitrary files and punches a LAN hole, and knows nothing about any specific tool. Deriving a tool's config from the exempted endpoint (e.g. a coding agent's model settings pointed at your LAN model) is a sibling tool's job, not anonctl's. See [ADR-0006](docs/adr/0006-seed-home-and-box-wide-add-time-defaults.md).
+
+### Worked example: an anonymized `pi` account wired to a LAN model
+
+This sets up an `anon` account whose web egress goes through Tor, that runs the [`pi`](https://github.com/badlogic/pi-mono) coding agent pre-configured to talk to a **local model on your LAN** (here a llama.cpp / llama-swap style router at `192.168.1.150:8080` serving `Ornith 1.0 35B`), with the agent's own traffic to that model exempted from forcing. Do the two "once" steps, then every `sudo anonctl add <name>` is one command.
+
+**1. Build the default home template** (the files `pi` reads from `~/.pi/agent/`). anonctl copies this tree verbatim into each fresh account's home, so lay it out exactly as it should appear in the account's `$HOME`:
+
+```sh
+mkdir -p ~/anon-home/.pi/agent
+```
+
+`~/anon-home/.pi/agent/models.json`, a **single provider** pointed at the LAN model. `api: openai-completions` matches a llama.cpp/vLLM/LM-Studio OpenAI-compatible server; `baseUrl` is the LAN endpoint (the same host:port you exempt below); `apiKey` is a placeholder a local model ignores (**never put a real host key here**, it would land in the anon home). Ornith ships in two ids: the plain `Ornith-1.0-35B` (`reasoning: false`) and `Ornith-1.0-35B-thinking` (`reasoning: true`).
+
+```json
+{
+  "providers": {
+    "llamacpp-router": {
+      "api": "openai-completions",
+      "baseUrl": "http://192.168.1.150:8080/v1",
+      "apiKey": "none",
+      "models": [
+        {
+          "id": "Ornith-1.0-35B",
+          "name": "Ornith 1.0 35B",
+          "reasoning": false,
+          "input": ["text", "image"],
+          "contextWindow": 262144,
+          "maxTokens": 16384,
+          "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+        },
+        {
+          "id": "Ornith-1.0-35B-thinking",
+          "name": "Ornith 1.0 35B Thinking",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "contextWindow": 262144,
+          "maxTokens": 16384,
+          "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+        }
+      ]
+    }
+  }
+}
+```
+
+`~/anon-home/.pi/agent/settings.json`, selecting the **non-thinking Ornith as the default** and enabling both. `pi` keys `defaultProvider`/`defaultModel` by the provider name + model id, and `enabledModels` by `provider/id`:
+
+```json
+{
+  "defaultProvider": "llamacpp-router",
+  "defaultModel": "Ornith-1.0-35B",
+  "enabledModels": [
+    "llamacpp-router/Ornith-1.0-35B",
+    "llamacpp-router/Ornith-1.0-35B-thinking"
+  ]
+}
+```
+
+**2. Install the defaults (once):**
+
+```sh
+sudo cp -r ~/anon-home/. /etc/anonctl/default-home/                                  # the pi config template
+sudo tee /etc/anonctl/defaults.json <<<'{"allowDirect":["192.168.1.150:8080"]}'       # exempt the LAN model host
+```
+
+The `allowDirect` host:port MUST match the model's `baseUrl` host:port: that is the one narrow direct hole letting the account reach the LAN model, while everything else stays forced through Tor.
+
+**3. Provision an account, then prove it:**
+
+```sh
+sudo anonctl add work        # seeds ~work's ~/.pi/agent from the template + exempts 192.168.1.150:8080; picks a confirmed Tor endpoint
+sudo anonctl verify work     # PROVE it: anonymized exit, DNS remote, a direct dial DROPPED, the LAN split-tunnel tight
+sudo anonctl use work        # on green, drops into an anon-work shell where `pi` already talks to the LAN model
+```
+
+Inside the account, `pi` starts on `Ornith 1.0 35B` (non-thinking) against the LAN model over the exempted hole, while its web/tool egress is forced through Tor and fail-closed. Switching to `Ornith-1.0-35B-thinking` inside `pi` (it is enabled) turns reasoning on for that session. anonctl seeded the *files* and punched the *hole*; it never learned what a model or a provider is (that stays in the config you wrote). A sibling tool like [anon-pi](https://github.com/wighawag/anon-pi) can generate this `models.json` for you from your host `~/.pi/agent/models.json` provider that matches the exempted endpoint, if you would rather not hand-write it.
+
+> Heads-up on the `apiKey`: a genuinely local model ignores it, so `"none"` is fine. If your LAN model DOES require a key, treat it as a secret: do not bake it into `/etc/anonctl/default-home/` (world of the account, and copied into every account), set it inside the account's own `~/.pi/agent/models.json` after provisioning instead.
 
 ## Choosing an endpoint on add (scan-and-offer)
 
