@@ -10,7 +10,7 @@ anonctl is a Linux-only **setup-and-verify manager** (like ufw/firewalld, specia
 
 - A **Linux kernel** with `nftables` (per-UID `meta skuid` matching and transparent redirect via `SO_ORIGINAL_DST`). anonctl is Linux-only; these primitives do not transfer to other platforms.
 - **Root**, for the verbs that mutate the system (`add`, `rm`, `update`/`reconfigure`) and for `use` (which drops to the account via `setpriv`). `list` and `status` are read-only and need no privilege.
-- A **socks5h endpoint** to anonymize through. The default is a local **Tor** SOCKS port (`socks5h://127.0.0.1:9050`), so `anonctl add` works out of the box if you run Tor; any other socks5h endpoint (Mullvad local SOCKS, wireproxy, `ssh -D`, wireproxy chained with gost) works too via `--endpoint`. **anonctl does NOT manage the endpoint's lifecycle**: it assumes the endpoint already exists and stays up. Enabling it at boot (e.g. `systemctl enable --now tor.service`) is your job (see [Operating notes](#operating-notes)).
+- A **socks5h endpoint** to anonymize through. With no `--endpoint`, `anonctl add` **scans the common local SOCKS ports** (9050 / 9150 / 1080), confirms each really speaks SOCKS5, and defaults to a confirmed local **Tor** SOCKS port (`socks5h://127.0.0.1:9050`), so it works out of the box if you run Tor; any other socks5h endpoint (Mullvad local SOCKS, wireproxy, `ssh -D`, wireproxy chained with gost) works too via `--endpoint`. **anonctl does NOT manage the endpoint's lifecycle**: it assumes the endpoint already exists and stays up. Enabling it at boot (e.g. `systemctl enable --now tor.service`) is your job (see [Operating notes](#operating-notes)).
 
 ## Install
 
@@ -99,6 +99,15 @@ sudo anonctl add work                                        # seeded + LAN-exem
 ```
 
 anonctl stays **generic** here: it seeds arbitrary files and punches a LAN hole, and knows nothing about any specific tool. Deriving a tool's config from the exempted endpoint (e.g. a coding agent's model settings pointed at your LAN model) is a sibling tool's job, not anonctl's. See [ADR-0006](docs/adr/0006-seed-home-and-box-wide-add-time-defaults.md).
+
+## Choosing an endpoint on add (scan-and-offer)
+
+With no `--endpoint`, `add` **scans** the common local SOCKS ports (9050 Tor, 9150 Tor Browser, 1080 generic), **confirms** each open port actually speaks SOCKS5 (an open port is not enough), and offers the confirmed ones. It presents **evidence only** and never labels the exit provider (a SOCKS proxy does not announce Tor/Mullvad, so a label would be a dangerous lie); the strongest thing it says is the port-conventional "likely Tor" prior, which you can override.
+
+- **Interactive** (a terminal): a numbered menu with a confirmed **Tor endpoint pre-selected as the default**; press Enter for the default, type a number, or type a `socks5h://host:port`. A `socks-peruser` endpoint already **in use by another account** is shown as such and is not selectable (see [the cross-identification boundary](#the-cross-identification-boundary)).
+- **Non-interactive** (a script / CI / piped stdin): no prompt. It picks the confirmed Tor default if present, else **fails closed** (`no endpoint confirmed; pass --endpoint ...`) rather than silently configuring a dead `9050`.
+
+Either way the chosen endpoint still passes the cross-identification guard before any rules are applied. Pass `--endpoint socks5h://host:port` to skip the scan entirely.
 
 ## verify is the trust anchor
 

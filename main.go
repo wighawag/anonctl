@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -138,9 +139,26 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		}
 	}
 
+	// Resolve the endpoint. With an explicit --endpoint, use it as-is (unchanged).
+	// With NONE, SCAN the local socks5h ports and choose: default to a confirmed Tor
+	// endpoint, prompt interactively when there is a TTY (annotating any peruser
+	// endpoint already in use by another account), and fall back fail-closed
+	// non-interactively (Tor-if-confirmed, else refuse) rather than blindly
+	// configuring a dead 9050. An empty result means "use the plain Tor default"
+	// (chooseEndpointForAdd never returns "" without an error).
+	endpointArg := cmd.Endpoint
+	if endpointArg == "" {
+		chosen, cerr := chooseEndpointForAdd(cmd.Account)
+		if cerr != nil {
+			fmt.Fprintf(os.Stderr, "anonctl: add: %v\n", cerr)
+			return 1
+		}
+		endpointArg = chosen.URL()
+	}
+
 	// Build the at-rest config from the just-provisioned UIDs and the chosen
-	// endpoint (default Tor SocksPort when none named), then install the forcing.
-	cfg, err := buildConfig(ctx, r, cmd.Account, cmd.Endpoint, exemptions)
+	// endpoint, then install the forcing.
+	cfg, err := buildConfig(ctx, r, cmd.Account, endpointArg, exemptions)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "anonctl: add: %v\n", err)
 		return 1
@@ -724,6 +742,124 @@ func claimEndpoint(account string, ep endpoint.Endpoint) error {
 	}
 	reg := accountconfig.BuildRegistryExcluding(configs, account)
 	return reg.Claim(account, ep)
+}
+
+// The scan-and-offer seams: package vars so a unit test drives the endpoint-choice
+// flow without a real socket probe or a real terminal. Production wires the real
+// DialProber scan, the real stdin TTY check, and reads the real prompt from stdin.
+var (
+	// endpointScan probes the local socks5h ports and returns the confirmed offers.
+	// Tests replace it to inject a scripted candidate set.
+	endpointScan = func() []endpoint.Endpoint {
+		return endpoint.Scan(endpoint.DialProber{Timeout: 2 * time.Second})
+	}
+	// stdinIsTTY reports whether add is running interactively (a terminal to prompt
+	// at). Non-interactive => no prompt => fail-closed fallback. Tests force either.
+	stdinIsTTY = defaultStdinIsTTY
+	// promptReader is where the interactive menu pick is read from. Tests inject a
+	// scripted reader; production reads os.Stdin.
+	promptReader io.Reader = os.Stdin
+	// promptWriter is where the interactive menu is rendered (stderr, so it never
+	// pollutes any stdout contract). Tests capture it.
+	promptWriter io.Writer = os.Stderr
+)
+
+// defaultStdinIsTTY reports whether stdin is a character device (a terminal). It
+// is the production stdinIsTTY: a piped/redirected stdin (a script, CI) reads as
+// NOT a TTY, so add takes the non-interactive fail-closed path.
+func defaultStdinIsTTY() bool {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// peruserOwners folds the on-disk claim set into a lookup from a peruser endpoint
+// key (host:port) to the account that owns it, so BuildOffers can annotate a taken
+// endpoint. A tor-shared config contributes nothing (share-safe). A read failure is
+// surfaced so the annotation never silently misses a claim.
+func peruserOwners() (map[string]string, error) {
+	configs, err := configListStore.List()
+	if err != nil {
+		return nil, fmt.Errorf("reading endpoint claims: %w", err)
+	}
+	owners := map[string]string{}
+	for _, c := range configs {
+		ep := c.Endpoint()
+		if ep.Class == endpoint.ClassSocksPeruser {
+			owners[ep.Address()] = c.Account
+		}
+	}
+	return owners, nil
+}
+
+// chooseEndpointForAdd is the no-`--endpoint` resolution: scan the local ports,
+// decorate the offers with the default (confirmed Tor) selection and the
+// in-use-by-another-account annotation, then either PROMPT (interactive) or pick
+// the fail-closed non-interactive outcome (Tor-if-confirmed, else refuse). The
+// returned endpoint still flows through claimEndpoint before any mutation (the
+// annotation is advisory; the Claim is the enforcement).
+func chooseEndpointForAdd(account string) (endpoint.Endpoint, error) {
+	owners, err := peruserOwners()
+	if err != nil {
+		return endpoint.Endpoint{}, err
+	}
+	takenBy := func(ep endpoint.Endpoint) string { return owners[ep.Address()] }
+	offers := endpoint.BuildOffers(endpointScan(), account, takenBy)
+
+	if !stdinIsTTY() {
+		chosen, cerr := endpoint.ChooseNonInteractive(offers)
+		if cerr != nil {
+			return endpoint.Endpoint{}, fmt.Errorf("%w (or run `anonctl add` interactively to choose)", cerr)
+		}
+		return chosen, nil
+	}
+	return promptEndpointChoice(offers)
+}
+
+// promptEndpointChoice renders the confirmed offers (evidence only, never labelling
+// the provider) and reads the operator's pick: a number selects that offer,
+// an empty line accepts the DEFAULT (the confirmed Tor endpoint) when there is one,
+// and a `socks5h://host:port` (or bare host:port) types a custom endpoint. A taken
+// peruser offer is shown "in use by <account>" and is not selectable. When there is
+// no default and the operator just hits enter, it re-prompts once via the custom
+// path being required.
+func promptEndpointChoice(offers []endpoint.Offer) (endpoint.Endpoint, error) {
+	def, hasDefault := endpoint.DefaultOffer(offers)
+	fmt.Fprintln(promptWriter, "anonctl: no --endpoint given; scanning local socks5h ports (evidence only, provider not labelled):")
+	if len(offers) == 0 {
+		fmt.Fprintln(promptWriter, "  (no socks5h endpoint confirmed on the common ports)")
+	}
+	for i, o := range offers {
+		line := fmt.Sprintf("  [%d] %s  (%s)", i+1, o.Endpoint.URL(), o.Endpoint.Class)
+		if o.IsDefault {
+			line += "  [default]"
+		}
+		if o.TakenBy != "" {
+			line += fmt.Sprintf("  IN USE by %q (not selectable)", o.TakenBy)
+		}
+		fmt.Fprintln(promptWriter, line)
+	}
+	if hasDefault {
+		fmt.Fprintf(promptWriter, "choose a number, type a socks5h://host:port, or press Enter for the default (%s): ", def.Endpoint.URL())
+	} else {
+		fmt.Fprint(promptWriter, "choose a number or type a socks5h://host:port: ")
+	}
+
+	line, _ := bufio.NewReader(promptReader).ReadString('\n')
+	line = strings.TrimSpace(line)
+	switch {
+	case line == "" && hasDefault:
+		return def.Endpoint, nil
+	case line == "":
+		return endpoint.Endpoint{}, fmt.Errorf("no endpoint chosen and no default confirmed; re-run with `--endpoint socks5h://host:port`")
+	}
+	if n, perr := strconv.Atoi(line); perr == nil {
+		return endpoint.SelectByIndex(offers, n)
+	}
+	// A typed value: parse + classify it exactly like an explicit --endpoint.
+	return resolveEndpoint(line)
 }
 
 // forcingDeps wires the real runners + stores for the forcing orchestration (the
