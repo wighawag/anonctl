@@ -1,0 +1,105 @@
+# goreleaser config for anonctl: Linux-only binaries (anonctl forces per-UID
+# kernel egress via nftables `skuid` redirect + SO_ORIGINAL_DST, primitives that
+# do not exist off Linux), static (CGO disabled) covering amd64, arm64, and
+# 32-bit ARM v7/v6 so older Raspberry Pi models are covered (Pi 1 / Zero =
+# armv6, Pi 2 / 3 32-bit = armv7, Pi 3/4/5 64-bit = arm64). Mirrors the sibling
+# netcage's proven setup, adapted for anonctl's TWO binaries.
+version: 2
+
+project_name: anonctl
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: anonctl
+    main: .
+    binary: anonctl
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      # Stamp the version with the release tag (e.g. v0.1.0 -> 0.1.0). When absent
+      # (a plain go build / go install), main.resolveVersion (version.go) falls
+      # back to the module version + VCS revision from the build info.
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      # 32-bit ARM variants for older Raspberry Pi models.
+      - "7" # Pi 2, Pi 3 (32-bit OS)
+      - "6" # Pi 1, Pi Zero / Zero W
+
+  # The per-account forced-egress shim (the userspace data path: a transparent
+  # TCP-to-SOCKS relay + DNS-over-SOCKS-TCP forwarder). ONE instance runs per
+  # anon account under its dedicated shim UID, supervised by the
+  # anonctl-shim@<account>.service systemd unit whose ExecStart looks for the
+  # binary at /usr/local/bin/anonctl-shim (internal/systemd.DefaultShimBinaryPath).
+  # It MUST ship alongside the anonctl binary; without it an account cannot run.
+  # The archive places both binaries side by side so the install step (the
+  # packaging-install-script-and-docs task) can drop this one at
+  # /usr/local/bin/anonctl-shim to satisfy the unit's ExecStart. CGO_ENABLED=0 is
+  # LOAD-BEARING: the shim must be a static binary. It has no main.version to
+  # stamp (the manager binary carries the version), so only -s -w here.
+  - id: anonctl-shim
+    main: ./cmd/anonctl-shim
+    binary: anonctl-shim
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - "7"
+      - "6"
+
+archives:
+  - id: anonctl
+    # Bundle BOTH binaries (anonctl + anonctl-shim) into one archive per target,
+    # so a downloaded release carries the manager AND the shim side by side and an
+    # install step can place anonctl-shim at /usr/local/bin/anonctl-shim (the path
+    # the systemd unit's ExecStart expects, internal/systemd.DefaultShimBinaryPath).
+    ids:
+      - anonctl
+      - anonctl-shim
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_
+      {{- .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}
+    files:
+      - README.md
+      - LICENSE
+      - docs/adr/*.md
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"
+
+release:
+  draft: false
+  prerelease: auto

@@ -1,0 +1,48 @@
+name: release
+
+# Cut a release by pushing a version tag, e.g.:
+#   git tag v0.1.0 && git push origin v0.1.0
+# goreleaser cross-compiles the Linux binaries (amd64, arm64, armv7, armv6 for
+# older Raspberry Pi models), archives BOTH anonctl and anonctl-shim side by side
+# (the shim install step drops anonctl-shim at /usr/local/bin/anonctl-shim, the
+# path the systemd unit's ExecStart expects), builds checksums, and publishes them
+# to the GitHub Release for the tag.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # goreleaser needs full history + tags for the changelog
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          check-latest: true
+
+      - name: Run unit tests
+        # Unit tests only. The setup/verify integration suite is behind the
+        # `integration` build tag because it needs a capable Linux host with root
+        # + nftables + a live socks5h endpoint (it installs real per-UID kernel
+        # rules and probes egress), which GitHub runners lack. Run it on a capable
+        # host with `go test -tags integration ./...`.
+        run: go test ./...
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
