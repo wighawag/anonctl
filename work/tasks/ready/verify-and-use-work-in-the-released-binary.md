@@ -50,3 +50,7 @@ The live probing (`setpriv` + `nft` + dialing the endpoint) is RUNTIME BEHAVIOUR
 > Do: un-gate the three product files (rename off the `_integration` suffix), delete the two stubs, keep `integration` on all `*_test.go`, replace the runtime `go build` probe helper with a `probe` mode on the installed static shim binary exec'd under setpriv, and make a missing tool / un-runnable probe a LOUD failing assertion (not a silent pass, not a silent skip - the "a probe that could not run is not a pass" contract). Fix the README verify/use sections. Keep the unit suite (pure decisions vs the fixture) green and the `-tags integration` tests compiling.
 >
 > Where to test: `go build ./...` (default) must yield a binary whose verify RUNS the probes (the real proof is a root host with Tor - flag that a real-host re-validation is the final gate, like the e2e runs); `go test ./...` green; `go test -tags integration ./...` still compiles + runs on a capable host. "Done" = a normally-built anonctl verifies and uses a real account, no `-tags integration` rebuild needed, missing tools fail loud, no runtime go-build. This is the fix that makes the shipped tool actually usable; do it carefully.
+
+## Requeue 2026-07-09
+
+The gate failure was NOT your change: main was pre-existing RED (TestRmDisablesShimBeforeUserdel hits the real /etc/anonctl marker off-root). That is being fixed by fix-rm-test-marker-isolation. Once it lands, your un-gating work will re-run against a green main.
