@@ -32,13 +32,14 @@ import (
 // counter.go): the counter is keyed on exemptHost:53 (a redirected packet has had
 // its daddr rewritten to the shim, so it no longer matches; only a NON-redirected
 // "hole" packet keeps the LAN daddr and is counted), then it dials exemptHost:53 as
-// the anon UID and reports whether the counter moved. A missing nft/setpriv, or any
-// error, yields reached=false (the safe reading: no observed clear-DNS egress),
-// never a false leak.
-func clearLANDNSReached(ctx context.Context, p LiveParams, network, addr string) bool {
+// the anon UID and reports whether the counter moved. It returns (reached, err):
+// a counter plant/read ERROR is propagated (a probe that could not run is not a
+// pass), NOT swallowed to reached=false; only a MALFORMED/non-v4 addr reads as a
+// clean reached=false (that case is not a probe failure, it is out of scope here).
+func clearLANDNSReached(ctx context.Context, p LiveParams, network, addr string) (bool, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil || net.ParseIP(host).To4() == nil {
-		return false // only the v4 LAN-resolver case is probed here
+		return false, nil // only the v4 LAN-resolver case is probed here
 	}
 	l4 := "tcp"
 	if strings.HasPrefix(network, "udp") {
@@ -60,16 +61,23 @@ func clearLANDNSReached(ctx context.Context, p LiveParams, network, addr string)
 // counterDaddr/l4/port describe what the counter watches for; probeNetwork/probeAddr
 // are what the anon UID actually dials to try to produce that escape. They differ
 // only for the loopback-endpoint closure case (dial the loopback endpoint, watch
-// its off-box-form daddr) and are identical for the off-box leak/closure probes. A
-// missing nft, a plant/list error, or a missing helper yields reached=false (the
-// fail-closed-safe reading: no observed escape), never a false leak.
-func offBoxLeakReached(ctx context.Context, p LiveParams, counterDaddr, l4 string, port int, probeNetwork, probeAddr string) bool {
+// its off-box-form daddr) and are identical for the off-box leak/closure probes.
+//
+// It returns (reached, err). A COUNTER ERROR (nft missing, a plant/list failure)
+// is returned as a non-nil err, NOT swallowed to reached=false: a probe that could
+// not run is NOT a pass (the caller surfaces the error as a LOUD failing
+// assertion, via escapedLeakProbeAssertion). This is the discipline the two
+// closures were missing (the invalid-nft false-green: an unplantable counter read
+// as "nothing escaped" => a silent PASS). A clean run returns whether the counter
+// moved (a genuine clear escape) with a nil err, so a redirect/drop reads as no
+// leak (reached=false) and only a real escape reads as a leak (reached=true).
+func offBoxLeakReached(ctx context.Context, p LiveParams, counterDaddr, l4 string, port int, probeNetwork, probeAddr string) (bool, error) {
 	if _, err := exec.LookPath("nft"); err != nil {
-		return false
+		return false, fmt.Errorf("escaped-leak counter probe cannot run: nft not found: %w", err)
 	}
 	ruleset := escapedLeakCounterRuleset(p.AnonUID, counterDaddr, l4, port)
-	if _, _, err := nftRun(ctx, ruleset, "nft", "-f", "-"); err != nil {
-		return false
+	if _, stderr, err := nftRun(ctx, ruleset, "nft", "-f", "-"); err != nil {
+		return false, fmt.Errorf("plant escaped-leak counter: %w (%s)", err, stderr)
 	}
 	defer func() { _, _, _ = nftRun(ctx, "delete table inet "+escapedLeakCounterTable, "nft", "-f", "-") }()
 
@@ -81,11 +89,11 @@ func offBoxLeakReached(ctx context.Context, p LiveParams, counterDaddr, l4 strin
 	defer cancel()
 	_, _, _ = runSetprivProbe(pctx, p.AnonUID, probeNetwork, probeAddr)
 
-	out, _, err := nftRun(ctx, "", "nft", "list", "table", "inet", escapedLeakCounterTable)
+	out, stderr, err := nftRun(ctx, "", "nft", "list", "table", "inet", escapedLeakCounterTable)
 	if err != nil {
-		return false
+		return false, fmt.Errorf("read escaped-leak counter: %w (%s)", err, stderr)
 	}
-	return counterMoved(out)
+	return counterMoved(out), nil
 }
 
 // nftRun shells out to nft (optionally with a ruleset on stdin), returning

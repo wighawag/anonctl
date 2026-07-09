@@ -398,6 +398,23 @@ func LeakDropAssertion(family string, reached bool) Assertion {
 	return dropAssertion(name, "a direct "+family+" connection from the anon UID", reached)
 }
 
+// escapedLeakProbeAssertion turns an escaped-leak-counter probe's outcome into a
+// named drop assertion, treating a probe ERROR as a LOUD failure (Err set, Ok
+// false), never a silent pass. This is the discipline the two closures on the
+// escaped-leak counter (bypass-loopback-closure, split-tunnel-tight) were MISSING:
+// their live probe planted an nft counter, and a plant/read error was swallowed to
+// reached=false, which dropAssertion reads as "nothing escaped" => PASS. A probe
+// that could not run is NOT a pass (ADR 0003; mirrors the anonymized-exit /
+// dns-remote checks, which surface a probe error via Assertion.Err). So when err
+// is non-nil the assertion FAILS with that error surfaced; otherwise the pure
+// leak/no-leak decision (dropAssertion) stands on the observed reached value.
+func escapedLeakProbeAssertion(name, what string, reached bool, err error) Assertion {
+	if err != nil {
+		return Assertion{Name: name, Err: err}
+	}
+	return dropAssertion(name, what, reached)
+}
+
 // BypassLoopbackClosureAssertion is closure (a): the anon UID reaching any loopback
 // destination OTHER than its own shim port must be DROPPED. reached is whether the
 // probe to the non-shim loopback destination egressed (true == the closure is
