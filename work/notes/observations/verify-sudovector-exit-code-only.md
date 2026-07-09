@@ -1,3 +1,0 @@
-# verify's sudoVector still trusts the sudo exit code alone (same bug as provision's)
-
-2026-07-09: While hardening `internal/provision.sudoAllowed` (task harden-sudo-absence-probe) I noticed `internal/verify/probes_integration.go` `sudoVector` decides the sudo escape from the exit code alone (`exec.CommandContext(ctx, "sudo", "-l", "-U", account).Run(); err == nil => Escaped=true`), the exact lenient-exit-0 false-alarm this task fixes on the provision side. It was the root cause of the `no-uid-transition-egress` false-positive in e2e-binary-revalidation-2.md. Out of this task's scope (provision-only), left untouched; a follow-up could route it through the same output-parse (`parseSudoOutput`).
