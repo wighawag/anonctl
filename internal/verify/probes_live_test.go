@@ -8,111 +8,134 @@ import (
 	"testing"
 )
 
-// TestSetuidWrapperCommand_PkexecIsNonInteractive proves the core of this task: the
-// pkexec UID-transition probe is built to run STRICTLY NON-INTERACTIVELY, so a real
-// `sudo anonctl verify` never pops a polkit password dialog and never false-flags
-// on the operator's interactive auth (v0.1.2 bug). setuidWrapperCommand must build
-// pkexec's argv with --disable-internal-agent AND hand it a scrubbed env with the
-// four session-agent handles removed (DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR,
-// DISPLAY, WAYLAND_DISPLAY), so unattended pkexec fails "Request dismissed" instead
-// of reaching the session polkit agent.
-func TestSetuidWrapperCommand_PkexecIsNonInteractive(t *testing.T) {
-	env := []string{
-		"PATH=/usr/bin",
-		"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
-		"XDG_RUNTIME_DIR=/run/user/1000",
-		"DISPLAY=:0",
-		"WAYLAND_DISPLAY=wayland-0",
-		"HOME=/home/anon",
+// TestPkexecPolicyQueryCommand_QueriesPolkitNeverRunsPkexec proves the core of this
+// task: the pkexec UID-transition vector QUERIES polkit with pkcheck (the
+// non-interactive policy query), it never RUNS pkexec. The v0.1.3/v0.1.4 mechanism
+// (running `pkexec --disable-internal-agent` under a scrubbed env) did NOT stop the
+// GNOME polkit dialog, because polkit finds the auth agent via systemd-logind, not
+// env vars (work/notes/findings/pkexec-probe-must-use-pkcheck-not-run-pkexec.md).
+// pkcheck WITHOUT --allow-user-interaction/-u never starts an agent and never
+// prompts. The subject must be ANON-OWNED, so the query runs under `setpriv --reuid
+// <anon>` and passes `--process $$` (self) via `sh -c 'exec pkcheck ...'` so $$
+// stays the pkcheck process's own pid across the exec.
+func TestPkexecPolicyQueryCommand_QueriesPolkitNeverRunsPkexec(t *testing.T) {
+	argv := pkexecPolicyQueryCommand(30001)
+	want := []string{
+		"setpriv", "--reuid", "30001", "--clear-groups",
+		"sh", "-c", "exec pkcheck --action-id org.freedesktop.policykit.exec --process $$",
 	}
-	argv, scrubbed := setuidWrapperCommand(30001, "pkexec", env)
-
-	// argv: setpriv --reuid 30001 --clear-groups pkexec --disable-internal-agent id -u
-	want := []string{"setpriv", "--reuid", "30001", "--clear-groups", "pkexec", "--disable-internal-agent", "id", "-u"}
 	if fmt.Sprint(argv) != fmt.Sprint(want) {
-		t.Fatalf("pkexec probe argv = %v, want %v", argv, want)
+		t.Fatalf("pkexec policy-query argv = %v, want %v", argv, want)
 	}
-	if !contains(argv, "--disable-internal-agent") {
-		t.Fatalf("pkexec probe must pass --disable-internal-agent so it cannot reach an auth agent; got %v", argv)
+	// It must NOT run pkexec (that is what pops the dialog) and must NOT pass an
+	// interaction flag (that is what would start an agent + prompt).
+	joined := strings.Join(argv, " ")
+	if strings.Contains(joined, "pkexec") {
+		t.Fatalf("the pkexec vector must QUERY polkit (pkcheck), never RUN pkexec; got %v", argv)
 	}
-
-	// The scrubbed env must DROP the four session-agent handles and KEEP the rest.
-	for _, banned := range []string{"DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "DISPLAY", "WAYLAND_DISPLAY"} {
-		if envHas(scrubbed, banned) {
-			t.Fatalf("pkexec probe env must DROP %s (else it can reach the session polkit agent and prompt); got %v", banned, scrubbed)
-		}
+	if strings.Contains(joined, "--allow-user-interaction") || strings.Contains(joined, " -u ") {
+		t.Fatalf("the pkcheck query must NOT pass -u/--allow-user-interaction (else it starts an agent and prompts); got %v", argv)
 	}
-	for _, kept := range []string{"PATH", "HOME"} {
-		if !envHas(scrubbed, kept) {
-			t.Fatalf("pkexec probe env must keep %s (only the agent handles are scrubbed); got %v", kept, scrubbed)
-		}
+	if !strings.Contains(joined, "pkcheck") || !strings.Contains(joined, "org.freedesktop.policykit.exec") {
+		t.Fatalf("the query must ask pkcheck about the exec action org.freedesktop.policykit.exec; got %v", argv)
 	}
 }
 
-// TestSetuidWrapperCommand_NonPkexecWrapperUnchanged proves the scrubbing is scoped:
-// a non-pkexec wrapper (e.g. mullvad-exclude) gets NO --disable-internal-agent flag
-// (it is a pkexec-only flag) and inherits the ambient env unchanged (nil scrub).
-// mullvad-exclude runs the target as the caller and cannot prompt, so it needs no
-// special handling; only the pkexec auth-agent path is scrubbed.
+// TestSetuidWrapperCommand_NonPkexecWrapperUnchanged proves the non-pkexec wrappers
+// still RUN the wrapper (they are not a polkit-gated escalation): a non-pkexec
+// wrapper (e.g. mullvad-exclude) is built as `setpriv --reuid <anon> <wrapper> id
+// -u` with NO extra flags and inherits the ambient env unchanged. mullvad-exclude
+// runs the target as the caller and cannot prompt; only the pkexec vector changed
+// to the pkcheck query.
 func TestSetuidWrapperCommand_NonPkexecWrapperUnchanged(t *testing.T) {
-	argv, scrubbed := setuidWrapperCommand(30001, "mullvad-exclude", []string{"DISPLAY=:0"})
+	argv := setuidWrapperCommand(30001, "mullvad-exclude")
 	want := []string{"setpriv", "--reuid", "30001", "--clear-groups", "mullvad-exclude", "id", "-u"}
 	if fmt.Sprint(argv) != fmt.Sprint(want) {
 		t.Fatalf("mullvad-exclude probe argv = %v, want %v", argv, want)
 	}
 	if contains(argv, "--disable-internal-agent") {
-		t.Fatalf("--disable-internal-agent is pkexec-only; must not appear for mullvad-exclude; got %v", argv)
-	}
-	if scrubbed != nil {
-		t.Fatalf("a non-pkexec wrapper inherits the ambient env (nil scrub); got %v", scrubbed)
+		t.Fatalf("the dead --disable-internal-agent must not appear for any wrapper; got %v", argv)
 	}
 }
 
-// TestSetuidWrapperVector_UnattendedFailIsNotEscaped proves the false-positive is
-// gone on the normal desktop: when unattended pkexec cannot escalate (it prints no
-// numeric euid line, e.g. "Error executing command as another user: Request
-// dismissed"), the vector reads as NOT escaped. No real pkexec runs; the exec seam
-// is scripted.
-func TestSetuidWrapperVector_UnattendedFailIsNotEscaped(t *testing.T) {
-	orig := runSetuidWrapper
-	defer func() { runSetuidWrapper = orig }()
-	var gotArgv, gotEnv []string
-	runSetuidWrapper = func(_ context.Context, argv, env []string) string {
-		gotArgv, gotEnv = argv, env
-		return "Error executing command as another user: Request dismissed\n"
+// TestPkexecVector_AuthRequiredIsNotEscaped proves the false-FAIL is gone on a
+// normal desktop: when pkcheck reports auth is required with no interaction
+// (exit 2), the anon account CANNOT pkexec-to-root unattended, so the vector reads
+// as NOT escaped, and NO prompt ever appears (pkcheck without -u). exit 1 (not
+// authorized) and exit 3 (dismissed) are likewise not an unattended escape. No real
+// pkcheck runs; the exec seam is scripted.
+func TestPkexecVector_AuthRequiredIsNotEscaped(t *testing.T) {
+	if _, err := exec.LookPath("setpriv"); err != nil {
+		t.Skip("setpriv not on PATH: the pkexec vector short-circuits before the query")
 	}
-
-	v := setuidWrapperVector(context.Background(), LiveParams{AnonUID: 30001, ShimUID: 995}, "pkexec")
-	if v.Escaped {
-		t.Fatalf("an unattended pkexec that could not escalate must NOT be flagged as escaped; got %+v", v)
-	}
-	// It must have been driven non-interactively (the operator-auth false-flag path is gone).
-	if !contains(gotArgv, "--disable-internal-agent") {
-		t.Fatalf("the vector must exec pkexec non-interactively (--disable-internal-agent); got %v", gotArgv)
-	}
-	if envHas(gotEnv, "DBUS_SESSION_BUS_ADDRESS") {
-		t.Fatalf("the vector must exec pkexec with a scrubbed env (no DBUS_SESSION_BUS_ADDRESS); got %v", gotEnv)
+	orig := runPkcheck
+	defer func() { runPkcheck = orig }()
+	for _, exit := range []int{2, 1, 3} {
+		var gotArgv []string
+		runPkcheck = func(_ context.Context, argv []string) (int, bool) {
+			gotArgv = argv
+			return exit, true
+		}
+		v := pkexecVector(context.Background(), LiveParams{AnonUID: 30001, ShimUID: 995})
+		if v.Escaped {
+			t.Fatalf("pkcheck exit %d (no unattended escalation) must NOT be flagged as escaped; got %+v", exit, v)
+		}
+		if v.Inconclusive {
+			t.Fatalf("pkcheck exit %d is a conclusive no-escape, not inconclusive; got %+v", exit, v)
+		}
+		// It must have QUERIED polkit (pkcheck), never RUN pkexec.
+		gotJoined := strings.Join(gotArgv, " ")
+		if strings.Contains(gotJoined, "pkexec") || !strings.Contains(gotJoined, "pkcheck") {
+			t.Fatalf("the vector must exec the pkcheck query, never pkexec; got %v", gotArgv)
+		}
 	}
 }
 
-// TestSetuidWrapperVector_UnattendedEscalationIsEscaped proves the detection is NOT
-// neutered: a genuinely permissive policy (a NOPASSWD-style polkit rule that lets
-// the anon account pkexec-to-root with NO auth) STILL escalates unattended, prints
-// a non-anon euid, and is caught as a real escape (Escaped=true). Scripted via the
-// exec seam (a fixtured unattended escalation), no real pkexec.
-func TestSetuidWrapperVector_UnattendedEscalationIsEscaped(t *testing.T) {
-	orig := runSetuidWrapper
-	defer func() { runSetuidWrapper = orig }()
-	runSetuidWrapper = func(_ context.Context, _, _ []string) string {
-		return "0\n" // pkexec escalated to root with no auth (permissive policy)
+// TestPkexecVector_UnattendedAuthorizationIsEscaped proves the detection is NOT
+// neutered: a host whose polkit policy authorizes the exec action WITHOUT auth
+// (pkcheck exit 0) means the anon account can pkexec-to-root UNATTENDED, a real
+// forcing bypass, so the vector is STILL caught as a real escape (Escaped=true).
+// Scripted via the exec seam, no real pkcheck.
+func TestPkexecVector_UnattendedAuthorizationIsEscaped(t *testing.T) {
+	if _, err := exec.LookPath("setpriv"); err != nil {
+		t.Skip("setpriv not on PATH: the pkexec vector short-circuits before the query")
+	}
+	orig := runPkcheck
+	defer func() { runPkcheck = orig }()
+	runPkcheck = func(_ context.Context, _ []string) (int, bool) {
+		return 0, true // authorized WITHOUT auth: unattended escalation allowed
 	}
 
-	v := setuidWrapperVector(context.Background(), LiveParams{AnonUID: 30001, ShimUID: 995}, "pkexec")
+	v := pkexecVector(context.Background(), LiveParams{AnonUID: 30001, ShimUID: 995})
 	if !v.Escaped {
-		t.Fatalf("a permissive policy that escalates unattended MUST still be caught as a real escape; got %+v", v)
+		t.Fatalf("pkcheck exit 0 (unattended escalation allowed) MUST be caught as a real escape; got %+v", v)
 	}
 	if v.Detail == "" {
 		t.Fatalf("an escaping vector must carry a detail line; got %+v", v)
+	}
+}
+
+// TestPkexecVector_PkcheckMissingIsInconclusive proves the honest not-conclusive
+// reading: when pkcheck is absent or un-runnable, the vector is neither a false
+// escape nor a false conclusive no-escape; it is reported Inconclusive (best-effort
+// framing), and it NEVER falls back to RUNNING pkexec. Scripted via the exec seam
+// (ran=false); no real pkcheck/pkexec, no prompt.
+func TestPkexecVector_PkcheckMissingIsInconclusive(t *testing.T) {
+	if _, err := exec.LookPath("setpriv"); err != nil {
+		t.Skip("setpriv not on PATH: the pkexec vector short-circuits before the query")
+	}
+	orig := runPkcheck
+	defer func() { runPkcheck = orig }()
+	runPkcheck = func(_ context.Context, _ []string) (int, bool) {
+		return 0, false // pkcheck missing / un-runnable
+	}
+
+	v := pkexecVector(context.Background(), LiveParams{AnonUID: 30001, ShimUID: 995})
+	if v.Escaped {
+		t.Fatalf("a missing pkcheck must NOT read as a false escape; got %+v", v)
+	}
+	if !v.Inconclusive {
+		t.Fatalf("a missing/un-runnable pkcheck must be honestly NOT-conclusive; got %+v", v)
 	}
 }
 
@@ -186,15 +209,6 @@ func TestSudoVector_AuthBlockedIsInconclusive(t *testing.T) {
 func contains(ss []string, want string) bool {
 	for _, s := range ss {
 		if s == want {
-			return true
-		}
-	}
-	return false
-}
-
-func envHas(env []string, key string) bool {
-	for _, e := range env {
-		if strings.HasPrefix(e, key+"=") {
 			return true
 		}
 	}
