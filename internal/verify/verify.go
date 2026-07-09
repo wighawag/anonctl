@@ -52,6 +52,7 @@ import (
 	"strings"
 
 	"github.com/wighawag/anonctl/internal/endpoint"
+	"github.com/wighawag/anonctl/internal/sudoprobe"
 )
 
 // SchemaVersion is the version of the `--json` report CONTRACT. It evolves
@@ -495,10 +496,18 @@ func SplitTunnelTightAssertion(exempt string, exemptReached, nonExemptReached bo
 // "sudo", "setuid:ping"); Detail is optional extra context for an escaping vector.
 // The vectors come from the hand-audited finding
 // (work/notes/findings/uid-transition-escape-surface.md), NOT a guessed list.
+//
+// Inconclusive marks a vector whose probe ran but could NOT be classified either
+// way (e.g. sudo's `sudo -l -U` output was ambiguous / unparseable on a build we
+// cannot read): it is NOT an escape (so it never false-alarms) and NOT a
+// conclusive no-escape (so it never silently hides a real path). The assertion
+// surfaces it honestly, consistent with the best-effort framing. Inconclusive and
+// Escaped are mutually exclusive; a conclusive no-escape leaves both false.
 type UIDTransitionVector struct {
-	Name    string
-	Escaped bool
-	Detail  string
+	Name         string
+	Escaped      bool
+	Inconclusive bool
+	Detail       string
 }
 
 // NoUIDTransitionEgressAssertion is the BEST-EFFORT row-7 decision (Tails
@@ -524,6 +533,7 @@ func NoUIDTransitionEgressAssertion(vectors []UIDTransitionVector) Assertion {
 	}
 	names := make([]string, 0, len(vectors))
 	var escaped []string
+	var inconclusive []string
 	for _, v := range vectors {
 		names = append(names, v.Name)
 		if v.Escaped {
@@ -531,6 +541,14 @@ func NoUIDTransitionEgressAssertion(vectors []UIDTransitionVector) Assertion {
 				escaped = append(escaped, v.Name+" ("+v.Detail+")")
 			} else {
 				escaped = append(escaped, v.Name)
+			}
+			continue
+		}
+		if v.Inconclusive {
+			if v.Detail != "" {
+				inconclusive = append(inconclusive, v.Name+" ("+v.Detail+")")
+			} else {
+				inconclusive = append(inconclusive, v.Name)
 			}
 		}
 	}
@@ -541,7 +559,42 @@ func NoUIDTransitionEgressAssertion(vectors []UIDTransitionVector) Assertion {
 	}
 	a.Ok = true
 	a.Detail = "the checked UID-transition vectors did not yield an off-box socket owned by a non-anon, non-shim uid (checked: " + checked + "). This is best-effort, not exhaustive: verify cannot enumerate every daemon on every host, so an arbitrary triggerable daemon may still escape the per-UID forcing (only netns-strength confinement closes that class)"
+	// An inconclusive vector (a probe that ran but could not be classified) is NOT
+	// an escape, but it is not a conclusive no-escape either: surface it honestly so
+	// the pass never reads as a total guarantee for that vector (never a silent pass).
+	if len(inconclusive) > 0 {
+		a.Detail += ". NOT conclusively checked (probe ran but was inconclusive): " + strings.Join(inconclusive, "; ")
+	}
 	return a
+}
+
+// sudoVectorFromVerdict is the PURE sudo UID-transition vector decision: it maps
+// the shared sudoprobe.Verdict (read from `sudo -l -U <account>` OUTPUT, never the
+// exit code) onto the vector, so a lenient exit-0 no-rights sudo build no longer
+// reports a false sudo escape. It is the twin of provision's status mapping (the
+// same `sudo -l -U` truth, the same shared parse), read here as the verify-side
+// escape signal, and is pure so the mapping is unit-tested with no real sudo; the
+// integration sudoVector feeds it the parsed real-probe verdict.
+//
+//   - Denied  => the sudo path did NOT escape (Escaped=false): no sudo rights.
+//   - Granted => the sudo path ESCAPED (Escaped=true): a real sudo'd socket carries
+//     a non-anon uid, bypassing the `meta skuid` forcing.
+//   - Unknown => honestly NOT-conclusively-checked (Inconclusive=true): never a
+//     false Escaped=true (a false alarm) nor a false conclusive Escaped=false that
+//     would hide a real sudo path. Consistent with the best-effort framing.
+func sudoVectorFromVerdict(v sudoprobe.Verdict) UIDTransitionVector {
+	out := UIDTransitionVector{Name: "sudo"}
+	switch v {
+	case sudoprobe.Granted:
+		out.Escaped = true
+		out.Detail = "the account is permitted sudo (`sudo -l -U` listed rights): a sudo'd socket carries a non-anon uid"
+	case sudoprobe.Denied:
+		// Escaped=false, Inconclusive=false: a conclusive no-escape.
+	case sudoprobe.Unknown:
+		out.Inconclusive = true
+		out.Detail = "could not classify `sudo -l -U` output (neither a not-allowed denial nor a permitted-commands listing): the sudo vector is not conclusively checked"
+	}
+	return out
 }
 
 // LANExemptionNotADNSHoleAssertion is the Tails leak-catalogue row-2 decision, only

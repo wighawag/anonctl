@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/wighawag/anonctl/internal/lanexempt"
+	"github.com/wighawag/anonctl/internal/sudoprobe"
 )
 
 // clearLANDNSReached reports whether a DIRECT clear-DNS query from the anon UID to
@@ -395,23 +396,38 @@ func uidTransitionVectors(ctx context.Context, p LiveParams) []UIDTransitionVect
 // sudoVector probes the sudo escape: whether the anon account has ANY sudo rights
 // (a sudo'd command runs as a DIFFERENT, typically root, uid and its socket
 // escapes the `meta skuid` forcing). It runs `sudo -l -U <account>` (list the
-// account's permitted sudo commands): sudo exits non-zero ("not allowed to run
-// sudo") when the account has none, so a zero exit means it CAN sudo (an escape).
+// account's permitted sudo commands) and decides from the OUTPUT, NOT the exit
+// code: some sudo builds (observed: 1.9.16p2,
+// work/notes/findings/e2e-binary-revalidation-2.md) print the not-allowed text yet
+// exit 0 for a no-rights account, so an exit-code-only read false-alarms a sudo
+// escape (the actual source of the no-uid-transition-egress false-positive). It
+// reads stdout+stderr (the negative is commonly on stderr, the listing on stdout),
+// classifies via the shared sudoprobe.ParseOutput (the SAME parse provision's
+// status uses, not a duplicate), and maps the verdict via sudoVectorFromVerdict.
 // A missing `sudo` binary means the vector is closed for this account too
-// (reported as checked-and-not-escaped). This mirrors provision's sudoAllowed
-// probe (the same `sudo -l -U` truth), read here as the verify-side escape signal.
+// (reported as checked-and-not-escaped).
 func sudoVector(ctx context.Context, p LiveParams) UIDTransitionVector {
-	v := UIDTransitionVector{Name: "sudo"}
 	if _, err := exec.LookPath("sudo"); err != nil {
-		return v // no sudo binary: no sudo transition path here
+		return UIDTransitionVector{Name: "sudo"} // no sudo binary: no sudo transition path here
 	}
 	cctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
-	if err := exec.CommandContext(cctx, "sudo", "-l", "-U", p.Account).Run(); err == nil {
-		v.Escaped = true
-		v.Detail = "the account is permitted sudo (`sudo -l -U` listed rights): a sudo'd socket carries a non-anon uid"
-	}
-	return v
+	stdout, stderr := runSudoList(cctx, p.Account)
+	return sudoVectorFromVerdict(sudoprobe.ParseOutput(stdout + "\n" + stderr))
+}
+
+// runSudoList shells out to `sudo -l -U <account>` and returns its stdout+stderr
+// (the exit code is DELIBERATELY ignored: the verdict is read from the OUTPUT via
+// sudoprobe.ParseOutput, robust to lenient builds that exit 0 for a no-rights
+// account). It is the sudoVector's ONLY sudo access and lives here
+// (integration-tagged) because the live probe needs a real sudo.
+func runSudoList(ctx context.Context, account string) (stdout, stderr string) {
+	cmd := exec.CommandContext(ctx, "sudo", "-l", "-U", account)
+	var out, errb strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &errb
+	_ = cmd.Run()
+	return out.String(), errb.String()
 }
 
 // setuidWrapperVector probes one setuid "run a command as another uid" wrapper

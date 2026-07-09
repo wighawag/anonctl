@@ -24,6 +24,7 @@ import (
 
 	"github.com/wighawag/anonctl/internal/cli"
 	"github.com/wighawag/anonctl/internal/marker"
+	"github.com/wighawag/anonctl/internal/sudoprobe"
 )
 
 // Runner abstracts command execution so provisioning is unit-testable without a
@@ -245,13 +246,13 @@ func Status(ctx context.Context, r Runner, account string) (AccountStatus, error
 	// escape). See sudoRights for the parse and how UNKNOWN maps onto the pair.
 	if exists {
 		switch sudoRights(ctx, r, account) {
-		case sudoDenied:
+		case sudoprobe.Denied:
 			st.SudoChecked = true
 			st.SudoAllowed = false
-		case sudoGranted:
+		case sudoprobe.Granted:
 			st.SudoChecked = true
 			st.SudoAllowed = true
-		case sudoUnknown:
+		case sudoprobe.Unknown:
 			// Leave SudoChecked=false: no reliable verdict. The `status` shell renders
 			// this as an explicit UNKNOWN line (see main.go runStatus).
 		}
@@ -259,54 +260,16 @@ func Status(ctx context.Context, r Runner, account string) (AccountStatus, error
 	return st, nil
 }
 
-// sudoVerdict is the three-valued result of the sudo-absence probe. sudo-absence
-// cannot be read from the exit code alone: some sudo builds (observed: 1.9.16p2,
-// work/notes/findings/e2e-binary-revalidation-2.md) print the not-allowed text yet
-// exit 0 for a no-rights account, so an exit-code-only read false-alarms "can
-// sudo". We read the OUTPUT instead, and honestly report sudoUnknown when it is
-// neither a clear grant nor a clear denial rather than guessing either way.
-type sudoVerdict int
-
-const (
-	// sudoUnknown: the probe could not be classified (empty/ambiguous/unparseable
-	// output, or the probe could not run). Surfaced as UNKNOWN / not-checked, NEVER
-	// as a false "has sudo" or a false "no sudo".
-	sudoUnknown sudoVerdict = iota
-	// sudoDenied: the output carries the decisive "not allowed to run sudo" negative.
-	// The account has no sudo rights (the hardened state), whatever the exit code.
-	sudoDenied
-	// sudoGranted: the output lists permitted commands (a real grant). The account
-	// CAN sudo (a uid-transition escape), whatever the exit code.
-	sudoGranted
-)
-
 // sudoRights probes whether the account has ANY sudo rights via
 // `sudo -l -U <account>` (list the account's permitted sudo commands) and decides
 // from the OUTPUT, not the exit code. It reads stdout+stderr (the negative is
-// commonly on stderr, the listing on stdout) and classifies via parseSudoOutput.
-// This is the PROVE side of the sudo vector, robust to lenient sudo builds that
-// exit 0 for a no-rights account.
-func sudoRights(ctx context.Context, r Runner, account string) sudoVerdict {
+// commonly on stderr, the listing on stdout) and classifies via the SHARED
+// sudoprobe.ParseOutput (the SAME parse verify's sudoVector uses, not a
+// duplicate). This is the PROVE side of the sudo vector, robust to lenient sudo
+// builds that exit 0 for a no-rights account.
+func sudoRights(ctx context.Context, r Runner, account string) sudoprobe.Verdict {
 	stdout, stderr, _ := r.Run(ctx, "sudo", "-l", "-U", account)
-	return parseSudoOutput(stdout + "\n" + stderr)
-}
-
-// parseSudoOutput classifies `sudo -l -U <account>` OUTPUT into the three-valued
-// verdict WITHOUT trusting the exit code. It is a pure function so the parse is
-// unit-testable against real-shaped fixtures. Precedence is DENY-first: if the
-// decisive "not allowed to run sudo" negative is present the account has no rights
-// even on a build that also prints noise; else a permitted-commands listing ("may
-// run the following commands") is a grant; anything else is UNKNOWN (we do not
-// guess). Matching is case-insensitive to tolerate build/locale casing drift.
-func parseSudoOutput(out string) sudoVerdict {
-	lower := strings.ToLower(out)
-	if strings.Contains(lower, "not allowed to run sudo") {
-		return sudoDenied
-	}
-	if strings.Contains(lower, "may run the following commands") {
-		return sudoGranted
-	}
-	return sudoUnknown
+	return sudoprobe.ParseOutput(stdout + "\n" + stderr)
 }
 
 // ensureLoginAccount creates the login account if absent (idempotent). It is a

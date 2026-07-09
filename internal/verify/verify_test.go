@@ -9,6 +9,7 @@ import (
 
 	"github.com/wighawag/anonctl/internal/endpoint"
 	"github.com/wighawag/anonctl/internal/socks5hfixture"
+	"github.com/wighawag/anonctl/internal/sudoprobe"
 )
 
 // --- Report: greenness, exit code, no-short-circuit (the CI-gating contract) ---
@@ -424,6 +425,74 @@ func TestNoUIDTransitionEgressAssertion_FailsWhenAnyVectorEscapes(t *testing.T) 
 	}
 	if !strings.Contains(a.Detail, "setuid:exim-submit") {
 		t.Fatalf("detail must name the offending vector; got %q", a.Detail)
+	}
+}
+
+// sudoVectorFromVerdict is the PURE sudo-vector decision the live probe feeds:
+// it maps the shared sudoprobe.Verdict (read from `sudo -l -U` OUTPUT, not the
+// exit code) onto the UID-transition vector. Denied => the sudo path did NOT
+// escape; Granted => it ESCAPED (a real sudo path off the anon UID). This is the
+// twin of provision's status mapping, read here as the verify-side escape signal.
+func TestSudoVectorFromVerdict_DeniedIsNoEscape(t *testing.T) {
+	v := sudoVectorFromVerdict(sudoprobe.Denied)
+	if v.Name != "sudo" {
+		t.Fatalf("vector name = %q, want sudo", v.Name)
+	}
+	if v.Escaped {
+		t.Fatalf("a Denied verdict (no sudo rights) must NOT escape; got %+v", v)
+	}
+	if v.Inconclusive {
+		t.Fatalf("a Denied verdict is a conclusive no-escape, not inconclusive; got %+v", v)
+	}
+}
+
+// A real grant is still caught: Granted => Escaped=true (a sudo'd socket carries a
+// non-anon uid), so the parse-based read never hides a real sudo escape.
+func TestSudoVectorFromVerdict_GrantedIsEscape(t *testing.T) {
+	v := sudoVectorFromVerdict(sudoprobe.Granted)
+	if !v.Escaped {
+		t.Fatalf("a Granted verdict (real sudo rights) must ESCAPE; got %+v", v)
+	}
+	if v.Inconclusive {
+		t.Fatalf("a Granted verdict is a conclusive escape, not inconclusive; got %+v", v)
+	}
+	if v.Detail == "" {
+		t.Fatalf("an escaping sudo vector must carry a detail line; got %+v", v)
+	}
+}
+
+// An ambiguous / unparseable probe is surfaced HONESTLY: Unknown maps to
+// NOT-conclusively-checked (Inconclusive=true), never a false Escaped=true (a
+// false alarm) NOR a false conclusive Escaped=false that would hide a real sudo
+// path. Consistent with the best-effort framing of the assertion.
+func TestSudoVectorFromVerdict_UnknownIsHonestlyInconclusive(t *testing.T) {
+	v := sudoVectorFromVerdict(sudoprobe.Unknown)
+	if v.Escaped {
+		t.Fatalf("an Unknown verdict must NEVER false-alarm as an escape; got %+v", v)
+	}
+	if !v.Inconclusive {
+		t.Fatalf("an Unknown verdict must be surfaced as not-conclusively-checked; got %+v", v)
+	}
+	if v.Detail == "" {
+		t.Fatalf("an inconclusive sudo vector must carry an honest detail line; got %+v", v)
+	}
+}
+
+// An INCONCLUSIVE vector does not fail the assertion (it is not an escape) and is
+// not silently dropped: the assertion still passes on the vectors it conclusively
+// checked, and its detail names the inconclusive vector so the not-conclusive
+// status is surfaced, never a silent pass.
+func TestNoUIDTransitionEgressAssertion_SurfacesInconclusiveVector(t *testing.T) {
+	vectors := []UIDTransitionVector{
+		{Name: "sudo", Inconclusive: true, Detail: "could not classify `sudo -l -U` output"},
+		{Name: "setuid:pkexec", Escaped: false},
+	}
+	a := NoUIDTransitionEgressAssertion(vectors)
+	if !a.Ok {
+		t.Fatalf("an inconclusive (not-escaped) vector must not FAIL the best-effort assertion; got %+v", a)
+	}
+	if !strings.Contains(a.Detail, "sudo") || !strings.Contains(strings.ToLower(a.Detail), "not conclusively checked") {
+		t.Fatalf("detail must surface the inconclusive vector honestly (not a silent pass); got %q", a.Detail)
 	}
 }
 
