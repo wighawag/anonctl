@@ -72,11 +72,17 @@ func offBoxLeakReached(ctx context.Context, p LiveParams, counterDaddr, l4 strin
 	if _, err := exec.LookPath("nft"); err != nil {
 		return false, fmt.Errorf("escaped-leak counter probe cannot run: nft not found: %w", err)
 	}
-	ruleset := escapedLeakCounterRuleset(p.AnonUID, counterDaddr, l4, port)
+	// A UNIQUELY-NAMED scratch table per probe: `verify.Run` runs the probes
+	// concurrently, and several plant a counter, so a shared table name would collide
+	// (this defer's delete would tear down a sibling probe's live counter, or the
+	// create below would fail on an existing table). Each probe creates + reads +
+	// deletes its OWN table, so parallel probes never fight over one name.
+	table := uniqueEscapedLeakCounterTable()
+	ruleset := escapedLeakCounterRuleset(table, p.AnonUID, counterDaddr, l4, port)
 	if _, stderr, err := nftRun(ctx, ruleset, "nft", "-f", "-"); err != nil {
 		return false, fmt.Errorf("plant escaped-leak counter: %w (%s)", err, stderr)
 	}
-	defer func() { _, _, _ = nftRun(ctx, "delete table inet "+escapedLeakCounterTable, "nft", "-f", "-") }()
+	defer func() { _, _, _ = nftRun(ctx, "delete table inet "+table, "nft", "-f", "-") }()
 
 	// Dial the off-box destination AS the anon UID; a genuine leak keeps the off-box
 	// daddr and hits the counter, a redirect/drop does not. We ignore whether the
@@ -85,13 +91,21 @@ func offBoxLeakReached(ctx context.Context, p LiveParams, counterDaddr, l4 strin
 	// propagated LOUD: if the dial never happened, a counter that stayed 0 is not
 	// evidence of "no leak", it is evidence of "nothing was probed" (a probe that
 	// could not run is not a pass).
-	pctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	//
+	// 3s deadline: this probe PASSES by the packet being DROPPED/redirected (the
+	// counter never moves), which is knowable FAST, so a long deadline just adds dead
+	// wall time. It matches the hand recipe's snappy `ping -W 3` / `curl -m` closure
+	// checks (work/notes/findings/manual-per-uid-tor-recipe.md). A genuine clear
+	// escape moves the counter on the very first datagram, well inside 3s; the margin
+	// covers a slow setpriv/shim exec, not a slow network round-trip (there is none:
+	// the whole point is that nothing should egress).
+	pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	if _, _, perr := runSetprivProbe(pctx, p.AnonUID, probeNetwork, probeAddr); perr != nil {
 		return false, perr
 	}
 
-	out, stderr, err := nftRun(ctx, "", "nft", "list", "table", "inet", escapedLeakCounterTable)
+	out, stderr, err := nftRun(ctx, "", "nft", "list", "table", "inet", table)
 	if err != nil {
 		return false, fmt.Errorf("read escaped-leak counter: %w (%s)", err, stderr)
 	}
@@ -213,13 +227,17 @@ func pingAsAnon(ctx context.Context, p LiveParams, target string) (reached bool,
 	if _, e := exec.LookPath("ping"); e != nil {
 		return false, fmt.Errorf("need ping on PATH to run the icmp-drop probe: %w", e)
 	}
-	pctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	// 3s deadline / -W 2 reply wait: icmp-drop PASSES by the ping getting NO reply (a
+	// dropped ICMP echo), which is knowable fast, so a long wait just burns wall time.
+	// -W 2 already exceeds any real off-box RTT; the 3s context is a small margin over
+	// -W 2 for the setpriv exec, not for a slow network (a dropped ping never answers).
+	pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	// -c 1 one packet, -W 3 three-second reply wait, -n numeric. Run under setpriv
+	// -c 1 one packet, -W 2 two-second reply wait, -n numeric. Run under setpriv
 	// so the ICMP socket is owned by the anon UID (the nft rules key on meta skuid).
 	cmd := exec.CommandContext(pctx, "setpriv",
 		"--reuid", strconv.Itoa(p.AnonUID), "--clear-groups",
-		"ping", "-c", "1", "-W", "3", "-n", target)
+		"ping", "-c", "1", "-W", "2", "-n", target)
 	out, _ := cmd.CombinedOutput()
 	s := string(out)
 	// A reply ("1 received" / "bytes from") means ICMP egressed and came back (a

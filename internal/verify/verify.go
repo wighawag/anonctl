@@ -53,6 +53,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/wighawag/anonctl/internal/endpoint"
 	"github.com/wighawag/anonctl/internal/sudoprobe"
@@ -267,28 +268,57 @@ func Run(ctx context.Context, checks []Check) Report {
 	return RunWith(ctx, checks, Progress{})
 }
 
-// RunWith is Run with an optional per-check Progress hook: it fires prog.Start
-// before each check and prog.Done after, so a caller can stream "running <name>"
-// then the completed PASS/FAIL as each probe finishes. The hook is observation
-// ONLY: it does not alter the checks, their order, the no-short-circuit rule, or
-// the resulting Report (a nil/zero Progress makes RunWith identical to Run). The
-// assertion passed to Done is the FINAL one, with its Name already defaulted from
-// the check, so the caller renders the same line the report will.
+// RunWith is Run with an optional per-check Progress hook. It runs the checks
+// CONCURRENTLY (each in its own goroutine): the leak/closure probes PASS by TIMING
+// OUT (a dropped packet never answers, so each waits its full deadline), and they
+// are INDEPENDENT (different off-box destinations / assertions), so running them in
+// parallel makes verify's wall time the MAX single probe time, not the SUM of every
+// timeout, a multi-x speedup with identical coverage.
+//
+// Concurrency does NOT weaken any contract:
+//   - ORDER: the Report's assertions are collected into a pre-sized slice at each
+//     check's ORIGINAL index, so the report is deterministic (original check order),
+//     regardless of which goroutine finishes first. No short-circuit: every check
+//     runs (a leak-test must show ALL failures), and a check whose assertion has no
+//     Name inherits the check's Name.
+//   - PROGRESS: prog.Start fires for every check UP FRONT in original order (the
+//     checks now start together, so there is no per-check "about to start" moment to
+//     interleave), and prog.Done fires once per check as it COMPLETES. Both hooks are
+//     funnelled through one mutex so they are NEVER invoked concurrently: the caller's
+//     writer (main renders to stderr) sees serialised calls and needs no locking of
+//     its own. A nil/zero Progress makes RunWith a pure concurrent Run.
+//
+// A shared parent ctx is fine: each check already applies its own per-probe timeout.
 func RunWith(ctx context.Context, checks []Check, prog Progress) Report {
-	var rep Report
-	for _, c := range checks {
-		if prog.Start != nil {
+	rep := Report{Assertions: make([]Assertion, len(checks))}
+	// Fire every Start up front, in original order: the checks run concurrently, so
+	// there is no sequential "about to run this one" point to interleave with Done.
+	if prog.Start != nil {
+		for _, c := range checks {
 			prog.Start(c.Name)
 		}
-		a := c.Run(ctx)
-		if a.Name == "" {
-			a.Name = c.Name
-		}
-		if prog.Done != nil {
-			prog.Done(a)
-		}
-		rep.Assertions = append(rep.Assertions, a)
 	}
+	var wg sync.WaitGroup
+	var doneMu sync.Mutex // serialises prog.Done so a caller's writer never races
+	for i, c := range checks {
+		wg.Add(1)
+		go func(i int, c Check) {
+			defer wg.Done()
+			a := c.Run(ctx)
+			if a.Name == "" {
+				a.Name = c.Name
+			}
+			// Disjoint index per goroutine: no two goroutines write the same slot, so
+			// there is no data race on rep.Assertions (each element is written once).
+			rep.Assertions[i] = a
+			if prog.Done != nil {
+				doneMu.Lock()
+				prog.Done(a)
+				doneMu.Unlock()
+			}
+		}(i, c)
+	}
+	wg.Wait()
 	return rep
 }
 
