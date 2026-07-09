@@ -39,17 +39,30 @@ const escapedLeakCounterTable = "anonctl_verify_escapedleak"
 //
 // daddr is the off-box destination the probe dials (a documentation/off-box IP);
 // its family selects ip/ip6. l4 is "tcp" or "udp". A port <= 0 counts the daddr on
-// any port of that l4 (the closure probes, which care that NO clear TCP escapes to
+// ANY port of that l4 (the closure probes, which care that NO clear TCP escapes to
 // the off-box host); a port > 0 pins it (the raw-UDP row, an off-box UDP port).
 // The chain policy is accept: the counter only OBSERVES, it never changes forcing.
+//
+// The whole-protocol (port-omitted) match is `meta l4proto <l4>`, NOT a bare
+// `<l4>`: a bare `... ip daddr <X> tcp counter` is INVALID nft (nft reads `tcp` as
+// a protocol keyword expecting a match like `dport`, so `tcp counter` is a parse
+// error, `Error: syntax error, unexpected counter`). `meta l4proto tcp` is the
+// valid all-TCP match (the hand recipe's own `meta l4proto tcp redirect` shape,
+// work/notes/findings/manual-per-uid-tor-recipe.md). Rendering the invalid bare
+// form was the latent false-green: the rule failed to plant and the swallowed
+// plant error read as "no leak", so the closure assertions passed WITHOUT probing.
 func escapedLeakCounterRuleset(anonUID int, daddr string, l4 string, port int) string {
 	family := "ip"
 	if ip := net.ParseIP(daddr); ip != nil && ip.To4() == nil {
 		family = "ip6"
 	}
-	match := fmt.Sprintf("meta skuid %d %s daddr %s %s", anonUID, family, daddr, l4)
+	var match string
 	if port > 0 {
-		match += " dport " + strconv.Itoa(port)
+		// Pin the specific off-box port (the raw-UDP row): `<l4> dport <port>` is valid.
+		match = fmt.Sprintf("meta skuid %d %s daddr %s %s dport %d", anonUID, family, daddr, l4, port)
+	} else {
+		// Match the WHOLE protocol to that daddr (the TCP closures): `meta l4proto <l4>`.
+		match = fmt.Sprintf("meta skuid %d %s daddr %s meta l4proto %s", anonUID, family, daddr, l4)
 	}
 	return fmt.Sprintf(`table inet %s {
     chain out {

@@ -258,6 +258,34 @@ func TestLeakDropAssertion_NamesAreDistinctPerFamily(t *testing.T) {
 	}
 }
 
+// TestEscapedLeakProbeAssertion_ProbeErrorIsNotAPass is the CORE of the false-green
+// fix: a probe that could not RUN (a counter plant/read error) must produce a LOUD
+// error verdict (Err set, Ok false), NEVER a silent pass. The old behaviour
+// swallowed a plant error to reached=false, and reached=false reads as "nothing
+// escaped" => the closure assertion PASSED without ever probing. This pins that an
+// error can no longer masquerade as a clean probe.
+func TestEscapedLeakProbeAssertion_ProbeErrorIsNotAPass(t *testing.T) {
+	plantErr := errors.New("plant escaped-leak counter: invalid nft")
+	a := escapedLeakProbeAssertion(AssertBypassLoopbackClosure, "the anon UID reaching a non-shim loopback destination", false, plantErr)
+	if a.Ok {
+		t.Fatalf("a counter plant/read ERROR must FAIL the assertion (a probe that could not run is not a pass), even with reached=false; got %+v", a)
+	}
+	if a.Err == nil {
+		t.Fatalf("the probe error must be SURFACED on the assertion (Err set), not swallowed; got %+v", a)
+	}
+	if a.Name != AssertBypassLoopbackClosure {
+		t.Fatalf("the assertion must keep its name on an error verdict; got %+v", a)
+	}
+	// A clean probe (no error) still decides on the observed reached value: dropped
+	// (reached=false) passes; a real escape (reached=true) fails.
+	if ok := escapedLeakProbeAssertion(AssertBypassLoopbackClosure, "x", false, nil); !ok.Ok || ok.Err != nil {
+		t.Fatalf("a clean dropped probe must PASS with no error; got %+v", ok)
+	}
+	if leak := escapedLeakProbeAssertion(AssertBypassLoopbackClosure, "x", true, nil); leak.Ok {
+		t.Fatalf("a clean probe that observed a real escape must FAIL (a leak); got %+v", leak)
+	}
+}
+
 func TestBypassClosureAssertions_PassWhenDropped(t *testing.T) {
 	if a := BypassLoopbackClosureAssertion(false); !a.Ok || a.Name != "bypass-loopback-closure" {
 		t.Fatalf("loopback closure: dropped must PASS with the right name; got %+v", a)

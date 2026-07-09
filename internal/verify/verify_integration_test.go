@@ -650,11 +650,16 @@ func TestLiveNoUIDTransitionEgress(t *testing.T) {
 func offBoxLeakReachedTest(t *testing.T, ctx context.Context, nr nftRunner, anonUID, anonGID int, daddr, l4 string, port int) bool {
 	t.Helper()
 	const counterTable = "anonctl_vitest_escapedleak"
-	match := "meta skuid " + strconv.Itoa(anonUID) + " ip daddr " + daddr + " " + l4
+	// Match the production renderer's valid shapes (counter.go): a positive port pins
+	// `<l4> dport <port>`; a port-omitted (whole-protocol) case is `meta l4proto
+	// <l4>`, NOT a bare `<l4>` (which is INVALID nft: `<l4> counter` is a parse error
+	// and was the latent false-green).
+	match := "meta skuid " + strconv.Itoa(anonUID) + " ip daddr " + daddr
 	dialPort := port
 	if port > 0 {
-		match += " dport " + strconv.Itoa(port)
+		match += " " + l4 + " dport " + strconv.Itoa(port)
 	} else {
+		match += " meta l4proto " + l4
 		dialPort = 9999 // a port-omitted TCP closure still needs a concrete dial port
 	}
 	ruleset := "table inet " + counterTable + " {\n  chain out {\n    type filter hook output priority 50; policy accept;\n    " + match + " counter\n  }\n}\n"

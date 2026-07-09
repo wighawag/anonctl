@@ -94,7 +94,10 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 			// tcp + udp/53, so raw UDP falls through to the policy DROP (recipe row 3's
 			// `socat UDP4:1.1.1.1:9999` EPERM). If the v4 drop were broken the datagram
 			// would escape with the off-box daddr and move the counter (a real leak).
-			return LeakDropAssertion("v4", offBoxReachedAsAnon(ctx, p, offBoxProbeV4, "udp", offBoxProbePort))
+			// A counter plant/read error fails LOUD (a probe that could not run is not a
+			// pass), never a silent reached=false green.
+			reached, err := offBoxReachedAsAnon(ctx, p, offBoxProbeV4, "udp", offBoxProbePort)
+			return escapedLeakProbeAssertion(AssertLeakDropV4, "a direct v4 connection from the anon UID", reached, err)
 		}},
 		{Name: AssertLeakDropV6, Run: func(ctx context.Context) Assertion {
 			return LeakDropAssertion("v6", probeAsAnon(ctx, p, "tcp6", "[::1]:1"))
@@ -106,8 +109,12 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 			// signal is that NO anon-UID TCP escapes the box carrying an OFF-BOX daddr in
 			// the clear. We dial an off-box TCP host and watch the escaped-leak counter
 			// keyed on that daddr: a redirected packet has its daddr rewritten to the shim
-			// (no match, PASS); a genuine escape keeps the off-box daddr (FAIL).
-			return BypassLoopbackClosureAssertion(offBoxReachedAsAnon(ctx, p, offBoxProbeV4, "tcp", 0))
+			// (no match, PASS); a genuine escape keeps the off-box daddr (FAIL). A
+			// counter plant/read error fails LOUD (a probe that could not run is not a
+			// pass), the exact false-green this closes: the invalid-nft counter used to
+			// swallow to reached=false and pass this closure WITHOUT probing.
+			reached, err := offBoxReachedAsAnon(ctx, p, offBoxProbeV4, "tcp", 0)
+			return escapedLeakProbeAssertion(AssertBypassLoopbackClosure, "the anon UID reaching a non-shim loopback destination", reached, err)
 		}},
 		{Name: AssertBypassEndpointClosure, Run: func(ctx context.Context) Assertion {
 			// Closure (b): the anon UID dialling the upstream endpoint directly must not
@@ -120,7 +127,8 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 			// counter would also catch the anon UID's legitimate (redirected) shim traffic.
 			// A genuine direct escape to the endpoint keeps daddr:port and moves it (FAIL).
 			endpointAddr := net.JoinHostPort(p.EndpointHost, strconv.Itoa(p.EndpointPort))
-			return BypassEndpointClosureAssertion(offBoxReachedAsAnon(ctx, p, p.EndpointHost, "tcp", p.EndpointPort, "tcp4", endpointAddr))
+			reached, err := offBoxReachedAsAnon(ctx, p, p.EndpointHost, "tcp", p.EndpointPort, "tcp4", endpointAddr)
+			return escapedLeakProbeAssertion(AssertBypassEndpointClosure, "the anon UID dialling the upstream endpoint directly", reached, err)
 		}},
 		{Name: AssertICMPDrop, Run: func(ctx context.Context) Assertion {
 			// Tails leak-catalogue row 4: an ICMP echo from the anon UID to an off-box
@@ -160,15 +168,26 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 			// into the shim, so a loopback handshake with the relay would false-"reach".
 			// Read the escaped-leak counter keyed on the sibling's off-box daddr instead:
 			// it stays 0 (redirected) unless the exemption widened into a real direct hole.
+			// A counter plant/read error fails the assertion LOUD (a probe that could not
+			// run is not a pass), never a silent reached=false green: this was the second
+			// false-green (the invalid-nft counter swallowed to reached=false and passed
+			// split-tunnel-tight WITHOUT probing the non-exempt sibling).
 			nonExempt := nonExemptLANOf(p.Exempt)
 			nonExemptReached := false
 			if host, _, err := net.SplitHostPort(nonExempt); err == nil {
-				nonExemptReached = offBoxReachedAsAnon(ctx, p, host, "tcp", 0, "tcp4", nonExempt)
+				reached, perr := offBoxReachedAsAnon(ctx, p, host, "tcp", 0, "tcp4", nonExempt)
+				if perr != nil {
+					return Assertion{Name: AssertSplitTunnelTight, Err: perr}
+				}
+				nonExemptReached = reached
 			}
 			return SplitTunnelTightAssertion(p.Exempt, exemptReached, nonExemptReached)
 		}})
 		checks = append(checks, Check{Name: AssertLANExemptionNotADNSHole, Run: func(ctx context.Context) Assertion {
-			tcp53, udp53 := clearLANDNSLeaked(ctx, p)
+			tcp53, udp53, err := clearLANDNSLeaked(ctx, p)
+			if err != nil {
+				return Assertion{Name: AssertLANExemptionNotADNSHole, Err: err}
+			}
 			return LANExemptionNotADNSHoleAssertion(p.Exempt, tcp53, udp53)
 		}})
 	}
@@ -183,16 +202,22 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 // a naive dig STILL answers, so "reached" here means a CLEAR packet actually left
 // to the exempted host's :53, which is only possible if the exemption punched a
 // DNS hole. With 53 excluded from the exemption (guardrail + nft), both must come
-// back false. It returns (tcp53Reached, udp53Reached).
-func clearLANDNSLeaked(ctx context.Context, p LiveParams) (tcp53, udp53 bool) {
+// back false. It returns (tcp53Reached, udp53Reached, err): a counter plant/read
+// error is PROPAGATED so the assertion fails LOUD (a probe that could not run is
+// not a pass), never swallowed to a silent no-hole pass.
+func clearLANDNSLeaked(ctx context.Context, p LiveParams) (tcp53, udp53 bool, err error) {
 	host := exemptHost(p.Exempt)
 	if host == "" {
-		return false, false
+		return false, false, nil
 	}
 	dns := net.JoinHostPort(host, strconv.Itoa(lanexempt.DNSPort))
-	tcp53 = clearLANDNSReached(ctx, p, "tcp4", dns)
-	udp53 = clearLANDNSReached(ctx, p, "udp4", dns)
-	return tcp53, udp53
+	if tcp53, err = clearLANDNSReached(ctx, p, "tcp4", dns); err != nil {
+		return false, false, err
+	}
+	if udp53, err = clearLANDNSReached(ctx, p, "udp4", dns); err != nil {
+		return false, false, err
+	}
+	return tcp53, udp53, nil
 }
 
 // exemptHost extracts the host from the exempted host:port (empty on a malformed
@@ -229,7 +254,11 @@ func udpSendAsAnon(ctx context.Context, p LiveParams, addr string) bool {
 // loopback-endpoint closure: dial 127.0.0.1:<endpoint>, watch its daddr). Omitted,
 // the probe dials counterDaddr on port (or a default high port for a port-omitted
 // TCP closure) over l4 directly.
-func offBoxReachedAsAnon(ctx context.Context, p LiveParams, counterDaddr, l4 string, port int, probe ...string) bool {
+//
+// It returns (reached, err): a counter plant/read ERROR is PROPAGATED so the
+// caller can fail the assertion LOUD (escapedLeakProbeAssertion), never swallowed
+// to a silent reached=false pass.
+func offBoxReachedAsAnon(ctx context.Context, p LiveParams, counterDaddr, l4 string, port int, probe ...string) (bool, error) {
 	var probeNetwork, probeAddr string
 	if len(probe) == 2 {
 		probeNetwork, probeAddr = probe[0], probe[1]

@@ -45,11 +45,31 @@ func TestEscapedLeakCounterRuleset_KeysOnTheOffBoxDaddr(t *testing.T) {
 	if !strings.Contains(rs, "ip daddr 192.0.2.1") {
 		t.Fatalf("counter must key on the off-box daddr; got:\n%s", rs)
 	}
-	if !strings.Contains(rs, "tcp counter") && !strings.Contains(rs, "tcp  counter") {
-		t.Fatalf("a port-omitted counter must match ANY port of the l4 (no dport clause); got:\n%s", rs)
-	}
 	if strings.Contains(rs, "dport") {
 		t.Fatalf("a port <= 0 must NOT pin a dport (it catches any port of the l4); got:\n%s", rs)
+	}
+}
+
+// TestEscapedLeakCounterRuleset_NoPortEmitsValidWholeProtocolMatch: the WHOLE-
+// PROTOCOL (port-omitted) case must render VALID nft. A bare `... ip daddr <X>
+// tcp counter` is a SYNTAX ERROR (nft reads `tcp` as a protocol keyword expecting
+// a match like `dport`, so `tcp counter` fails to parse: `Error: syntax error,
+// unexpected counter` on nftables v1.1.3). The valid all-TCP/all-UDP match is
+// `meta l4proto tcp` (the hand recipe's own `meta l4proto tcp redirect` shape,
+// work/notes/findings/manual-per-uid-tor-recipe.md). This was the latent false-
+// green: the invalid rule failed to plant and the swallowed error read as no leak,
+// so the closure assertions passed WITHOUT probing.
+func TestEscapedLeakCounterRuleset_NoPortEmitsValidWholeProtocolMatch(t *testing.T) {
+	for _, l4 := range []string{"tcp", "udp"} {
+		rs := escapedLeakCounterRuleset(1001, "192.0.2.1", l4, 0)
+		if !strings.Contains(rs, "meta l4proto "+l4+" counter") {
+			t.Fatalf("a port-omitted counter must match the WHOLE protocol via `meta l4proto %s` (valid nft), not a bare `%s counter`; got:\n%s", l4, l4, rs)
+		}
+		// The bare `... daddr <X> <l4> counter` shape (a protocol keyword directly
+		// before `counter`) is the invalid-nft false-green; it must be gone.
+		if strings.Contains(rs, "192.0.2.1 "+l4+" counter") {
+			t.Fatalf("a bare `%s counter` after the daddr is INVALID nft (a parse error) and must NOT be emitted; got:\n%s", l4, rs)
+		}
 	}
 }
 
