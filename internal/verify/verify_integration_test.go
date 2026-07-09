@@ -289,43 +289,45 @@ func TestLiveLeakAndClosuresAgainstRealRuleset(t *testing.T) {
 	}()
 	time.Sleep(300 * time.Millisecond) // let the shim bind
 
-	// --- leak-drop-v4 (LOAD-BEARING): a direct v4 connection from the anon UID to
-	// an off-box destination must be DROPPED. We dial a routable-but-unrelated v4
-	// address on a port the ruleset does not redirect for a raw TCP dial that would
-	// only succeed if egress were NOT forced/dropped. Because ALL non-shim TCP from
-	// the anon UID is redirected into the shim (which dials the fixture), a TCP dial
-	// to an arbitrary off-box IP is captured by the shim, so to prove the DROP we
-	// probe a NON-redirected path: a direct dial to the fixture endpoint's own
-	// port from the anon UID is closure (b) below; the pure leak drop here uses a
-	// UDP-family probe, which nft drops (SOCKS carries TCP only).
-	//
-	// v4 leak: the anon UID reaching a non-shim, non-exempt loopback TCP port is
-	// dropped by closure (a); we assert the DROP feeds LeakDropAssertion too, since
-	// it is the same fail-closed property observed on v4.
-	reachedV4 := probeAsAnon(t, anonUID, anonGID, "tcp4", "127.0.0.1:1") // port 1: no shim, no service
+	// --- leak-drop-v4 (LOAD-BEARING): a direct v4 LEAK is an anon-UID packet leaving
+	// the box with an OFF-BOX v4 daddr in the clear. A loopback TCP handshake proves
+	// NOTHING here: the transparent SO_ORIGINAL_DST relay always completes it. We read
+	// the escaped-leak counter for a raw non-53 UDP datagram to an off-box v4 host (nat
+	// redirects only tcp + udp/53, so raw UDP falls through to the policy DROP, recipe
+	// row 3's EPERM). The counter stays 0 (dropped) => reached=false => PASS.
+	const offBox = "192.0.2.1"
+	reachedV4 := offBoxLeakReachedTest(t, ctx, nr, anonUID, anonGID, offBox, "udp", 9999)
 	if a := verify.LeakDropAssertion("v4", reachedV4); !a.Ok {
-		t.Fatalf("leak-drop-v4 must hold (a direct v4 dial from the anon UID must be DROPPED); got %+v", a)
+		t.Fatalf("leak-drop-v4 must hold (no anon-UID packet may escape to an off-box v4 daddr); got %+v", a)
 	}
 
 	// --- leak-drop-v6: all IPv6 egress from the anon UID is dropped (leak-free, not
-	// leaked). A direct v6 dial must be DROPPED.
+	// leaked). A direct v6 dial must be DROPPED. IPv6 has no redirect target, so a v6
+	// dial genuinely fails-closed (no relay in the way): a completed handshake would be
+	// a real leak, so the direct-dial signal is truthful here.
 	reachedV6 := probeAsAnon(t, anonUID, anonGID, "tcp6", "[::1]:1")
 	if a := verify.LeakDropAssertion("v6", reachedV6); !a.Ok {
 		t.Fatalf("leak-drop-v6 must hold (a direct v6 dial from the anon UID must be DROPPED); got %+v", a)
 	}
 
-	// --- bypass-loopback-closure (a): the anon UID reaching a NON-shim loopback
-	// port must be DROPPED. We dial a loopback port that is neither the relay nor
-	// the DNS port (and not the endpoint port); it must not connect.
-	nonShimPort := relayPort + 100
-	reachedLoopback := probeAsAnon(t, anonUID, anonGID, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(nonShimPort)))
+	// --- bypass-loopback-closure (a): the anon UID must not reach an arbitrary
+	// destination directly. Since ALL its TCP is redirected into the shim, a loopback
+	// dial completes the handshake with the relay and proves nothing; the honest
+	// signal is that NO anon-UID TCP escapes the box with an OFF-BOX daddr in the
+	// clear. Counter keyed on the off-box daddr stays 0 (redirected) => PASS.
+	reachedLoopback := offBoxLeakReachedTest(t, ctx, nr, anonUID, anonGID, offBox, "tcp", 0)
 	if a := verify.BypassLoopbackClosureAssertion(reachedLoopback); !a.Ok {
-		t.Fatalf("bypass-loopback-closure (a) must hold; got %+v", a)
+		t.Fatalf("bypass-loopback-closure (a) must hold (no anon-UID TCP escapes to an off-box daddr); got %+v", a)
 	}
 
 	// --- bypass-endpoint-closure (b): the anon UID dialling the upstream endpoint
-	// DIRECTLY must be DROPPED (so it can never skip the shim / isolation username).
-	reachedEndpoint := probeAsAnon(t, anonUID, anonGID, "tcp4", fx.Addr())
+	// DIRECTLY must not escape the box to the endpoint's address:PORT in the clear.
+	// The fixture endpoint is loopback, so its TCP is redirected into the shim (BOTH
+	// daddr and dport rewritten to the shim relay port); the counter keyed on the
+	// endpoint daddr AND its ORIGINAL port stays 0 => PASS. Keying on the port (not
+	// any-port) is load-bearing: an any-port 127.0.0.1 counter would also catch the
+	// anon UID's legitimate redirected shim traffic.
+	reachedEndpoint := offBoxLeakReachedTest(t, ctx, nr, anonUID, anonGID, "127.0.0.1", "tcp", endpointPort)
 	if a := verify.BypassEndpointClosureAssertion(reachedEndpoint); !a.Ok {
 		t.Fatalf("bypass-endpoint-closure (b) must hold; got %+v", a)
 	}
@@ -403,6 +405,57 @@ func TestLiveLeakAndClosuresAgainstRealRuleset(t *testing.T) {
 	// The sentinel stayed untouched throughout (host isolation).
 	if !tableExists(t, nr, sentinel) {
 		t.Fatalf("the ruleset clobbered the sentinel table (host not isolated)")
+	}
+}
+
+// TestEscapedLeakCounterStillCatchesARealLeak is the NEGATIVE control that proves
+// the re-pointed probes did NOT neuter leak detection: it deliberately installs a
+// LEAKY ruleset (the anon UID's raw off-box UDP is ACCEPTed, not dropped), then
+// asserts the escaped-leak counter MOVES and LeakDropAssertion("v4", reached) FAILS.
+// If this ever passes, the leak-drop probe has gone blind and the trust anchor is
+// worthless. It is isolated to a throwaway account + a scratch leaky table, torn
+// down always; the host's real forcing is never touched.
+func TestEscapedLeakCounterStillCatchesARealLeak(t *testing.T) {
+	requireLiveHost(t)
+	if probeHelperBin == "" {
+		t.Skip("probe helper failed to build; skipping")
+	}
+	ctx := context.Background()
+	r := execRunner{}
+	nr := nftRunner{}
+
+	account := "anon-vitest-leak-" + strconv.Itoa(os.Getpid())
+	if _, err := provision.Add(ctx, r, account); err != nil {
+		t.Fatalf("provision.Add(%s): %v", account, err)
+	}
+	const leakTable = "anonctl_vitest_realleak"
+	defer func() {
+		_, _, _ = nr.Run(ctx, "delete table inet "+leakTable, "nft", "-f", "-")
+		_, _ = provision.Rm(ctx, r, account, true)
+	}()
+
+	anonUID := uidOf(t, account)
+	anonGID := gidOf(t, account)
+
+	// A LEAKY ruleset: for the anon UID, ACCEPT (never drop) raw off-box UDP. This is
+	// exactly the fail-closed hole the leak-drop-v4 assertion must catch. It is a
+	// SEPARATE scratch table at a base priority; we do NOT apply the real fail-closed
+	// ruleset, so nothing redirects the datagram and it escapes with the off-box daddr.
+	const offBox = "192.0.2.1"
+	leaky := "table inet " + leakTable + " {\n  chain out {\n    type filter hook output priority 0; policy accept;\n    meta skuid " + strconv.Itoa(anonUID) + " ip daddr " + offBox + " udp dport 9999 accept\n  }\n}\n"
+	if _, stderr, err := nr.Run(ctx, leaky, "nft", "-f", "-"); err != nil {
+		t.Fatalf("plant leaky ruleset: %v: %s", err, stderr)
+	}
+
+	// The escaped-leak counter MUST move (a real off-box UDP packet left in the clear),
+	// and the pure assertion MUST therefore FAIL: the fix re-points the probe, it does
+	// NOT blind it.
+	reached := offBoxLeakReachedTest(t, ctx, nr, anonUID, anonGID, offBox, "udp", 9999)
+	if !reached {
+		t.Fatalf("a genuinely leaking setup (raw off-box UDP ACCEPTed) must be DETECTED as reached; got reached=false (leak detection is neutered)")
+	}
+	if a := verify.LeakDropAssertion("v4", reached); a.Ok {
+		t.Fatalf("leak-drop-v4 must FAIL on a real leak; got %+v", a)
 	}
 }
 
@@ -582,6 +635,66 @@ func TestLiveNoUIDTransitionEgress(t *testing.T) {
 	if !strings.Contains(got.Detail, "sudo") {
 		t.Fatalf("%s detail must name the checked sudo vector; got %q", verify.AssertNoUIDTransitionEgress, got.Detail)
 	}
+}
+
+// offBoxLeakReachedTest is the TEST-side twin of the production escaped-leak
+// counter (internal/verify/counter.go + offBoxLeakReached): it reports whether an
+// anon-UID packet ESCAPED the box still carrying the OFF-BOX daddr (a real leak) vs
+// was redirected into the shim / dropped (the PASS). Because the transparent relay
+// makes a loopback handshake always complete, this NEVER reads a completed
+// handshake; it plants a throwaway counter chain at a filter priority AFTER the
+// account's nat_out (dstnat/-100) keyed on the off-box daddr(+optional port), dials
+// the off-box destination AS the anon UID, and reads whether the counter moved. A
+// port <= 0 counts any port of the l4 (the TCP closures); a positive port pins it
+// (the raw-UDP row). It ALWAYS tears down its scratch table.
+func offBoxLeakReachedTest(t *testing.T, ctx context.Context, nr nftRunner, anonUID, anonGID int, daddr, l4 string, port int) bool {
+	t.Helper()
+	const counterTable = "anonctl_vitest_escapedleak"
+	match := "meta skuid " + strconv.Itoa(anonUID) + " ip daddr " + daddr + " " + l4
+	dialPort := port
+	if port > 0 {
+		match += " dport " + strconv.Itoa(port)
+	} else {
+		dialPort = 9999 // a port-omitted TCP closure still needs a concrete dial port
+	}
+	ruleset := "table inet " + counterTable + " {\n  chain out {\n    type filter hook output priority 50; policy accept;\n    " + match + " counter\n  }\n}\n"
+	if _, stderr, err := nr.Run(ctx, ruleset, "nft", "-f", "-"); err != nil {
+		t.Fatalf("plant escaped-leak counter: %v: %s", err, stderr)
+	}
+	defer func() { _, _, _ = nr.Run(ctx, "delete table inet "+counterTable, "nft", "-f", "-") }()
+
+	network := l4 + "4"
+	addr := net.JoinHostPort(daddr, strconv.Itoa(dialPort))
+	if l4 == "udp" {
+		udpSendAsAnon(t, anonUID, anonGID, addr)
+	} else {
+		probeAsAnon(t, anonUID, anonGID, network, addr)
+	}
+
+	out, _, err := nr.Run(ctx, "", "nft", "list", "table", "inet", counterTable)
+	if err != nil {
+		return false
+	}
+	return counterHasPackets(out)
+}
+
+// counterHasPackets reports whether an nft-list dump shows a `counter packets N`
+// with N > 0 (a clear packet escaped). Mirrors production's counterMoved.
+func counterHasPackets(listed string) bool {
+	for _, line := range strings.Split(listed, "\n") {
+		if !strings.Contains(line, "counter packets") {
+			continue
+		}
+		fields := strings.Fields(line)
+		for i, f := range fields {
+			if f == "packets" && i+1 < len(fields) {
+				if n, err := strconv.Atoi(fields[i+1]); err == nil && n > 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // tableExists reports whether an inet table is present (best-effort; a list error
