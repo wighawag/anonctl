@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
+
+	"github.com/wighawag/anonctl/internal/cli"
 )
 
 // Self-elevation: a root-requiring verb run without root re-execs the SAME command
@@ -75,7 +78,7 @@ var (
 // It NEVER prompts or execs in a way tests can observe a password: the prompt is
 // sudo's, and all three impure steps (geteuid, sudo lookup, re-exec) are behind
 // seams the unit tests replace.
-func maybeElevate(verb string, args []string) (handled bool, exitCode int) {
+func maybeElevate(verb, account string, args []string) (handled bool, exitCode int) {
 	if !rootRequiringVerbs[verb] {
 		return false, 0 // read verbs never elevate
 	}
@@ -87,6 +90,27 @@ func maybeElevate(verb string, args []string) (handled bool, exitCode int) {
 		// are STILL not root. Do not re-exec (that would loop); run directly and let
 		// the verb surface its own "must be root" error.
 		return false, 0
+	}
+	if session := os.Getenv(anonctlSessionEnv); session != "" {
+		// We are INSIDE an `anonctl use` session (a dropped anon shell). The anon account
+		// has NO sudo path (that is the security design: anon is a privilege dead-end),
+		// so a sudo re-exec from here can only dead-end on an anon password prompt, no
+		// matter the target. Refuse cleanly with the accurate way to proceed instead of
+		// prompting. This is a UX guard, not a security control (the kernel forcing +
+		// default-deny are the real protection). Cases:
+		//   - `use` of the SAME account: you are already in it, nothing to do.
+		//   - `use` of a DIFFERENT account: you cannot switch in-process (no root from
+		//     here); exit first, then run it from your normal (sudo-capable) account.
+		//   - any other root verb: same reason; run it from your normal account.
+		switch {
+		case verb == "use" && account == session:
+			fmt.Fprintf(os.Stderr, "anonctl: already inside the anonctl session for %q; nothing to do (type `exit` to leave it)\n", session)
+		case verb == "use":
+			fmt.Fprintf(os.Stderr, "anonctl: cannot switch from the anonctl session for %q to %q in place (the anon account has no sudo to re-elevate); type `exit` to leave this session, then run `%s` from your normal account\n", session, account, useCommandFor(account))
+		default:
+			fmt.Fprintf(os.Stderr, "anonctl: %s needs root, but you are inside the anonctl session for %q (the anon account has no sudo); type `exit` to leave it, then run the command from your normal account\n", verb, session)
+		}
+		return true, 1
 	}
 	sudoPath, err := elevateLookSudo()
 	if err != nil {
@@ -109,6 +133,17 @@ func maybeElevate(verb string, args []string) (handled bool, exitCode int) {
 	argv := append([]string{sudoPath, self}, args...)
 	env := append(os.Environ(), elevatedSentinelEnv+"=1")
 	return true, elevateReexec(sudoPath, argv, env)
+}
+
+// useCommandFor renders the exact command a user should re-run to enter an account
+// after exiting the current session: the default `anon` -> `anonctl use`, and
+// `anon-<name>` -> `anonctl use <name>`. It is only for the in-session refusal
+// message, so the suggestion matches what the operator would actually type.
+func useCommandFor(account string) string {
+	if account == cli.DefaultAccount {
+		return "anonctl use"
+	}
+	return "anonctl use " + strings.TrimPrefix(account, cli.DefaultAccount+"-")
 }
 
 // runElevated is the production re-exec: run `sudo <self> <args...>` inheriting the

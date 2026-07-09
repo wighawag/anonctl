@@ -66,7 +66,7 @@ func run(args []string) int {
 	// through to the verb's own "must be root" error. The re-exec passes the ORIGINAL
 	// args unchanged (flags/account/--json), and the notice is on stderr so `--json`
 	// stdout stays pure. See elevate.go.
-	if handled, code := maybeElevate(cmd.Verb, args); handled {
+	if handled, code := maybeElevate(cmd.Verb, cmd.Account, args); handled {
 		return code
 	}
 
@@ -1018,7 +1018,9 @@ const usage = `usage:
                                      NOT the leak protection: it is a snapshot (verify at login, not continuous)
                                      and bypassable (su/sudo -iu/ssh/cron reach the account anyway). The real
                                      protection is the kernel rules + the standing default-deny; a MANDATORY gate
-                                     is the separate mandatory-anonctl-gated-login idea.
+                                     is the separate mandatory-anonctl-gated-login idea. Run from your NORMAL
+                                     (sudo-capable) account: inside an anon session use cannot re-elevate
+                                     (anon has no sudo), so switching accounts means exit first, then re-run.
   anonctl update|reconfigure --endpoint <socks5h://host:port> [--allow-direct <IP|CIDR[:port]>]... [<name>]
                                      change the account's endpoint and re-apply fail-closed (no leak window) (root)
                                      --allow-direct here REPLACES the account's LAN holes (omit to keep them)

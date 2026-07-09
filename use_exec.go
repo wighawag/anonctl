@@ -65,6 +65,11 @@ func execLoginShell(ctx context.Context, r provision.Runner, account string) err
 		"SHELL=" + shell,
 		"PATH=/usr/local/bin:/usr/bin:/bin",
 		"TERM=" + os.Getenv("TERM"),
+		// Mark the dropped shell as an anonctl session so a nested `anonctl use` (or any
+		// root-requiring verb) run from INSIDE it refuses cleanly instead of trying to
+		// sudo: the anon account has no sudo path, so a re-exec would just dead-end on an
+		// anon password prompt. The value is the account, so the refusal names it.
+		anonctlSessionEnv + "=" + account,
 	}
 
 	// Land in the account's HOME before exec'ing the shell. syscall.Exec inherits the
@@ -97,6 +102,13 @@ func execLoginShell(ctx context.Context, r provision.Runner, account string) err
 	}
 	return syscall.Exec(setpriv, argv, env)
 }
+
+// anonctlSessionEnv marks a shell that `anonctl use` dropped into (value: the anon
+// account name). It lets anonctl detect it is running INSIDE an anon session so a
+// nested root-requiring verb refuses with a clear message rather than re-exec'ing
+// via sudo (which an anon account cannot pass: no sudo path). It is a plain marker,
+// not a security control: the real protection is the kernel forcing + default-deny.
+const anonctlSessionEnv = "ANONCTL_SESSION"
 
 // loginWorkingDir picks the directory the dropped login shell should start in: the
 // account's HOME when it is a usable absolute path, else `/`. It is the pure
