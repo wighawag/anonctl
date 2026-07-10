@@ -14,10 +14,10 @@ import (
 	"time"
 
 	"github.com/wighawag/anoncore/accountconfig"
+	"github.com/wighawag/anoncore/provision"
 	"github.com/wighawag/anonctl/internal/cli"
 	"github.com/wighawag/anonctl/internal/forcing"
 	"github.com/wighawag/anonctl/internal/nftables"
-	"github.com/wighawag/anoncore/provision"
 	"github.com/wighawag/anonctl/internal/systemd"
 )
 

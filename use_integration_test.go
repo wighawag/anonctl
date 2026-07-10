@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wighawag/anonctl/internal/cli"
 	"github.com/wighawag/anoncore/provision"
+	"github.com/wighawag/anonctl/internal/cli"
 )
 
 // TestUseExecLoginShellDropsToAccount is the isolated `integration`-tagged proof

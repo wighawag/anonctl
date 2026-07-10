@@ -11,11 +11,11 @@ import (
 	"testing"
 
 	"github.com/wighawag/anoncore/accountconfig"
-	"github.com/wighawag/anonctl/internal/cli"
 	"github.com/wighawag/anoncore/endpoint"
-	"github.com/wighawag/anonctl/internal/forcing"
 	"github.com/wighawag/anoncore/marker"
 	"github.com/wighawag/anoncore/provision"
+	"github.com/wighawag/anonctl/internal/cli"
+	"github.com/wighawag/anonctl/internal/forcing"
 	"github.com/wighawag/anonctl/internal/verify"
 )
 

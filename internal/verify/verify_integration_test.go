@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"github.com/wighawag/anoncore/endpoint"
+	"github.com/wighawag/anoncore/provision"
 	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anonctl/internal/nftables"
-	"github.com/wighawag/anoncore/provision"
 	"github.com/wighawag/anonctl/internal/shim"
 	"github.com/wighawag/anonctl/internal/socks5hfixture"
 	"github.com/wighawag/anonctl/internal/verify"

@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anoncore/sudoprobe"
+	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anonctl/internal/systemd"
 )
 

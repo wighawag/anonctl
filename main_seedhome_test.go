@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/wighawag/anoncore/seedhome"
 	"github.com/wighawag/anonctl/internal/cli"
 	"github.com/wighawag/anonctl/internal/defaults"
-	"github.com/wighawag/anoncore/seedhome"
 )
 
 // seedFakeRunner answers the `getent passwd` probes runSeedHome/runAdd make so the

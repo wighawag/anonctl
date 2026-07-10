@@ -27,17 +27,17 @@ import (
 	"time"
 
 	"github.com/wighawag/anoncore/accountconfig"
-	"github.com/wighawag/anonctl/internal/cli"
-	"github.com/wighawag/anonctl/internal/defaults"
 	"github.com/wighawag/anoncore/endpoint"
-	"github.com/wighawag/anonctl/internal/forcing"
-	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anoncore/marker"
-	"github.com/wighawag/anonctl/internal/nftables"
 	"github.com/wighawag/anoncore/provision"
 	"github.com/wighawag/anoncore/seedhome"
-	"github.com/wighawag/anonctl/internal/systemd"
 	"github.com/wighawag/anoncore/ui"
+	"github.com/wighawag/anonctl/internal/cli"
+	"github.com/wighawag/anonctl/internal/defaults"
+	"github.com/wighawag/anonctl/internal/forcing"
+	"github.com/wighawag/anonctl/internal/lanexempt"
+	"github.com/wighawag/anonctl/internal/nftables"
+	"github.com/wighawag/anonctl/internal/systemd"
 	"github.com/wighawag/anonctl/internal/verify"
 )
 
