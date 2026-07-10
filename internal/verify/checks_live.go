@@ -49,6 +49,20 @@ const (
 	offBoxProbePort = 9999
 )
 
+// nonExemptLoopbackProbe is the NON-shim, NON-exempt loopback destination the
+// bypass-loopback-closure probe dials AS the anon UID (closure a). 127.0.0.2 is
+// still 127.0.0.0/8 (so it is governed by the broad loopback drop) but is neither
+// the shim's 127.0.0.1 ports nor an operator-exempted loopback service, so a
+// counter keyed on this daddr:port proves closure (a) directly: a redirected packet
+// has its daddr/dport rewritten to the shim relay (counter stays 0 => PASS), a
+// genuine escape keeps 127.0.0.2:port (FAIL). This replaces the old off-box target
+// so the probe now dials a real NON-exempt loopback port, per the loopback-exemption
+// task: with a loopback exemption active, EVERY OTHER loopback port must still drop.
+const (
+	nonExemptLoopbackProbe     = "127.0.0.2"
+	nonExemptLoopbackProbePort = 9999
+)
+
 // LiveChecks is the REAL assertion set: it stands up live probes AS the anon UID
 // against the fail-closed ruleset the nftables task installed, and feeds their
 // outcomes to the PURE assertion decisions in verify.go. It is compiled into
@@ -116,18 +130,20 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 			return LeakDropAssertion("v6", reached)
 		}},
 		{Name: AssertBypassLoopbackClosure, Run: func(ctx context.Context) Assertion {
-			// Closure (a): the anon UID must not reach an arbitrary destination directly.
-			// Since ALL of its TCP is redirected into the shim, a loopback dial completes
-			// the handshake with the relay and proves nothing; the honest, non-vacuous
-			// signal is that NO anon-UID TCP escapes the box carrying an OFF-BOX daddr in
-			// the clear. We dial an off-box TCP host and watch the escaped-leak counter
-			// keyed on that daddr: a redirected packet has its daddr rewritten to the shim
-			// (no match, PASS); a genuine escape keeps the off-box daddr (FAIL). A
-			// counter plant/read error fails LOUD (a probe that could not run is not a
-			// pass), the exact false-green this closes: the invalid-nft counter used to
-			// swallow to reached=false and pass this closure WITHOUT probing.
-			reached, err := offBoxReachedAsAnon(ctx, p, offBoxProbeV4, "tcp", 0)
-			return escapedLeakProbeAssertion(AssertBypassLoopbackClosure, "the anon UID reaching a non-shim loopback destination", reached, err)
+			// Closure (a): the anon UID must reach ONLY its own shim loopback ports; every
+			// OTHER 127.0.0.0/8 destination must be redirected-into-the-shim-or-dropped,
+			// never reached DIRECTLY. We dial a NON-shim, NON-exempt loopback port
+			// (127.0.0.2:port) AS the anon UID and watch the escaped-leak counter keyed on
+			// that daddr AND port: a redirected packet has BOTH rewritten to the shim relay
+			// (no match, PASS); a genuine DIRECT reach to this non-exempt loopback keeps
+			// 127.0.0.2:port and moves the counter (FAIL). Keying on the loopback daddr:port
+			// (not off-box, and not any-port 127.0.0.1) is load-bearing here: it proves the
+			// exemption did NOT widen loopback, since a real loopback listener on the exempt
+			// port is reachable (split-tunnel-tight) while THIS non-exempt loopback port is
+			// not. A counter plant/read error fails LOUD (a probe that could not run is not
+			// a pass).
+			reached, err := offBoxReachedAsAnon(ctx, p, nonExemptLoopbackProbe, "tcp", nonExemptLoopbackProbePort, "tcp4", net.JoinHostPort(nonExemptLoopbackProbe, strconv.Itoa(nonExemptLoopbackProbePort)))
+			return escapedLeakProbeAssertion(AssertBypassLoopbackClosure, "the anon UID reaching a non-shim, non-exempt loopback port", reached, err)
 		}},
 		{Name: AssertBypassEndpointClosure, Run: func(ctx context.Context) Assertion {
 			// Closure (b): the anon UID dialling the upstream endpoint directly must not

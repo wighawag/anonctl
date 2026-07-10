@@ -293,6 +293,38 @@ func TestAllowRejectsUnsafeValues(t *testing.T) {
 	}
 }
 
+// The unified --allow flag DISPATCHES on the typed address class at the SAME CLI
+// entry point: a loopback literal (127.0.0.1:port) is accepted and carried like a
+// LAN one (no new flag, no new field), while a loopback anonymizer control/SOCKS/DNS
+// port is rejected LOUDLY here. This is the loopback-exemption feature's CLI-boundary
+// proof that one flag covers both classes.
+func TestAllowFlagLoopbackClassDispatch(t *testing.T) {
+	// A same-host loopback service on a non-anonymizer port rides the same flag.
+	cmd, err := cli.Parse([]string{"add", "--allow", "127.0.0.1:8080", "work"})
+	if err != nil {
+		t.Fatalf("Parse(--allow 127.0.0.1:8080): %v", err)
+	}
+	if len(cmd.Exemptions) != 1 || cmd.Exemptions[0].Raw != "127.0.0.1:8080" {
+		t.Fatalf("loopback exemption must ride the same Exemptions slice; got %+v", cmd.Exemptions)
+	}
+	if !cmd.Exemptions[0].IsLoopback() {
+		t.Errorf("127.0.0.1:8080 must route to the loopback class from the --allow entry point")
+	}
+
+	// A loopback anonymizer control/SOCKS/DNS port is rejected loudly at the boundary.
+	for _, bad := range []string{
+		"127.0.0.1:53",   // clear DNS
+		"127.0.0.1:9050", // Tor SOCKS
+		"127.0.0.1:9051", // Tor control (self-deanonymization)
+		"127.0.0.1:1080", // generic SOCKS
+		"127.0.0.1",      // port-omitted: no all-ports loopback form
+	} {
+		if _, err := cli.Parse([]string{"add", "--allow", bad}); err == nil {
+			t.Errorf("Parse(--allow %q) = nil error, want a loud loopback reject", bad)
+		}
+	}
+}
+
 // `status` and `list` accept `--json` for machine-readable output; the other
 // verbs need not.
 func TestJSONFlag(t *testing.T) {

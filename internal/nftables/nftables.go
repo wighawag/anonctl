@@ -71,13 +71,17 @@ type Params struct {
 	// the matching family so closure (b) is never silently v4-only.
 	EndpointHost string
 	EndpointPort int
-	// Exemptions are the narrow LAN exemptions: private-only, exact host:port (or
-	// whole-host / CIDR) destinations the anon UID may reach DIRECTLY over the real
-	// NIC instead of through the forced path. Each is already guardrail-validated by
-	// internal/lanexempt (RFC1918/link-local only, IP/CIDR not hostnames); Generate
-	// trusts that and emits, for the anon UID and before the redirect/drop, a nat
-	// `return` (so it is not redirected into the shim) and a filter `accept` (so the
-	// default-DROP does not drop it). Empty (the default) is byte-identical to the
+	// Exemptions are the narrow direct-egress exemptions: exact host:port (or
+	// whole-host / CIDR) LAN destinations OR same-host loopback destinations the anon
+	// UID may reach DIRECTLY instead of through the forced path. Each is already
+	// guardrail-validated by internal/lanexempt (RFC1918/link-local or loopback only,
+	// IP/CIDR not hostnames, and the loopback class rejects the well-known anonymizer
+	// ports); Generate additionally rejects a loopback exemption on the account's OWN
+	// shim relay/DNS or endpoint port (validate, ADR-0008), then emits, for the anon
+	// UID and before the redirect/drop, a nat `return` (so it is not redirected into
+	// the shim) and a filter `accept` (so the default-DROP does not drop it). A
+	// loopback accept sits before the broad `127.0.0.0/8 drop`, so closure (a) still
+	// drops every OTHER loopback port. Empty (the default) is byte-identical to the
 	// pre-exemption fail-closed ruleset: the hole is opt-in and never widens the
 	// forced egress. Because the default is already DROP-for-the-UID, a non-exempt
 	// LAN host is dropped by construction, so NO separate defense-in-depth RFC1918
@@ -136,16 +140,18 @@ func Generate(p Params) (string, error) {
 	w("        meta skuid != %d return", p.AnonUID)
 	w("        ip daddr 127.0.0.1 tcp dport { %d, %d } return", p.RelayPort, p.DNSPort)
 	w("        ip daddr 127.0.0.1 udp dport %d return", p.DNSPort)
-	// LAN exemptions (enabler half): RETURN the anon UID's traffic to an exempted
-	// private destination so it is NOT redirected into the shim and egresses the
-	// real NIC directly. Emitted BEFORE the DNS and catch-all TCP redirects so the
-	// exempt packet is never swallowed by them. Each exemption names EXACTLY one
-	// non-53 TCP port (a port is mandatory and :53 is rejected at the guardrail,
-	// internal/lanexempt), so it can never carry clear DNS: tcp/53 to the exempted
-	// host is NOT returned here and still hits the DNS redirect below (Tails
-	// leak-catalogue row 2). There is no all-ports form to widen it (ADR-0007).
+	// Direct exemptions (enabler half): RETURN the anon UID's traffic to an exempted
+	// LAN or loopback destination so it is NOT redirected into the shim and reaches
+	// the target directly (the real NIC for a LAN host, loopback for a same-host
+	// service). Emitted BEFORE the DNS and catch-all TCP redirects so the exempt
+	// packet is never swallowed by them (a loopback return in particular MUST precede
+	// the catch-all `redirect to :relay`, ADR-0008). Each exemption names EXACTLY one
+	// safe TCP port (a port is mandatory; :53 and the anonymizer control/SOCKS/DNS
+	// ports are rejected at the guardrail), so it can never carry clear DNS: tcp/53 to
+	// the exempted host is NOT returned here and still hits the DNS redirect below
+	// (Tails leak-catalogue row 2). There is no all-ports form to widen it (ADR-0007).
 	for _, e := range p.Exemptions {
-		w("        # LAN exemption (direct, not forced): %s", e.Raw)
+		w("        # direct exemption (%s, not forced): %s", exemptClass(e), e.Raw)
 		w("        meta skuid %d %s return", p.AnonUID, exemptMatch(e))
 	}
 	w("        udp dport 53 redirect to :%d", p.DNSPort)
@@ -167,14 +173,16 @@ func Generate(p Params) (string, error) {
 	// accepted), then closure (a) accept-own-shim-ports, then drop all other
 	// loopback + all IPv6 (leak-free), then policy DROP catches the rest.
 	w("        meta skuid %d %s daddr %s tcp dport %d drop", p.AnonUID, endpointFamily, p.EndpointHost, p.EndpointPort)
-	// LAN exemptions (narrowing half): ACCEPT the anon UID's traffic to an exempted
-	// private destination, before the fail-closed drops, so it leaves directly. It
-	// is scoped to EXACTLY the named daddr(+port): everything else (including the
-	// rest of that host's subnet) still hits the drops or the policy DROP, so the
-	// exemption cannot silently widen (story 25). No separate RFC1918 drop rules:
-	// the default-DROP gives netcage's defense-in-depth for free.
+	// Direct exemptions (narrowing half): ACCEPT the anon UID's traffic to an
+	// exempted LAN or loopback destination, before the fail-closed drops, so it leaves
+	// directly. It is scoped to EXACTLY the named daddr(+port): everything else
+	// (including the rest of that host's subnet, and for loopback every OTHER 127.x
+	// port via the broad drop below) still hits the drops or the policy DROP, so the
+	// exemption cannot silently widen (story 25) and closure (a) survives (ADR-0008).
+	// No separate RFC1918 drop rules: the default-DROP gives netcage's defense-in-depth
+	// for free.
 	for _, e := range p.Exemptions {
-		w("        # LAN exemption (direct, not forced): %s", e.Raw)
+		w("        # direct exemption (%s, not forced): %s", exemptClass(e), e.Raw)
 		w("        meta skuid %d %s accept", p.AnonUID, exemptMatch(e))
 	}
 	w("        meta skuid %d ip daddr 127.0.0.1 tcp dport { %d, %d } accept", p.AnonUID, p.RelayPort, p.DNSPort)
@@ -192,12 +200,21 @@ func Generate(p Params) (string, error) {
 // SHARED by the nat `return` and the filter `accept` so the two halves can never
 // diverge (the enabler and the narrowing must target the exact same traffic). It
 // picks the ip/ip6 family from the exemption's address family and pins the exact
-// `tcp dport`. A port is mandatory and :53 is rejected at the guardrail
-// (internal/lanexempt), so the port here is always a single non-53 TCP port:
-// there is no all-ports (`tcp dport != 53`) form any more, because an all-ports
-// hole to a host running a forwarding proxy is a deanonymization vector
-// (ADR-0007). It never matches UDP (the forced path carries TCP; the exemption is
-// TCP-only by construction).
+// `tcp dport`. A port is mandatory and the anonymizer control/SOCKS/DNS ports are
+// rejected at the guardrail (internal/lanexempt for the well-known set, and
+// Generate's validate for the account's shim/endpoint ports), so the port here is
+// always a single safe TCP port: there is no all-ports (`tcp dport != 53`) form any
+// more, because an all-ports hole to a host running a forwarding proxy is a
+// deanonymization vector (ADR-0007). It never matches UDP (the forced path carries
+// TCP; the exemption is TCP-only by construction).
+//
+// The LOOPBACK and LAN classes emit the SAME clause shape (`<family> daddr <dst>
+// tcp dport <port>`): a loopback /32 renders as the bare `127.0.0.1`, which lands
+// the nat `return` and the filter `accept` before the broad `127.0.0.0/8 drop`, so
+// closure (a) still drops every OTHER loopback port. The two classes DIVERGE at the
+// guardrail (which ports each may name, ADR-0008), not in the emitted rule, so this
+// stays one shared helper (the loopback branch is a comment about intent, not a
+// separate code path, because the nft match is identical once the port is validated).
 func exemptMatch(e lanexempt.Exempt) string {
 	family := "ip6"
 	if e.IsV4() {
@@ -211,6 +228,16 @@ func exemptMatch(e lanexempt.Exempt) string {
 // idiom, and how the recipe writes single hosts), while a real subnet keeps its
 // CIDR. This is purely how the exact same destination is spelled; it never widens
 // the match.
+// exemptClass names an exemption's address class for the emitted nft comment, so a
+// reader of the ruleset can see at a glance whether a direct hole is a LAN host or
+// a same-host loopback service (the two go through different guardrails, ADR-0008).
+func exemptClass(e lanexempt.Exempt) string {
+	if e.IsLoopback() {
+		return "loopback"
+	}
+	return "LAN"
+}
+
 func exemptDst(n *net.IPNet) string {
 	ones, bits := n.Mask.Size()
 	if ones == bits {
@@ -249,6 +276,32 @@ func (p Params) validate() error {
 		// match exactly; a hostname would be ambiguous (and a DNS lookup in a
 		// firewall rule is itself a leak vector).
 		return fmt.Errorf("nftables: endpoint host %q must be an IP literal (v4 or v6), not a hostname", p.EndpointHost)
+	}
+	// The ACCOUNT-specific half of the loopback exemption port blocklist (docs/adr/0008):
+	// a loopback exemption must NOT name the account's OWN shim relay/DNS ports or the
+	// configured endpoint port. Those are host-dependent, so lanexempt.Parse (which is
+	// context-free) cannot reject them; it rejects the well-known static set
+	// (9050/9150/9051/1080/53). Here, where the account's ports are known, we complete
+	// the guardrail: allowing the anon UID a DIRECT loopback hole to the shim's own
+	// relay/DNS ports would let it bypass the shim's SO_ORIGINAL_DST framing, and a hole
+	// to the endpoint port would re-open closure (b). LAN exemptions are exempt from
+	// this check: a LAN host's :19050 is a different socket than the loopback shim.
+	for _, e := range p.Exemptions {
+		if !e.IsLoopback() {
+			continue
+		}
+		var reason string
+		switch e.Port {
+		case p.RelayPort:
+			reason = "the account's shim relay port (a direct hole would bypass the shim)"
+		case p.DNSPort:
+			reason = "the account's shim DNS port (a direct hole would bypass the shim)"
+		case p.EndpointPort:
+			reason = "the configured endpoint port (a direct hole would re-open bypass closure (b))"
+		}
+		if reason != "" {
+			return fmt.Errorf("nftables: loopback exemption %q targets port %d: %s; it cannot be exempted", e.Raw, e.Port, reason)
+		}
 	}
 	return nil
 }

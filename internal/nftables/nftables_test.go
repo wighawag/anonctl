@@ -1,7 +1,9 @@
 package nftables_test
 
 import (
+	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -212,7 +214,7 @@ func TestGenerateNoExemptionsByDefault(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 	// No exemption => no exemption accept/return lines at all.
-	if strings.Contains(out, "# LAN exemption") {
+	if strings.Contains(out, "# direct exemption") {
 		t.Errorf("expected no exemption lines with an empty Exemptions; got:\n%s", out)
 	}
 }
@@ -359,6 +361,130 @@ func TestGenerateExemptOrderingBeforeDrops(t *testing.T) {
 	anonLoopbackDrop := "meta skuid 30034 ip daddr 127.0.0.0/8 drop"
 	if i(exemptAccept) < 0 || i(exemptAccept) > i(anonLoopbackDrop) {
 		t.Errorf("exempt filter accept must precede the anon-UID drops")
+	}
+}
+
+// TestGenerateLoopbackExemptReachableDirectly proves a configured loopback
+// exemption (127.0.0.1:<port>) punches the same TWO-rule direct hole as a LAN one:
+// (1) a nat_out `return` scoped to `ip daddr 127.0.0.1 tcp dport <port>` (so the
+// catch-all TCP redirect does not swallow it into the shim) and (2) a filter_out
+// `accept` before the `127.0.0.0/8 drop` (so closure (a) does not drop it). This
+// is the same-host local-model case (the loopback branch of the task).
+func TestGenerateLoopbackExemptReachableDirectly(t *testing.T) {
+	p := sampleParams()
+	p.Exemptions = []lanexempt.Exempt{mustExempt(t, "127.0.0.1:8080")}
+	out, err := nftables.Generate(p)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// (1) nat_out: the loopback exempt daddr+port is RETURNed (not redirected), for
+	// the anon UID, so it reaches the same-host service directly.
+	mustContain(t, out, "meta skuid 30034 ip daddr 127.0.0.1 tcp dport 8080 return")
+	// (2) filter_out: the loopback exempt daddr+port is ACCEPTed for the anon UID.
+	mustContain(t, out, "meta skuid 30034 ip daddr 127.0.0.1 tcp dport 8080 accept")
+}
+
+// TestGenerateLoopbackExemptOrderingBeforeDropAndRedirect proves the loopback
+// exemption's rules sit BEFORE the catch-all TCP redirect (nat) and BEFORE the
+// broad 127.0.0.0/8 drop (filter): a first-match firewall is only as correct as
+// its ordering. Closure (a) must still DROP every OTHER loopback port, so the
+// accept must precede the drop but the drop must still be present.
+func TestGenerateLoopbackExemptOrderingBeforeDropAndRedirect(t *testing.T) {
+	p := sampleParams()
+	p.Exemptions = []lanexempt.Exempt{mustExempt(t, "127.0.0.1:8080")}
+	out, err := nftables.Generate(p)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	i := func(s string) int { return strings.Index(out, s) }
+
+	// nat_out: the loopback exempt RETURN must precede the catch-all TCP redirect.
+	exemptReturn := "meta skuid 30034 ip daddr 127.0.0.1 tcp dport 8080 return"
+	redirect := "meta l4proto tcp redirect to :19050"
+	if i(exemptReturn) < 0 || i(redirect) < 0 || i(exemptReturn) > i(redirect) {
+		t.Errorf("loopback exempt nat return must precede the catch-all TCP redirect")
+	}
+
+	// filter_out: the loopback exempt ACCEPT must precede the broad 127.0.0.0/8 drop,
+	// which must STILL be present (closure (a) does not widen: every OTHER loopback
+	// port is still dropped).
+	exemptAccept := "meta skuid 30034 ip daddr 127.0.0.1 tcp dport 8080 accept"
+	loopbackDrop := "meta skuid 30034 ip daddr 127.0.0.0/8 drop"
+	if i(exemptAccept) < 0 || i(loopbackDrop) < 0 || i(exemptAccept) > i(loopbackDrop) {
+		t.Errorf("loopback exempt filter accept must precede the broad 127.0.0.0/8 drop (which must remain)")
+	}
+}
+
+// TestGenerateLoopbackExemptClosureAStillHolds proves closure (a) survives a
+// loopback exemption: the broad 127.0.0.0/8 drop is STILL emitted, so every
+// NON-exempt loopback port stays dropped (the exemption pins exactly 8080; a
+// sibling loopback port is not accepted).
+func TestGenerateLoopbackExemptClosureAStillHolds(t *testing.T) {
+	p := sampleParams()
+	p.Exemptions = []lanexempt.Exempt{mustExempt(t, "127.0.0.1:8080")}
+	out, err := nftables.Generate(p)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	mustContain(t, out, "meta skuid 30034 ip daddr 127.0.0.0/8 drop")
+	// The exemption does not accept a DIFFERENT loopback port.
+	if strings.Contains(out, "127.0.0.1 tcp dport 9999 accept") {
+		t.Errorf("a loopback exemption must not accept a non-exempt loopback port; got:\n%s", out)
+	}
+}
+
+// TestGenerateLoopbackExemptClosureBStillHolds proves closure (b) survives: the
+// anon-UID direct-endpoint DROP is still emitted (a loopback exemption cannot
+// re-open the SOCKS/control surface). The default endpoint is 9050, which the
+// guardrail already refuses as an exemption; this asserts the closure rule itself
+// is intact.
+func TestGenerateLoopbackExemptClosureBStillHolds(t *testing.T) {
+	p := sampleParams()
+	p.Exemptions = []lanexempt.Exempt{mustExempt(t, "127.0.0.1:8080")}
+	out, err := nftables.Generate(p)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	mustContain(t, out, "meta skuid 30034 ip daddr 127.0.0.1 tcp dport 9050 drop")
+}
+
+// TestGenerateRejectsLoopbackExemptOnAccountPort proves the account-specific half
+// of the loopback port blocklist: a loopback exemption whose port equals the
+// shim relay port, the shim DNS port, or the configured endpoint port is REJECTED
+// at generate time (these are host-dependent, so lanexempt.Parse cannot know them;
+// Generate does). Naming the port keeps the refusal self-explaining.
+func TestGenerateRejectsLoopbackExemptOnAccountPort(t *testing.T) {
+	cases := map[string]int{
+		"relay port":    19050,
+		"dns port":      19053,
+		"endpoint port": 9050,
+	}
+	for name, port := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := sampleParams()
+			// Build a loopback exemption on the account port directly (Parse rejects the
+			// static well-known 9050 already; the relay/dns ports pass Parse and must be
+			// caught HERE, where the account ports are known).
+			_, n, _ := net.ParseCIDR("127.0.0.1/32")
+			p.Exemptions = []lanexempt.Exempt{{Network: n, Port: port, Raw: fmt.Sprintf("127.0.0.1:%d", port)}}
+			if _, err := nftables.Generate(p); err == nil {
+				t.Errorf("Generate must reject a loopback exemption on the account's %s (%d)", name, port)
+			} else if !strings.Contains(err.Error(), strconv.Itoa(port)) {
+				t.Errorf("reject should name the offending port %d; got: %v", port, err)
+			}
+		})
+	}
+}
+
+// TestGenerateAllowsLANExemptOnAccountPort proves the account-port refusal is
+// LOOPBACK-only: a LAN exemption that happens to name the same numeric port as the
+// shim relay is fine (a LAN host's :19050 is a different socket than the loopback
+// shim), so the account-port guard must not fire for a LAN destination.
+func TestGenerateAllowsLANExemptOnAccountPort(t *testing.T) {
+	p := sampleParams()
+	p.Exemptions = []lanexempt.Exempt{mustExempt(t, fmt.Sprintf("192.168.1.150:%d", p.RelayPort))}
+	if _, err := nftables.Generate(p); err != nil {
+		t.Errorf("a LAN exemption on the relay port number must be allowed (different host); got: %v", err)
 	}
 }
 
