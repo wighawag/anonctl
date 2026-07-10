@@ -580,6 +580,167 @@ func TestLiveLANExemptionNotADNSHole(t *testing.T) {
 	}
 }
 
+// TestLiveLoopbackExemptionDirectButTight is the integration proof of the loopback
+// exemption (loopback-exemption task): with a same-host loopback service exempted
+// (127.0.0.1:<port>), the anon UID reaches THAT port DIRECTLY (split-tunnel-tight
+// exemptReached==true) while every OTHER loopback destination stays dropped
+// (bypass-loopback-closure, closure a) AND the anonymizer control ports (9050/9051)
+// stay dropped (closure b + a). It mirrors the LAN split-tunnel proof but on
+// loopback, isolated to throwaway accounts/table, and asserts the host's other
+// rules are untouched via a sentinel. A real listener on the exempt loopback port
+// makes the "reachable" signal non-vacuous.
+func TestLiveLoopbackExemptionDirectButTight(t *testing.T) {
+	requireLiveHost(t)
+	if probeHelperBin == "" {
+		t.Skip("probe helper failed to build; skipping")
+	}
+	ctx := context.Background()
+	r := execRunner{}
+	nr := nftRunner{}
+
+	account := "anon-vitest-lo-" + strconv.Itoa(os.Getpid())
+	shimAccount := account + "-shim"
+	table := nftables.TableName(account)
+
+	// SENTINEL: a table we plant and later assert is UNTOUCHED (host isolation).
+	const sentinel = "anonctl_vitest_lo_sentinel"
+	if _, stderr, err := nr.Run(ctx, "table inet "+sentinel+" {}\n", "nft", "-f", "-"); err != nil {
+		t.Fatalf("plant sentinel: %v: %s", err, stderr)
+	}
+
+	if _, err := provision.Add(ctx, r, account); err != nil {
+		t.Fatalf("provision.Add(%s): %v", account, err)
+	}
+	defer func() {
+		_, _, _ = nr.Run(ctx, "delete table inet "+table, "nft", "-f", "-")
+		_, _, _ = nr.Run(ctx, "delete table inet "+sentinel, "nft", "-f", "-")
+		_, _ = provision.Rm(ctx, r, account, true)
+		if tableExists(t, nr, sentinel) {
+			t.Errorf("cleanup left the sentinel table behind (host not isolated)")
+		}
+	}()
+
+	anonUID := uidOf(t, account)
+	anonGID := gidOf(t, account)
+	shimUID := uidOf(t, shimAccount)
+
+	// A deterministic socks5h fixture plays the endpoint (no real Tor); the shim
+	// dials it. Its port is the account's endpoint port (closure b targets it).
+	fx := socks5hfixture.New(socks5hfixture.Options{ExitIP: "127.0.0.1"})
+	if err := fx.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("start socks5h fixture: %v", err)
+	}
+	defer fx.Close()
+	_, endpointPortStr, _ := net.SplitHostPort(fx.Addr())
+	endpointPort, _ := strconv.Atoi(endpointPortStr)
+
+	const relayPort, dnsPort = 59150, 59153
+
+	// A REAL listener on the EXEMPT loopback port, so "reachable" is a truthful
+	// direct-handshake signal (the exemption RETURNs it, so it is NOT redirected into
+	// the shim). 18080 is a non-anonymizer, non-shim, non-endpoint loopback port.
+	const exemptPort = 18080
+	exempt := net.JoinHostPort("127.0.0.1", strconv.Itoa(exemptPort))
+	ln, err := net.Listen("tcp", exempt)
+	if err != nil {
+		t.Skipf("could not listen on the exempt loopback target (%v); skipping", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	exemptEntry, err := lanexempt.Parse(exempt) // 127.0.0.1:18080, a loopback-class exemption
+	if err != nil {
+		t.Fatalf("lanexempt.Parse(%q): %v", exempt, err)
+	}
+	if !exemptEntry.IsLoopback() {
+		t.Fatalf("%q must parse as a loopback-class exemption", exempt)
+	}
+	p := nftables.Params{
+		Account:      account,
+		AnonUID:      anonUID,
+		ShimUID:      shimUID,
+		RelayPort:    relayPort,
+		DNSPort:      dnsPort,
+		EndpointHost: "127.0.0.1",
+		EndpointPort: endpointPort,
+		Exemptions:   []lanexempt.Exempt{exemptEntry},
+	}
+	if err := nftables.Apply(ctx, nr, p); err != nil {
+		t.Fatalf("apply ruleset with loopback exemption: %v", err)
+	}
+
+	// No shim is started: the EXEMPT port is RETURNed by the nat chain (not
+	// redirected), so it reaches the real loopback listener with no shim in the path;
+	// and the NON-exempt / control-port checks read the escaped-leak COUNTER (planted
+	// at a filter priority AFTER the nat redirect), which is decided by whether the
+	// packet was rewritten, independent of whether a shim answers.
+
+	// (1) POSITIVE: the anon UID reaches the EXEMPTED loopback port DIRECTLY (the
+	// accept-before-drop hole is open), else the whole feature is a no-op and
+	// split-tunnel-tight would pass vacuously.
+	if !probeAsAnon(t, anonUID, anonGID, "tcp4", exempt) {
+		t.Fatalf("the anon UID must reach the EXEMPTED loopback port %s directly", exempt)
+	}
+
+	// (2) CLOSURE (a): a NON-exempt loopback port (with NO exemption) must NOT be
+	// reachable directly: it is redirected into the shim (which cannot SOCKS-CONNECT
+	// to a host-loopback service through the endpoint), so the escaped-leak counter
+	// keyed on 127.0.0.2:9999 stays 0 => the direct hole did not widen.
+	reachedNonExempt := offBoxLeakReachedTest(t, ctx, nr, anonUID, anonGID, "127.0.0.2", "tcp", 9999)
+	if a := verify.BypassLoopbackClosureAssertion(reachedNonExempt); !a.Ok {
+		t.Fatalf("bypass-loopback-closure (a) must still hold with a loopback exemption active; got %+v", a)
+	}
+
+	// (3) The ANONYMIZER control ports stay dropped: 9050 (endpoint/Tor SOCKS) via
+	// closure (b), and 9051 (Tor control) via closure (a). Neither may be reached
+	// directly by the anon UID even with a loopback exemption active. Counter keyed on
+	// the loopback daddr:port stays 0 (redirected/dropped) => PASS.
+	for _, ctrlPort := range []int{9050, 9051} {
+		reached := offBoxLeakReachedTest(t, ctx, nr, anonUID, anonGID, "127.0.0.1", "tcp", ctrlPort)
+		if reached {
+			t.Fatalf("the anon UID must NOT reach loopback anonymizer control port %d directly with a loopback exemption active", ctrlPort)
+		}
+	}
+
+	// (4) Through the PRODUCTION orchestrator: split-tunnel-tight (exempt reachable,
+	// non-exempt loopback sibling dropped) and bypass-loopback-closure (a non-exempt
+	// loopback port dropped) must both FIRE and PASS for the loopback exemption.
+	lp := verify.LiveParams{
+		Account:      account,
+		Endpoint:     "socks5h://127.0.0.1:" + endpointPortStr,
+		Class:        endpoint.ClassSocksPeruser,
+		AnonUID:      anonUID,
+		ShimUID:      shimUID,
+		RelayPort:    relayPort,
+		DNSPort:      dnsPort,
+		EndpointHost: "127.0.0.1",
+		EndpointPort: endpointPort,
+		Exempt:       exempt,
+	}
+	rep := verify.RunVerify(ctx, lp)
+	byName := map[string]verify.Assertion{}
+	for _, a := range rep.Assertions {
+		byName[a.Name] = a
+	}
+	for _, name := range []string{verify.AssertSplitTunnelTight, verify.AssertBypassLoopbackClosure} {
+		a, ok := byName[name]
+		if !ok {
+			t.Fatalf("RunVerify must include the %s assertion with a loopback exemption active; got %+v", name, rep.Assertions)
+		}
+		if !a.Ok {
+			t.Fatalf("%s must PASS for a reachable, tight loopback exemption; got %+v", name, a)
+		}
+	}
+}
+
 // TestLiveNoUIDTransitionEgress is the integration proof of Tails leak-catalogue
 // row 7 (best-effort): a FRESHLY-provisioned throwaway anon account (hardened at
 // add-time: no sudoers entry, no sudo/wheel group) does NOT let the concretely

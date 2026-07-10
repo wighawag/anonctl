@@ -124,7 +124,7 @@ func TestGenerateBaselineNoExemptionsIsByteIdenticalToBefore(t *testing.T) {
 	if withNil != withEmpty {
 		t.Errorf("nil and empty exemptions must produce identical baseline text")
 	}
-	if strings.Contains(withNil, "LAN exemption") {
+	if strings.Contains(withNil, "direct exemption") {
 		t.Errorf("a baseline with no exemptions must emit no exemption rule:\n%s", withNil)
 	}
 }

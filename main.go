@@ -1092,8 +1092,10 @@ const usage = `usage:
                                      survives reboot (default endpoint: the local Tor SocksPort) (root).
                                      CREATE-ONLY: refuses an existing account (use update to change its
                                      endpoint/exemptions, or rm then add to recreate).
-                                     --allow punches a narrow private-only LAN hole (repeatable;
-                                     RFC1918/link-local only, an exact :port is REQUIRED, never :53)
+                                     --allow punches a narrow direct hole (repeatable; an exact :port is
+                                     REQUIRED, never :53): an RFC1918/link-local LAN host, OR a same-host
+                                     loopback service 127.0.0.1:<port> (the anonymizer control/SOCKS/DNS
+                                     ports 9050/9150/9051/1080 are refused on loopback)
   anonctl rm     [--purge-account] [<name>]
                                      remove forcing; --purge-account also deletes the account (root)
   anonctl seed-home [--from <dir>] [--force] [<name>]
@@ -1122,7 +1124,7 @@ const usage = `usage:
                                      change the account's endpoint and re-apply fail-closed (no leak window) (root).
                                      With no --endpoint on a terminal it scans local socks5h ports and prompts
                                      (like add); non-interactively --endpoint is required.
-                                     --allow here REPLACES the account's LAN holes (omit to keep them)
+                                     --allow here REPLACES the account's direct holes (omit to keep them)
   anonctl --version | version       print the anonctl version
 
 Box-wide add-time defaults live under ` + "`/etc/anonctl`" + ` (create them yourself; a
@@ -1130,7 +1132,7 @@ fresh install ships neither, so the directory-exists convention stays opt-in):
   - Default home: create ` + "`/etc/anonctl/default-home/`" + ` (e.g.
     ` + "`sudo cp -r <src>/. /etc/anonctl/default-home/`" + `) and its contents seed every
     FRESH account's home. Its PRESENCE is the switch; there is no config key.
-  - Default LAN exemptions: put them in ` + "`/etc/anonctl/defaults.json`" + `, e.g.
+  - Default direct exemptions: put them in ` + "`/etc/anonctl/defaults.json`" + `, e.g.
     ` + "`{\"allow\": [\"192.168.1.150:8080\"]}`" + `. A bare ` + "`add`" + ` applies them (a CLI
     ` + "`--allow`" + ` overrides; a default is still validated, never a quieter leak
     path; a port is mandatory). Use ` + "`{\"allow\": []}`" + ` for a valid no-op starting point. This is

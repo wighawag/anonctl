@@ -55,7 +55,8 @@ func BaselineTableName(account string) string {
 // then define fresh, so a re-load cleanly replaces ONLY this account's baseline
 // table and never touches the forcing table or any other table on the host.
 //
-// exemptions are the SAME narrow LAN exemptions the forcing table opens (story 25).
+// exemptions are the SAME narrow direct exemptions the forcing table opens (LAN or
+// loopback, story 25).
 // The baseline must RETURN them, exactly as it returns loopback, BEFORE its broad
 // non-loopback drop: an exempted destination is deliberately NOT redirected into the
 // shim (forcing's nat chain `return`s it), so it reaches this baseline chain still
@@ -103,13 +104,17 @@ func GenerateBaseline(account string, anonUID int, exemptions []lanexempt.Exempt
 	// no such loopback traffic, so this simply does not match the real egress below.
 	w("        meta skuid %d ip daddr 127.0.0.0/8 return", anonUID)
 	w("        meta skuid %d ip6 daddr ::1 return", anonUID)
-	// LAN exemptions: RETURN each exempted destination BEFORE the broad drop, exactly
-	// as loopback is returned, so the forcing chain's exemption `accept` governs it
-	// (the baseline's terminal drop would otherwise kill the un-redirected LAN flow).
-	// The match is exemptMatch (SHARED with the forcing return+accept) so all three
-	// target byte-identical traffic and can never diverge.
+	// Direct exemptions: RETURN each exempted destination BEFORE the broad drop,
+	// exactly as loopback is returned, so the forcing chain's exemption `accept`
+	// governs it (the baseline's terminal drop would otherwise kill the un-redirected
+	// LAN flow). The match is exemptMatch (SHARED with the forcing return+accept) so
+	// all three target byte-identical traffic and can never diverge. A LOOPBACK
+	// exemption is already covered by the `ip daddr 127.0.0.0/8 return` above (its
+	// daddr is loopback), so its per-exemption return here is a harmless no-op; it is
+	// still emitted for uniformity (the shared loop) and never widens the baseline
+	// (the resting DROP only ever hits NON-loopback egress).
 	for _, e := range exemptions {
-		w("        # LAN exemption (direct, not forced): %s", e.Raw)
+		w("        # direct exemption (%s, not forced): %s", exemptClass(e), e.Raw)
 		w("        meta skuid %d %s return", anonUID, exemptMatch(e))
 	}
 	// The resting-state DROP: every NON-loopback destination for the anon UID (v4
