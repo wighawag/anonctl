@@ -92,10 +92,10 @@ func TestVerifyDispatchesAndExitsNonZeroInDefaultBuild(t *testing.T) {
 
 // verifyParams READS the persisted exemption back into verify.LiveParams.Exempt,
 // so the split-tunnel-tight + lan-exemption-not-a-dns-hole assertions fire live
-// for an exempted account (they run only when Exempt != ""). A port-omitted
+// for an exempted account (they run only when Exempt != ""). An exact-port
 // exemption renders a dialable host:port (the split-tunnel probe needs a concrete
-// port); an account with NO exemptions yields an empty Exempt (the assertions are
-// cleanly skipped, as today).
+// port; a port is mandatory now); an account with NO exemptions yields an empty
+// Exempt (the assertions are cleanly skipped, as today).
 func TestVerifyParamsPopulatesExemptFromConfig(t *testing.T) {
 	store := accountconfig.Store{BaseDir: t.TempDir()}
 	cfg := accountconfig.Config{
@@ -116,14 +116,14 @@ func TestVerifyParamsPopulatesExemptFromConfig(t *testing.T) {
 		t.Errorf("Exempt = %q, want 192.168.1.150:8080 (read back from the persisted config)", p.Exempt)
 	}
 
-	// A port-omitted (all-TCP) exemption still yields a concrete dialable host:port.
-	cfg.Exemptions = []string{"192.168.1.150"}
+	// A second exact-port exemption still yields a concrete dialable host:port.
+	cfg.Exemptions = []string{"192.168.1.150:8443"}
 	if err := store.Write(cfg); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 	p = verifyParams(store, "anon", st)
-	if p.Exempt == "" {
-		t.Errorf("port-omitted exemption yielded empty Exempt; want a concrete host:port so the probe can dial")
+	if p.Exempt != "192.168.1.150:8443" {
+		t.Errorf("Exempt = %q, want 192.168.1.150:8443 (a concrete host:port so the probe can dial)", p.Exempt)
 	}
 
 	// No exemptions => empty Exempt => the two assertions are cleanly skipped.

@@ -240,23 +240,24 @@ func TestEndpointFlag(t *testing.T) {
 	}
 }
 
-// The forcing verbs accept a repeatable `--allow-direct` (netcage's vocabulary):
-// each value is parsed+validated through lanexempt.Parse at the CLI boundary and
+// The forcing verbs accept a repeatable `--allow` (netcage's vocabulary): each
+// value is parsed+validated through lanexempt.Parse at the CLI boundary and
 // collected onto cmd.Exemptions, in both the `=value` and the space forms. A
 // public/hostname/:53 value is rejected LOUDLY here (the fail-loud config gate),
-// and the flag must not swallow the account name.
-func TestAllowDirectFlag(t *testing.T) {
-	cmd, err := cli.Parse([]string{"add", "--allow-direct", "192.168.1.150:8080", "--allow-direct=10.0.0.0/24", "work"})
+// and the flag must not swallow the account name. Every value carries an explicit
+// port (a port is mandatory).
+func TestAllowFlag(t *testing.T) {
+	cmd, err := cli.Parse([]string{"add", "--allow", "192.168.1.150:8080", "--allow=10.0.0.0/24:9090", "work"})
 	if err != nil {
 		t.Fatalf("Parse error: %v", err)
 	}
 	if cmd.Account != "anon-work" {
-		t.Errorf("account = %q, want anon-work (--allow-direct value must not swallow the name)", cmd.Account)
+		t.Errorf("account = %q, want anon-work (--allow value must not swallow the name)", cmd.Account)
 	}
 	if len(cmd.Exemptions) != 2 {
 		t.Fatalf("Exemptions = %d, want 2 (repeatable flag)", len(cmd.Exemptions))
 	}
-	if cmd.Exemptions[0].Raw != "192.168.1.150:8080" || cmd.Exemptions[1].Raw != "10.0.0.0/24" {
+	if cmd.Exemptions[0].Raw != "192.168.1.150:8080" || cmd.Exemptions[1].Raw != "10.0.0.0/24:9090" {
 		t.Errorf("Exemptions raw = %q/%q, want the two values in order", cmd.Exemptions[0].Raw, cmd.Exemptions[1].Raw)
 	}
 
@@ -268,23 +269,26 @@ func TestAllowDirectFlag(t *testing.T) {
 		t.Errorf("bare add Exemptions = %d, want 0 (no exemption unless asked)", len(bare.Exemptions))
 	}
 
-	if _, err := cli.Parse([]string{"add", "--allow-direct"}); err == nil {
-		t.Error("dangling --allow-direct (no value) must be a parse error")
+	if _, err := cli.Parse([]string{"add", "--allow"}); err == nil {
+		t.Error("dangling --allow (no value) must be a parse error")
 	}
 }
 
-// The guardrail is surfaced at the CLI boundary: a public address, a hostname, and
-// the un-exemptable clear-DNS port 53 are each rejected LOUDLY by Parse (via
-// lanexempt.Parse), so an operator cannot punch an anonymity leak from the CLI.
-func TestAllowDirectRejectsUnsafeValues(t *testing.T) {
+// The guardrail is surfaced at the CLI boundary: a public address, a hostname, the
+// un-exemptable clear-DNS port 53, and a PORT-OMITTED (all-ports) value are each
+// rejected LOUDLY by Parse (via lanexempt.Parse), so an operator cannot punch an
+// anonymity leak from the CLI.
+func TestAllowRejectsUnsafeValues(t *testing.T) {
 	for _, bad := range []string{
 		"8.8.8.8:443",      // public address
 		"router.local:80",  // hostname
 		"192.168.1.150:53", // un-exemptable clear-DNS port
-		"10.0.0.0/7",       // too-wide prefix straddling public space
+		"10.0.0.0/7:80",    // too-wide prefix straddling public space
+		"192.168.1.150",    // port-omitted (all-ports) is now rejected
+		"10.0.0.0/24",      // port-omitted CIDR too
 	} {
-		if _, err := cli.Parse([]string{"add", "--allow-direct", bad}); err == nil {
-			t.Errorf("Parse(--allow-direct %q) = nil error, want a loud reject", bad)
+		if _, err := cli.Parse([]string{"add", "--allow", bad}); err == nil {
+			t.Errorf("Parse(--allow %q) = nil error, want a loud reject", bad)
 		}
 	}
 }

@@ -62,14 +62,14 @@ sudo install -m 0755 anonctl-shim /usr/local/bin/anonctl-shim
 ## Usage
 
 ```
-anonctl add    [--endpoint <socks5h://host:port>] [<name>]   provision + force an account (root)
+anonctl add    [--endpoint <socks5h://host:port>] [--allow <IP|CIDR:port>]... [<name>]   provision + force an account (root)
 anonctl rm     [--purge-account] [<name>]                    remove forcing; --purge-account also deletes the account (root)
 anonctl seed-home [--from <dir>] [--force] [<name>]          copy a template dir into the account's home (root)
 anonctl list   [--json]                                      list the anon accounts on the box
 anonctl status [<name>] [--json]                             show one account's state
 anonctl verify [<name>] [--json]                             PROVE the account is anonymized (non-zero exit on failure)
 anonctl use    [<name>]                                      verify, then open a shell as the account ONLY on green (root)
-anonctl update|reconfigure --endpoint <socks5h://host:port> [<name>]   re-point an account, re-applied fail-closed (root)
+anonctl update|reconfigure --endpoint <socks5h://host:port> [--allow <IP|CIDR:port>]... [<name>]   re-point an account, re-applied fail-closed (root)
 anonctl --version | version                                  print the version
 ```
 
@@ -90,11 +90,11 @@ A fresh anon account lands with a near-empty home. `anonctl seed-home [--from <d
 Two **box-wide defaults** under `/etc/anonctl/` let a bare `anonctl add <name>` land a ready-to-use account with no flags:
 
 - **Default home is a directory-exists convention.** If `/etc/anonctl/default-home/` exists, `add` seeds every FRESH account's home from it (never overwriting; `add` is create-only and has no `--force`). Populate it with a plain `sudo cp -r <src>/. /etc/anonctl/default-home/`.
-- **Default LAN exemptions** live in `/etc/anonctl/defaults.json` (`{"allowDirect":["192.168.1.150:8080"]}`, root-owned). `add` applies them when you pass no `--allow-direct`. A CLI flag overrides the file, and a **default exemption is validated through the same guardrail as the flag** (public / hostname / `:53` rejected loudly): a default is never a quieter path to a leak.
+- **Default LAN exemptions** live in `/etc/anonctl/defaults.json` (`{"allow":["192.168.1.150:8080"]}`, root-owned). `add` applies them when you pass no `--allow`. A CLI flag overrides the file, and a **default exemption is validated through the same guardrail as the flag** (public / hostname / `:53` / port-omitted rejected loudly, a port is mandatory): a default is never a quieter path to a leak.
 
 ```sh
 sudo cp -r ~/anon-home/. /etc/anonctl/default-home/          # seed template (once)
-sudo tee /etc/anonctl/defaults.json <<<'{"allowDirect":["192.168.1.150:8080"]}'   # default LAN hole (once)
+sudo tee /etc/anonctl/defaults.json <<<'{"allow":["192.168.1.150:8080"]}'   # default LAN hole (once)
 sudo anonctl add work                                        # seeded + LAN-exempted, zero flags
 ```
 
@@ -161,10 +161,10 @@ mkdir -p ~/anon-home/.pi/agent
 
 ```sh
 sudo cp -r ~/anon-home/. /etc/anonctl/default-home/                                  # the pi config template
-sudo tee /etc/anonctl/defaults.json <<<'{"allowDirect":["192.168.1.150:8080"]}'       # exempt the LAN model host
+sudo tee /etc/anonctl/defaults.json <<<'{"allow":["192.168.1.150:8080"]}'       # exempt the LAN model host
 ```
 
-The `allowDirect` host:port MUST match the model's `baseUrl` host:port: that is the one narrow direct hole letting the account reach the LAN model, while everything else stays forced through Tor.
+The `allow` host:port MUST match the model's `baseUrl` host:port: that is the one narrow direct hole letting the account reach the LAN model, while everything else stays forced through Tor. A **port is mandatory** here, and there is no all-ports (bare-IP) form: an exemption always names the exact service. That is not just tidiness. An all-ports hole to a LAN host that happens to run **any forwarding proxy** on some other port (an `ssh -D` SOCKS, a squid/HTTP proxy, a Tor SocksPort, a socat tunnel) would let the anon account dial that proxy directly and egress the whole internet **from your real IP**: a deanonymization vector, worse than a DNS leak. So anonctl exempts exactly one `host:port` and nothing else. anonctl mirrors [netcage](https://github.com/wighawag/netcage)'s `--allow` vocabulary; the two tools' exemption flags are kept aligned. See [ADR-0007](docs/adr/0007-lan-exemption-port-mandatory.md).
 
 **3. Provision an account, then prove it:**
 

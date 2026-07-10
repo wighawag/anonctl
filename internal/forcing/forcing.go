@@ -136,7 +136,7 @@ func Reconfigure(ctx context.Context, d Deps, c accountconfig.Config, exemptions
 	// Re-apply the rules FIRST (atomic table replace: the default-DROP is never
 	// gone), so the new endpoint's closure (b) is in force before the shim is
 	// pointed at it. Persist the new rule file so a reboot re-applies the new state.
-	// Re-apply the BASELINE too, so a changed exemption set (an `update --allow-direct`)
+	// Re-apply the BASELINE too, so a changed exemption set (an `update --allow`)
 	// updates the LIVE baseline's exemption RETURNs, not just the persisted file: the
 	// baseline must RETURN the same exempted destinations the forcing chain accepts,
 	// or the direct hole is dropped by the stale baseline. It stays a scoped, atomic

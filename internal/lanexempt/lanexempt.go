@@ -1,17 +1,22 @@
 // Package lanexempt is anonctl's PURE guardrail for the narrow LAN exemption: the
-// parse+validate that turns an operator-supplied `IP|CIDR[:port]` into a
+// parse+validate that turns an operator-supplied `IP|CIDR:port` into a
 // validated, private-only exemption the nftables ruleset punches a direct hole
 // for. It is all pure logic (no root, no sockets, no system mutation) so the
 // guardrail is exhaustively unit-testable everywhere (the default `go test ./...`).
 //
-// It mirrors netcage's `--allow-direct` guardrail VERBATIM (netcage
+// It mirrors netcage's `--allow` guardrail VERBATIM (netcage
 // internal/cli/allowdirect.go, ADR-0005): the ONLY destinations accepted are
 // RFC1918 private space plus link-local; a hostname or any non-IP/CIDR literal is
 // refused (a LAN name cannot resolve through the forced path, and a local-resolver
 // hole would be another leak); a value not FULLY contained in a private range
 // (public, or a too-wide prefix that straddles public space) is refused LOUDLY,
-// naming the value. This is the fail-loud-at-config-time security gate: a user
-// cannot accidentally punch an anonymity leak (story 24).
+// naming the value. A PORT IS MANDATORY: a port-omitted (bare-IP / all-ports)
+// value is refused LOUDLY too, because the old all-ports form opened every TCP
+// port except 53 and is a deanonymization leak when the exempted host runs a
+// forwarding proxy on some other port (see docs/adr/0007); the only defensible
+// granularity is "reach exactly this service". This is the
+// fail-loud-at-config-time security gate: a user cannot accidentally punch an
+// anonymity leak (story 24).
 //
 // The MECHANISM anonctl builds on top of this is simpler than netcage's two-half
 // TUN split: there is no TUN here, so a single nft `accept`-before-drop suffices
@@ -34,19 +39,19 @@ import (
 // before the anon-UID drops, plus a nat `return` so it is not redirected).
 //
 // Network is always non-nil. A bare IP is normalised to a host route (/32 for
-// IPv4, /128 for IPv6). Port is the TCP destination port, or 0 meaning "all TCP
-// ports on this network" (a bare IP or CIDR with no `:port`). The entry is
-// TCP-only by construction (the forced path carries TCP; UDP other than DNS is
-// dropped), enforced at the nft layer, not encoded per entry.
+// IPv4, /128 for IPv6). Port is the exact TCP destination port and is always
+// > 0: a port is mandatory (Parse rejects a port-omitted value), so an exemption
+// always names EXACTLY one service. The entry is TCP-only by construction (the
+// forced path carries TCP; UDP other than DNS is dropped), enforced at the nft
+// layer, not encoded per entry.
 type Exempt struct {
 	Network *net.IPNet // the exempted destination network (a /32 or /128 for a bare IP)
-	Port    int        // TCP port, or 0 for all TCP ports on the network
+	Port    int        // exact TCP port (always > 0; a port is mandatory)
 	Raw     string     // the original value, preserved for diagnostics
 }
 
 // dnsPort is the clear-DNS port (53). It is UN-EXEMPTABLE: Parse rejects an
-// explicit `:53` exemption and internal/nftables excludes it from a port-omitted
-// (all-TCP) exemption's accept, so the LAN hole can never carry clear DNS (Tails
+// explicit `:53` exemption, so the LAN hole can never carry clear DNS (Tails
 // leak-catalogue row 2). Exported so the nft generator names the SAME port rather
 // than spelling a bare 53, keeping the guardrail and the generation consistent.
 const DNSPort = 53
@@ -56,20 +61,14 @@ const dnsPort = DNSPort
 // HostPort renders the exemption as a dialable `host:port` for a live verify
 // probe (the split-tunnel probe dials the exempted destination and expects it
 // reachable, so it needs a concrete host+port). The host is the network's base
-// address (the exact host for a bare-IP /32 or /128). The port is the exemption's
-// own TCP port when it named one; for a port-omitted (all-TCP) exemption it falls
-// back to defaultPort, since the probe must pick ONE concrete TCP port to dial and
-// every non-53 TCP port is exempted. It never renders 53 (un-exemptable), so the
-// caller's defaultPort is expected to be a real non-DNS TCP port.
-func (e Exempt) HostPort(defaultPort int) string {
+// address (the exact host for a bare-IP /32 or /128) and the port is the
+// exemption's own TCP port, always present (a port is mandatory). It never renders
+// 53 (un-exemptable).
+func (e Exempt) HostPort() string {
 	if e.Network == nil {
 		return ""
 	}
-	port := e.Port
-	if port == 0 {
-		port = defaultPort
-	}
-	return net.JoinHostPort(e.Network.IP.String(), strconv.Itoa(port))
+	return net.JoinHostPort(e.Network.IP.String(), strconv.Itoa(e.Port))
 }
 
 // IsV4 reports whether the exemption is an IPv4 destination, so the nft layer can
@@ -103,11 +102,12 @@ var privateRanges = func() []*net.IPNet {
 }()
 
 // Parse parses one exemption value into a validated Exempt. It accepts an IP or a
-// CIDR, each optionally suffixed with `:port`, and REJECTS (loudly, naming the
+// CIDR, each suffixed with a MANDATORY `:port`, and REJECTS (loudly, naming the
 // value + reason): a hostname or otherwise non-IP/CIDR literal; a malformed value;
-// an out-of-range or non-numeric port; and any address/network NOT fully within
-// the private/link-local ranges (a public destination that would leak). This is
-// the fail-loud-at-config-time security gate. Mirrors netcage's parseAllowDirect.
+// a port-omitted (all-ports) value; an out-of-range or non-numeric port; an
+// explicit `:53`; and any address/network NOT fully within the private/link-local
+// ranges (a public destination that would leak). This is the
+// fail-loud-at-config-time security gate. Mirrors netcage's parseAllow.
 func Parse(raw string) (Exempt, error) {
 	value := strings.TrimSpace(raw)
 	if value == "" {
@@ -119,12 +119,25 @@ func Parse(raw string) (Exempt, error) {
 		return Exempt{}, err
 	}
 
+	// Reject a port-omitted value: a port is MANDATORY. The old all-ports form
+	// (`192.168.1.150`, no `:port`) opened every TCP port except 53, which is a
+	// deanonymization leak if the exempted host runs a forwarding proxy on some
+	// other port (ssh -D SOCKS, squid, a Tor SocksPort, a socat tunnel): the anon
+	// account could dial that proxy directly and egress the whole internet from the
+	// real IP. The only defensible granularity is "reach exactly this service", so
+	// the exemption must always name an exact port (see docs/adr/0007).
+	if port == 0 {
+		return Exempt{}, fmt.Errorf(
+			"LAN exemption %q has no port: a port is mandatory (an all-ports hole to a host running a forwarding proxy would leak your real IP); add :port for the exact service, e.g. %s:8080",
+			raw, hostPart)
+	}
+
 	// Reject an explicit clear-DNS port (53). A LAN DNS hole (`@192.168.x.x`) can
 	// reveal the local network's public IP (Tails leak-catalogue row 2), so 53 is
 	// UN-EXEMPTABLE by construction: DNS must go through the anonymizer, never a
-	// direct LAN query. This is the fail-loud half; the nft layer separately
-	// EXCLUDES 53 from a port-omitted (all-TCP) exemption so that path cannot carry
-	// DNS either. 853 (DoT) is encrypted DNS and does not leak the public IP the
+	// direct LAN query. With the all-ports form removed, an exemption always names
+	// exactly one port, so rejecting :53 here is the whole DNS-hole guard. 853 (DoT)
+	// is encrypted DNS and does not leak the public IP the
 	// same way, and mDNS/5353 is UDP (never carried by the TCP-only exemption), so
 	// only 53 is rejected here.
 	if port == dnsPort {

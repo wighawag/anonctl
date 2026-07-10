@@ -164,12 +164,12 @@ func TestRoundTripPreservesEndpoint(t *testing.T) {
 }
 
 // A config with LAN exemptions round-trips the raw exemption values (credential-
-// free: just IP/CIDR[:port] strings, no secret), so the operator's --allow-direct
+// free: just IP/CIDR:port strings, no secret), so the operator's --allow
 // choices survive to the next verb / reboot and reach both the ruleset and verify.
 func TestRoundTripPreservesExemptions(t *testing.T) {
 	store := accountconfig.Store{BaseDir: t.TempDir()}
 	c := sample()
-	c.Exemptions = []string{"192.168.1.150:8080", "10.0.0.0/24"}
+	c.Exemptions = []string{"192.168.1.150:8080", "10.0.0.0/24:9090"}
 	if err := store.Write(c); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestRoundTripPreservesExemptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	if len(got.Exemptions) != 2 || got.Exemptions[0] != "192.168.1.150:8080" || got.Exemptions[1] != "10.0.0.0/24" {
+	if len(got.Exemptions) != 2 || got.Exemptions[0] != "192.168.1.150:8080" || got.Exemptions[1] != "10.0.0.0/24:9090" {
 		t.Errorf("Exemptions = %v, want the two raw values in order", got.Exemptions)
 	}
 }

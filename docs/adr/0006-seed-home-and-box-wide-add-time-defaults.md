@@ -2,7 +2,7 @@
 
 ## Context
 
-A fresh anon account lands with a near-empty home (skel + anonctl's minimal-PATH `.profile`), and a bare `anonctl add <name>` cannot carry any standing configuration: to get a usable account an operator had to re-type `--allow-direct` (and hand-populate the home) every time. The motivating case is running a coding agent inside the account against a local model on the LAN, which needs both a seeded tool config AND the model host exempted.
+A fresh anon account lands with a near-empty home (skel + anonctl's minimal-PATH `.profile`), and a bare `anonctl add <name>` cannot carry any standing configuration: to get a usable account an operator had to re-type `--allow` (and hand-populate the home) every time. The motivating case is running a coding agent inside the account against a local model on the LAN, which needs both a seeded tool config AND the model host exempted.
 
 ## Decision
 
@@ -12,7 +12,7 @@ anonctl gains a generic `seed-home` verb and two box-wide, add-time defaults, al
 
 2. **The default home is a directory-exists CONVENTION, not a config key.** If `/etc/anonctl/default-home/` exists, `add` seeds a FRESH account's home from it (never overwriting: `add` stays create-only and has no `--force`; re-adding never re-seeds, mirroring the login-env write). Its presence IS the switch. Populate it with a plain `sudo cp -r <src>/. /etc/anonctl/default-home/`; there is deliberately no helper verb.
 
-3. **Default LAN exemptions live in `/etc/anonctl/defaults.json`** (`{"allowDirect": [...]}`, root-owned). `add` applies them when given no `--allow-direct`. A CLI flag OVERRIDES the file (CLI beats config). A default exemption is re-validated through the SAME `lanexempt.Parse` guardrail the CLI flag uses, so a public / hostname / `:53` default is rejected loudly: a default is NEVER a quieter path to a leak than the flag.
+3. **Default LAN exemptions live in `/etc/anonctl/defaults.json`** (`{"allow": [...]}`, root-owned). `add` applies them when given no `--allow`. A CLI flag OVERRIDES the file (CLI beats config). A default exemption is re-validated through the SAME `lanexempt.Parse` guardrail the CLI flag uses, so a public / hostname / `:53` / port-omitted default is rejected loudly (a port is mandatory, ADR-0007): a default is NEVER a quieter path to a leak than the flag. (The flag was `--allow-direct` and the key `allowDirect` before ADR-0007's clean-break rename.)
 
 `--force` lives ONLY on `seed-home`, never on `add`. All the seed/defaults filesystem seams sit behind a configurable `BaseDir` (mirroring `marker.Store` / `accountconfig.Store`) so tests isolate the shared `/etc` read/write and assert the real path is untouched.
 
