@@ -32,14 +32,15 @@ const elevatedSentinelEnv = "ANONCTL_ELEVATED"
 var errSudoNotFound = errors.New("sudo not found on PATH")
 
 // rootRequiringVerbs are the verbs that mutate the system as root and so trigger
-// self-elevation when run non-root: the forcing/provisioning verbs plus `use`
-// (which drops UID via setpriv). Read-only verbs (list/status) are deliberately
-// ABSENT so a read never forces a password prompt.
+// self-elevation when run non-root: the forcing/provisioning verbs plus `use` and
+// `exec` (which drop UID via setpriv). Read-only verbs (list/status) are
+// deliberately ABSENT so a read never forces a password prompt.
 var rootRequiringVerbs = map[string]bool{
 	"add":         true,
 	"rm":          true,
 	"verify":      true,
 	"use":         true,
+	"exec":        true,
 	"update":      true,
 	"reconfigure": true,
 }

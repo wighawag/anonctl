@@ -69,6 +69,7 @@ anonctl list   [--json]                                      list the anon accou
 anonctl status [<name>] [--json]                             show one account's state
 anonctl verify [<name>] [--json]                             PROVE the account is anonymized (non-zero exit on failure)
 anonctl use    [<name>]                                      verify, then open a shell as the account ONLY on green (root)
+anonctl exec   [--as <name>] <program> [args...]             verify, then RUN <program> in the account ONLY on green; args forwarded verbatim (root)
 anonctl update|reconfigure --endpoint <socks5h://host:port> [--allow <IP|CIDR:port>]... [<name>]   re-point an account, re-applied fail-closed (root)
 anonctl --version | version                                  print the version
 ```
@@ -81,7 +82,7 @@ sudo anonctl verify                 # prove it: anonymized exit, DNS remote, a d
 sudo anonctl add --endpoint socks5h://127.0.0.1:1080 work   # a second account through another endpoint
 ```
 
-The `sudo` prefix above is optional: the root-requiring verbs (`add`, `rm`, `verify`, `use`, `update`/`reconfigure`) **self-elevate**. Run a bare `anonctl verify` and it re-execs itself via `sudo` and prompts for your password **inline in the terminal** (not a GUI dialog), then runs the verb and hands back its exit code exactly. Already-root (you typed `sudo anonctl ...`) runs directly with no second prompt; the read-only verbs (`list`, `status`) and `--version` never elevate; and if `sudo` is not installed you get the plain "must be root" error, never a polkit/GUI popup.
+The `sudo` prefix above is optional: the root-requiring verbs (`add`, `rm`, `verify`, `use`, `exec`, `update`/`reconfigure`) **self-elevate**. Run a bare `anonctl verify` and it re-execs itself via `sudo` and prompts for your password **inline in the terminal** (not a GUI dialog), then runs the verb and hands back its exit code exactly. Already-root (you typed `sudo anonctl ...`) runs directly with no second prompt; the read-only verbs (`list`, `status`) and `--version` never elevate; and if `sudo` is not installed you get the plain "must be root" error, never a polkit/GUI popup.
 
 ## Seeding a home and box-wide add-time defaults
 
@@ -202,6 +203,17 @@ The live probes run in the **normal binary** (a `go install` / release build): p
 Be honest about what `use` is and is NOT. It is **NOT the leak protection and NOT enforcement**. Two things it deliberately does not do: (1) it is a **snapshot**, verify green at login does not guarantee forcing stays up for the whole session (Tor could die, someone could flush the rules mid-session); (2) it is **not mandatory**, `su - <account>` / `sudo -iu <account>` / an SSH login / cron still reach the account and bypass `use` entirely. The **real protection is the kernel forcing plus the standing per-UID default-deny** (an anon UID with no forcing loaded is DROPPED, not free); `use` just refuses to hand you a shell on a setup that is broken RIGHT NOW. Making the account usable ONLY through anonctl is a separate, invasive login-shell/PAM change tracked as the `mandatory-anonctl-gated-login` idea, not this verb.
 
 Like the live `verify` probes, the shell drop runs in the **normal binary** (no `-tags integration` rebuild): it needs root + `setpriv` + a provisioned host, and it drops only after a green `verify`, so `use` on a broken or unprovable setup refuses with the failing assertions rather than handing you a shell.
+
+## exec: run one program in the account (use's one-program sibling)
+
+`anonctl exec [--as <name>] <program> [args...]` is `use` for a **single program** instead of an interactive shell: it runs the SAME `verify` gate and, **only on a green verify**, runs `<program>` inside the anonymized account (the same identity `use` drops you into); on a red verify it prints the failing assertions and runs **nothing**, so you can never get a non-anonymized run through `exec`. It is the same verify-then-enter primitive as `use`, two faces of one gate: `use` drops an interactive shell, `exec` runs one program. It requires root and self-elevates via `sudo` exactly like `use`, and it inherits `use`'s honesty caveat (a snapshot at launch, not continuous; the real protection is the kernel forcing + the standing default-deny).
+
+`exec` is what makes any tool launchable in an anonymized identity **generically**, with no per-tool launcher: `sudo anonctl exec pi -p "hello world"` runs `pi` anonymized. Two things about the grammar:
+
+- **The account is chosen with `--as`, not a positional name.** A bare `anonctl exec pi ...` has to run the *program* `pi` on the default `anon` account, so there is no positional slot left for an account name; `--as work` selects `anon-work` instead (resolved the same way every other verb resolves `<name>`). `--as` is only read *before* the program.
+- **Everything from the program token onward is forwarded VERBATIM** and is never interpreted as an anonctl flag. `anonctl exec pi -p "hello world" --json` passes `-p`, `hello world`, `--json` to `pi` (that `--json` is pi's, not anonctl's), and the quoted `hello world` reaches pi as a **single argument** (it is run through the account's login shell with each argument shell-quoted, so no re-splitting or globbing). anonctl's own flags (`--as`, `--skip-tor-exit-check`) must come *before* the program.
+
+Like `use`, the drop + program run is in the **normal binary** (no `-tags integration` rebuild): it needs root + `setpriv` + a provisioned host and runs only after a green `verify`.
 
 ## What anonctl guarantees and what it does NOT
 

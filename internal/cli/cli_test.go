@@ -97,6 +97,113 @@ func TestUseVerbAndNameResolution(t *testing.T) {
 	}
 }
 
+// `exec` runs a program INSIDE the anonymized account. Its grammar is bespoke
+// (`exec [--as <name>] <program> [args...]`): the account is chosen by `--as`
+// (default `anon`, `<name>` -> `anon-<name>`), the FIRST non-flag token is the
+// program, and everything after it is forwarded VERBATIM. These are the pure-parse
+// proofs of that split.
+func TestExecParse(t *testing.T) {
+	// Bare `exec <program>` targets the default account, no forwarded args.
+	bare, err := cli.Parse([]string{"exec", "pi"})
+	if err != nil {
+		t.Fatalf("Parse(exec pi): %v", err)
+	}
+	if bare.Verb != "exec" || bare.Account != "anon" || bare.Program != "pi" {
+		t.Errorf("exec pi => verb=%q account=%q program=%q, want exec/anon/pi", bare.Verb, bare.Account, bare.Program)
+	}
+	if len(bare.ExecArgs) != 0 {
+		t.Errorf("exec pi ExecArgs = %v, want none", bare.ExecArgs)
+	}
+
+	// `--as <name>` selects the named account and resolves it like the other verbs.
+	named, err := cli.Parse([]string{"exec", "--as", "work", "pi"})
+	if err != nil {
+		t.Fatalf("Parse(exec --as work pi): %v", err)
+	}
+	if named.Account != "anon-work" || named.Program != "pi" {
+		t.Errorf("exec --as work pi => account=%q program=%q, want anon-work/pi", named.Account, named.Program)
+	}
+
+	// `--as=<name>` (equals form) works too.
+	eq, err := cli.Parse([]string{"exec", "--as=media", "pi"})
+	if err != nil {
+		t.Fatalf("Parse(exec --as=media pi): %v", err)
+	}
+	if eq.Account != "anon-media" {
+		t.Errorf("exec --as=media => account=%q, want anon-media", eq.Account)
+	}
+}
+
+// The load-bearing property: everything after the program is forwarded VERBATIM and
+// NEVER interpreted as an anonctl flag. A `--json`, a `--as`, a `-p`, or a
+// `--skip-tor-exit-check` AFTER the program is the program's argument, not anonctl's,
+// and an arg with spaces stays a SINGLE element (`-p "hello world"` reaches the
+// program as `-p`, `hello world`).
+func TestExecArgsForwardedVerbatim(t *testing.T) {
+	cmd, err := cli.Parse([]string{"exec", "pi", "-p", "hello world", "--json", "--as", "notme", "--skip-tor-exit-check"})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cmd.Account != "anon" {
+		t.Errorf("account = %q, want anon (a --as AFTER the program is the program's arg, not anonctl's)", cmd.Account)
+	}
+	if cmd.JSON {
+		t.Error("a --json AFTER the program must NOT set anonctl's JSON flag")
+	}
+	if cmd.SkipTorExitCheck {
+		t.Error("a --skip-tor-exit-check AFTER the program must NOT set anonctl's flag")
+	}
+	if cmd.Program != "pi" {
+		t.Errorf("program = %q, want pi", cmd.Program)
+	}
+	want := []string{"-p", "hello world", "--json", "--as", "notme", "--skip-tor-exit-check"}
+	if len(cmd.ExecArgs) != len(want) {
+		t.Fatalf("ExecArgs = %v, want %v", cmd.ExecArgs, want)
+	}
+	for i := range want {
+		if cmd.ExecArgs[i] != want[i] {
+			t.Fatalf("ExecArgs = %v, want %v (verbatim, one element per arg)", cmd.ExecArgs, want)
+		}
+	}
+}
+
+// exec's OWN flags are honoured BEFORE the program (a `--skip-tor-exit-check`
+// preceding the program is anonctl's verify-gate flag), and `--as` there sets the
+// account.
+func TestExecOwnFlagsBeforeProgram(t *testing.T) {
+	cmd, err := cli.Parse([]string{"exec", "--skip-tor-exit-check", "--as", "work", "pi", "-p", "x"})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !cmd.SkipTorExitCheck {
+		t.Error("--skip-tor-exit-check BEFORE the program must set anonctl's gate flag")
+	}
+	if cmd.Account != "anon-work" || cmd.Program != "pi" {
+		t.Errorf("account/program = %q/%q, want anon-work/pi", cmd.Account, cmd.Program)
+	}
+	if len(cmd.ExecArgs) != 2 || cmd.ExecArgs[0] != "-p" || cmd.ExecArgs[1] != "x" {
+		t.Errorf("ExecArgs = %v, want [-p x]", cmd.ExecArgs)
+	}
+}
+
+// A bare `exec` with no program is a loud usage error (exec must run something), and
+// an `exec --as work` with no program is too. A dangling `--as` (no value) is a loud
+// error, and an unknown exec flag BEFORE the program is rejected.
+func TestExecMissingProgramAndBadFlags(t *testing.T) {
+	if _, err := cli.Parse([]string{"exec"}); err == nil {
+		t.Error("bare exec (no program) must be a usage error")
+	}
+	if _, err := cli.Parse([]string{"exec", "--as", "work"}); err == nil {
+		t.Error("exec --as work (no program) must be a usage error")
+	}
+	if _, err := cli.Parse([]string{"exec", "--as"}); err == nil {
+		t.Error("dangling --as (no value) must be a parse error")
+	}
+	if _, err := cli.Parse([]string{"exec", "--bogus", "pi"}); err == nil {
+		t.Error("an unknown exec flag before the program must be rejected")
+	}
+}
+
 // verify and update/reconfigure are STUBS filled by later tasks, but they must
 // still DISPATCH here so the verb surface is end-to-end.
 func TestStubVerbsDispatch(t *testing.T) {

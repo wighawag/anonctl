@@ -235,6 +235,99 @@ func TestUseRequiresRoot(t *testing.T) {
 	}
 }
 
+// exec is use's one-program sibling: the SAME verify-then-enter gate, but it RUNS a
+// program (args forwarded verbatim) instead of dropping an interactive shell. These
+// unit tests drive the gate behind the injectable seams (execVerifyReport +
+// execRunProgram + useGeteuid): green => the program runs for the right account with
+// the right args; red => the program NEVER runs (non-zero exit); and root is
+// required. The real setpriv run lives behind the `integration` tag.
+
+// execCall records what the execRunProgram seam was invoked with ("" program until
+// a run is attempted).
+type execCall struct {
+	account string
+	program string
+	args    []string
+}
+
+// swapExecSeams installs fake exec seams and returns a restore func + a pointer to
+// the recorded call. It neutralises the dispatch-time elevate seam exactly like
+// swapUseSeams so the runExec euid guard is exercised directly (no real sudo).
+func swapExecSeams(t *testing.T, rep verify.Report, euid int) *execCall {
+	t.Helper()
+	var call execCall
+	origVerify, origRun, origEuid := execVerifyReport, execRunProgram, useGeteuid
+	execVerifyReport = func(ctx context.Context, r provision.Runner, cmd *cli.Command, prog verify.Progress) verify.Report {
+		return rep
+	}
+	execRunProgram = func(ctx context.Context, r provision.Runner, account, program string, args []string) error {
+		call = execCall{account: account, program: program, args: args}
+		return nil // a real exec never returns; the fake records + returns nil
+	}
+	useGeteuid = func() int { return euid }
+	origEEuid, origLook := elevateGeteuid, elevateLookSudo
+	elevateGeteuid = func() int { return euid }
+	elevateLookSudo = func() (string, error) { return "", errSudoNotFound }
+	t.Cleanup(func() {
+		execVerifyReport, execRunProgram, useGeteuid = origVerify, origRun, origEuid
+		elevateGeteuid, elevateLookSudo = origEEuid, origLook
+	})
+	return &call
+}
+
+// On a GREEN verify, exec RUNS the program for the resolved account with the args
+// forwarded verbatim (exit 0, the run seam invoked with the right program+args).
+func TestExecGreenRunsProgram(t *testing.T) {
+	call := swapExecSeams(t, greenReport(), 0)
+	code := run([]string{"exec", "pi", "-p", "hello world"})
+	if code != 0 {
+		t.Errorf("run(exec pi ...) on green = %d, want 0", code)
+	}
+	if call.account != "anon" || call.program != "pi" {
+		t.Errorf("run seam got account/program %q/%q, want anon/pi", call.account, call.program)
+	}
+	if len(call.args) != 2 || call.args[0] != "-p" || call.args[1] != "hello world" {
+		t.Errorf("run seam got args %v, want [-p, \"hello world\"] (forwarded verbatim, one element)", call.args)
+	}
+}
+
+// A `--as <name>` exec on green runs the program for the RESOLVED `anon-<name>`.
+func TestExecGreenResolvesNamedAccount(t *testing.T) {
+	call := swapExecSeams(t, verify.Report{Account: "anon-work", Assertions: []verify.Assertion{{Ok: true, Name: "anonymized-exit"}}}, 0)
+	if code := run([]string{"exec", "--as", "work", "pi"}); code != 0 {
+		t.Errorf("run(exec --as work pi) on green = %d, want 0", code)
+	}
+	if call.account != "anon-work" || call.program != "pi" {
+		t.Errorf("run seam got %q/%q, want anon-work/pi", call.account, call.program)
+	}
+}
+
+// On a RED verify, exec exits NON-ZERO and does NOT run the program: you cannot get
+// a non-anonymized run via exec.
+func TestExecRedRefusesNoRun(t *testing.T) {
+	call := swapExecSeams(t, redReport(), 0)
+	code := run([]string{"exec", "pi"})
+	if code == 0 {
+		t.Errorf("run(exec pi) on red = 0, want non-zero (must refuse to run on a broken account)")
+	}
+	if call.program != "" {
+		t.Errorf("run seam invoked with %q on RED verify; exec must NOT run a program when verify fails", call.program)
+	}
+}
+
+// exec requires root (it drops to the account): a non-root invocation fails loud
+// (non-zero) and does NOT run verify or the program.
+func TestExecRequiresRoot(t *testing.T) {
+	call := swapExecSeams(t, greenReport(), 1000)
+	code := run([]string{"exec", "pi"})
+	if code == 0 {
+		t.Errorf("run(exec pi) as non-root = 0, want non-zero (exec must require root)")
+	}
+	if call.program != "" {
+		t.Errorf("run seam invoked as non-root; exec must refuse before dropping to the account")
+	}
+}
+
 // swapRmSeams installs fake rm seams that record their calls (in order) into a
 // shared event log, and returns a restore func + a pointer to that log. The
 // forcing-remove fake records a "disable-shim" event (standing in for the real

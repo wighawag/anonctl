@@ -13,11 +13,13 @@ import (
 	"github.com/wighawag/anonctl/internal/provision"
 )
 
-// execLoginShell is the REAL shell drop behind `anonctl use`. It is compiled into
+// execLoginShell is the REAL shell drop behind `anonctl use`: the INTERACTIVE face
+// of the shared verify-then-enter primitive (enterAccount does the resolution +
+// drop, `execProgram` is the one-shot sibling face). It is compiled into
 // EVERY build (dropping to the account is runtime behaviour needing setpriv +
 // root, like `add`/`rm`, not a test): the previous default-build stub that refused
-// to open a shell is gone. It resolves the account's UID / GID / login shell /
-// home from its passwd entry
+// to open a shell is gone. Via enterAccount it resolves the account's UID / GID /
+// login shell / home from its passwd entry
 // (via the Runner, the same read-only truth the rest of provisioning uses) and
 // REPLACES the anonctl process with the account's interactive login shell dropped
 // to that UID.
@@ -45,19 +47,108 @@ import (
 // effect. Any resolution/lookup failure returns an error (surfaced non-zero by
 // runUse), never a silent fallback to a non-anonymized shell.
 func execLoginShell(ctx context.Context, r provision.Runner, account string) error {
-	uid, gid, shell, home, err := accountLoginFields(ctx, r, account)
+	entry, err := enterAccount(ctx, r, account)
 	if err != nil {
 		return err
 	}
+	// argv0 of the shell is prefixed with `-` so it behaves as a LOGIN shell (the
+	// conventional login-shell signal), reinforcing the `-l` we pass setpriv. This is
+	// the INTERACTIVE face of the shared enter-primitive: drop into the account and
+	// hand the operator its login shell.
+	argv := append(entry.setprivPrefix(), entry.shell, "-l")
+	return syscall.Exec(entry.setpriv, argv, entry.env)
+}
+
+// execProgram is the ONE-PROGRAM face of the same verify-then-enter primitive
+// `execLoginShell` is the interactive face of. Behind the identical safety gate
+// (runExec verifies GREEN before ever calling this) it drops into the account with
+// the SAME setpriv mechanism, SAME clean-login env, SAME HOME chdir, but instead of
+// an interactive login shell it RUNS `program` with `args` forwarded VERBATIM.
+//
+// It runs the program THROUGH the account's login shell as a login shell command
+// (`setpriv ... <shell> -lc "<program> <args>"`) so the program inherits the same
+// login environment (minimal-PATH profile drop-in) an interactive `use` shell gets.
+// The command string is built by shell-quoting the program and each arg
+// INDEPENDENTLY (shellQuote), so an arg with spaces or metacharacters reaches the
+// program as ONE argument, never re-split or re-globbed: `anonctl exec pi -p "hi
+// there"` runs pi with a single `hi there` argument. Passing the args as a
+// pre-quoted command string (not via the shell's own `"$@"`) keeps the quoting
+// wholly on anonctl's side, so there is no second word-splitting pass to reason
+// about.
+//
+// It exec-REPLACES this process (syscall.Exec), so on success it never returns; the
+// program becomes anonctl. Any resolution/lookup failure returns an error (surfaced
+// non-zero by runExec), NEVER a silent fallback to a non-anonymized run.
+func execProgram(ctx context.Context, r provision.Runner, account, program string, args []string) error {
+	entry, err := enterAccount(ctx, r, account)
+	if err != nil {
+		return err
+	}
+	// Build the login-shell command: the program and every arg quoted independently so
+	// the login shell re-assembles the EXACT argv anonctl was handed (no re-split, no
+	// glob). shellQuote wraps each token in single quotes (POSIX-literal), so nothing
+	// inside is special to the shell.
+	quoted := make([]string, 0, len(args)+1)
+	quoted = append(quoted, shellQuote(program))
+	for _, a := range args {
+		quoted = append(quoted, shellQuote(a))
+	}
+	command := strings.Join(quoted, " ")
+
+	argv := append(entry.setprivPrefix(), entry.shell, "-lc", command)
+	return syscall.Exec(entry.setpriv, argv, entry.env)
+}
+
+// accountEntry is the resolved, ready-to-drop context the verify-then-enter
+// primitive produces once (via enterAccount): the located setpriv, the account's
+// numeric UID/GID + login shell, and the clean login environment, with the CWD
+// already moved into the account's HOME. Both faces (`execLoginShell` interactive,
+// `execProgram` one-shot) consume it, differing ONLY in what they hand setpriv to
+// run. This is the shape a future shared anoncore enter-primitive will host; the
+// per-tool substrate (here: setpriv into the anon UID) is all that stays behind.
+type accountEntry struct {
+	setpriv string
+	uid     int
+	gid     int
+	shell   string
+	env     []string
+}
+
+// setprivPrefix builds the leading `setpriv --reuid <uid> --regid <gid>
+// --init-groups` argv both faces share; the caller appends the shell + its
+// mode-specific tail (`-l` for a login shell, `-lc <command>` for a program).
+func (e accountEntry) setprivPrefix() []string {
+	return []string{
+		e.setpriv,
+		"--reuid", strconv.Itoa(e.uid),
+		"--regid", strconv.Itoa(e.gid),
+		"--init-groups",
+	}
+}
+
+// enterAccount is the SHARED verify-then-enter primitive's drop half (the verify
+// half is the runExec/runUse gate that MUST have passed GREEN before this is
+// called): it resolves the account's UID/GID/login-shell/home, locates setpriv,
+// builds the clean login environment, and chdirs into the account's HOME, returning
+// an accountEntry ready for either face to exec. Factoring it here keeps `use`
+// (interactive) and `exec` (one program) from drifting into two different notions
+// of "enter the account", and makes the later anoncore extraction trivial (this is
+// exactly the primitive that moves). Any failure is returned, never swallowed: an
+// enter that could not resolve/chdir must be a loud error, not a run in the clear.
+func enterAccount(ctx context.Context, r provision.Runner, account string) (accountEntry, error) {
+	uid, gid, shell, home, err := accountLoginFields(ctx, r, account)
+	if err != nil {
+		return accountEntry{}, err
+	}
 	setpriv, err := exec.LookPath("setpriv")
 	if err != nil {
-		return fmt.Errorf("setpriv not found (needed to drop to %s): %w", account, err)
+		return accountEntry{}, fmt.Errorf("setpriv not found (needed to drop to %s): %w", account, err)
 	}
 
-	// Build a minimal, clean login environment for the dropped shell: HOME/USER/
+	// Build a minimal, clean login environment for the dropped session: HOME/USER/
 	// LOGNAME for the account and a spartan PATH (the account's own profile drop-in
 	// refines it on login). Not inheriting anonctl's environment keeps a root-run
-	// `use` from leaking root's env into the anon session.
+	// `use`/`exec` from leaking root's env into the anon session.
 	env := []string{
 		"HOME=" + home,
 		"USER=" + account,
@@ -65,42 +156,42 @@ func execLoginShell(ctx context.Context, r provision.Runner, account string) err
 		"SHELL=" + shell,
 		"PATH=/usr/local/bin:/usr/bin:/bin",
 		"TERM=" + os.Getenv("TERM"),
-		// Mark the dropped shell as an anonctl session so a nested `anonctl use` (or any
-		// root-requiring verb) run from INSIDE it refuses cleanly instead of trying to
-		// sudo: the anon account has no sudo path, so a re-exec would just dead-end on an
-		// anon password prompt. The value is the account, so the refusal names it.
+		// Mark the dropped session as an anonctl session so a nested `anonctl use`/`exec`
+		// (or any root-requiring verb) run from INSIDE it refuses cleanly instead of
+		// trying to sudo: the anon account has no sudo path, so a re-exec would just
+		// dead-end on an anon password prompt. The value is the account, so the refusal
+		// names it.
 		anonctlSessionEnv + "=" + account,
 	}
 
-	// Land in the account's HOME before exec'ing the shell. syscall.Exec inherits the
-	// caller's CWD, and `use` is typically run from the operator's own home (e.g.
-	// /home/wighawag), which the anon account cannot write. A login shell that starts
-	// there but with HOME=/home/anon is a split environment: tools derive paths from
-	// $PWD (session dirs named after the caller's path) yet write under HOME, so they
-	// hit EACCES on the caller's dir or on a half-created /home/anon path. A real login
+	// Land in the account's HOME before exec'ing. syscall.Exec inherits the caller's
+	// CWD, and `use`/`exec` is typically run from the operator's own home (e.g.
+	// /home/wighawag), which the anon account cannot write. A session that starts there
+	// but with HOME=/home/anon is a split environment: tools derive paths from $PWD
+	// (session dirs named after the caller's path) yet write under HOME, so they hit
+	// EACCES on the caller's dir or on a half-created /home/anon path. A real login
 	// starts in HOME, so chdir there first. If HOME is unreachable (missing/permission),
 	// fall back to `/` rather than leaving the session in the caller's unwritable dir;
-	// never silently keep the caller's CWD. Do the chdir AS the account (setpriv drops
-	// privilege for the shell but not for this pre-exec chdir, so a root-run `use` must
-	// not let root's reach mask a home the account itself cannot enter).
+	// never silently keep the caller's CWD.
 	cwd := loginWorkingDir(home)
 	if err := os.Chdir(cwd); err != nil {
-		return fmt.Errorf("could not enter working dir %q for %s's session: %w", cwd, account, err)
+		return accountEntry{}, fmt.Errorf("could not enter working dir %q for %s's session: %w", cwd, account, err)
 	}
 	// PWD must agree with the CWD we just set, since login shells and tools trust $PWD
 	// over a getcwd() syscall; leaving the inherited PWD would re-introduce the split.
 	env = append(env, "PWD="+cwd)
 
-	// argv0 of the shell is prefixed with `-` so it behaves as a LOGIN shell (the
-	// conventional login-shell signal), reinforcing the `-l` we pass setpriv.
-	argv := []string{
-		setpriv,
-		"--reuid", strconv.Itoa(uid),
-		"--regid", strconv.Itoa(gid),
-		"--init-groups",
-		shell, "-l",
-	}
-	return syscall.Exec(setpriv, argv, env)
+	return accountEntry{setpriv: setpriv, uid: uid, gid: gid, shell: shell, env: env}, nil
+}
+
+// shellQuote wraps s in single quotes so a POSIX shell reads it as a single literal
+// argument, with NO word-splitting, glob, variable, or command substitution applied.
+// An embedded single quote is emitted as the classic `'\”` sequence (close-quote,
+// escaped-quote, re-open-quote). This is what lets `exec` forward an arbitrary arg
+// (spaces, `$`, `*`, `;`, quotes) through the account's login shell so the program
+// receives it EXACTLY as anonctl was handed it, never re-split or re-globbed.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // anonctlSessionEnv marks a shell that `anonctl use` dropped into (value: the anon

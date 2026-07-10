@@ -106,6 +106,8 @@ func run(args []string) int {
 		return runVerify(ctx, runner, cmd)
 	case "use":
 		return runUse(ctx, runner, cmd)
+	case "exec":
+		return runExec(ctx, runner, cmd)
 	case "seed-home":
 		return runSeedHome(ctx, runner, cmd)
 	case "update", "reconfigure":
@@ -726,7 +728,64 @@ var (
 	// compiled only under the `integration` tag (use_exec_integration.go), mirroring
 	// verify's build-tag split, so a stray unit path can never spawn a shell.
 	useExecLoginShell = execLoginShell
+	// execRunProgram drops to the account and RUNS one program with its args
+	// forwarded verbatim (the one-shot face of the same enter-primitive
+	// useExecLoginShell is the interactive face of). A unit test replaces it to
+	// assert the gate polarity + the forwarded program/args without a real drop.
+	execRunProgram = execProgram
 )
+
+// runExec is `anonctl exec [--as <name>] <program> [args...]`: the SAME verify-then-
+// enter SAFETY GATE as `use`, but instead of an interactive login shell it RUNS one
+// program in the anonymized account with every arg forwarded VERBATIM. It verifies
+// the resolved account and, ONLY on a GREEN verify, execs the program as that
+// account (the kernel forcing already in effect). On a RED verify it prints the
+// failing assertions and exits non-zero WITHOUT running the program, so `exec` can
+// NEVER run a program in the clear (never a non-anonymized run).
+//
+// `exec` is `use`'s sibling: `use` = drop an interactive shell, `exec` = run one
+// program, two faces of the same verify-green-then-enter gate (a future shared
+// anoncore enter-primitive hosts exactly this). It inherits use's honesty caveats
+// (a snapshot verify at launch, not continuous; the real protection is the kernel
+// forcing + default-deny) and its root requirement (it drops UID via setpriv), so it
+// self-elevates via sudo exactly like use/verify/add. The gate + drop are behind the
+// same package seams (execVerifyReport/execRunProgram/useGeteuid) so unit tests
+// assert the gate without a live host or a real drop; the real setpriv run is
+// exercised under the `integration` tag.
+func runExec(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
+	if useGeteuid() != 0 {
+		errorf("exec: must be root to run %s as %s (it changes UID via setpriv); re-run with sudo", cmd.Program, cmd.Account)
+		return 1
+	}
+
+	// `exec` runs the SAME shared verify gate as `verify`/`use`, so it gets the same
+	// per-check progress: the operator sees the multi-second probe run before either
+	// the program starts or the refusal prints. It has no --json (it execs a program),
+	// so progress is always the human hook (stderr).
+	rep := execVerifyReport(ctx, r, cmd, verifyProgress(false))
+	if !rep.Ok() {
+		// RED: print the failing assertions and REFUSE. Do NOT run the program (you must
+		// never get a non-anonymized run via `exec`).
+		fmt.Print(colorizeReport(rep.Human()))
+		errorf("exec: %s did NOT verify as anonymized; refusing to run %s (fix it, then `%s`)", cmd.Account, cmd.Program, verifyHint(cmd.Account))
+		return rep.ExitCode()
+	}
+
+	// GREEN: run the program in the account. exec replaces this process, so on success
+	// execRunProgram never returns; a returned error means the drop/run itself failed
+	// (e.g. no setpriv, no such account) and is surfaced non-zero, never a clear run.
+	fmt.Fprintf(os.Stderr, "%s %s; running %s as %s (the kernel forcing is in effect)\n", outStyle.Bold(cmd.Account), outStyle.Green("verified anonymized"), cmd.Program, cmd.Account)
+	if err := execRunProgram(ctx, r, cmd.Account, cmd.Program, cmd.ExecArgs); err != nil {
+		errorf("exec: running %s as %s: %v", cmd.Program, cmd.Account, err)
+		return 1
+	}
+	return 0 // unreachable on a real exec (it replaced the process)
+}
+
+// execVerifyReport runs the verify gate for `exec` (the SAME gate `verify`/`use`
+// run, marker-on-green included). It is a package var mirroring useVerifyReport so a
+// unit test injects a green/red report without a live host.
+var execVerifyReport = verifyAndMark
 
 // runUpdate is `update`/`reconfigure`: it changes an already-forced account's
 // endpoint and RE-APPLIES the rules fail-closed, with no un-anonymized window
@@ -1120,6 +1179,16 @@ const usage = `usage:
                                      is the separate mandatory-anonctl-gated-login idea. Run from your NORMAL
                                      (sudo-capable) account: inside an anon session use cannot re-elevate
                                      (anon has no sudo), so switching accounts means exit first, then re-run.
+  anonctl exec   [--as <name>] [--skip-tor-exit-check] <program> [args...]
+                                     verify the account, then RUN <program> inside it ONLY on green (root);
+                                     refuses (runs nothing) if it is not currently anonymized. use's one-program
+                                     sibling: same verify-then-enter gate, but it runs one program instead of
+                                     dropping an interactive shell. The account is chosen by --as (default anon,
+                                     <name> -> anon-<name>); the FIRST token is the program and EVERYTHING after
+                                     it is forwarded VERBATIM (never read as an anonctl flag), so
+                                     ` + "`anonctl exec pi -p \"hello world\"`" + ` reaches pi with a single
+                                     ` + "`hello world`" + ` arg. Same honesty caveat as use (a snapshot at
+                                     launch, not continuous; the real protection is the kernel rules + default-deny).
   anonctl update|reconfigure [--endpoint <socks5h://host:port>] [--allow <IP|CIDR:port>]... [<name>]
                                      change the account's endpoint and re-apply fail-closed (no leak window) (root).
                                      With no --endpoint on a terminal it scans local socks5h ports and prompts

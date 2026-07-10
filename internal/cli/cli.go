@@ -68,6 +68,18 @@ type Command struct {
 	// list/status/rm/verify.
 	Exemptions []lanexempt.Exempt
 
+	// Program is the program `exec` runs INSIDE the anonymized account (the first
+	// positional after any `--as <name>`). Meaningful only for `exec`; empty for every
+	// other verb.
+	Program string
+
+	// ExecArgs are the arguments forwarded VERBATIM to Program (everything on the
+	// command line after the program token). They are NOT interpreted as anonctl
+	// flags: `anonctl exec pi --session x -p "hi there"` forwards `--session x -p
+	// "hi there"` to pi untouched, and `"hi there"` stays a single argument. Meaningful
+	// only for `exec`.
+	ExecArgs []string
+
 	// SkipTorExitCheck relaxes the anonymized-exit assertion's Tor-exit REQUIREMENT
 	// for a tor-shared endpoint (`--skip-tor-exit-check`, on verify/use). It never
 	// relaxes the load-bearing half (the exit IP must still DIFFER from the host's, so
@@ -93,6 +105,7 @@ var verbs = map[string]bool{
 	"update":      true,
 	"reconfigure": true,
 	"use":         true,
+	"exec":        true,
 	"seed-home":   true,
 }
 
@@ -114,6 +127,15 @@ func Parse(args []string) (*Command, error) {
 		return nil, fmt.Errorf("unknown verb %q", verb)
 	}
 	cmd := &Command{Verb: verb}
+
+	// `exec` has a bespoke grammar (`exec [--as <name>] <program> [args...]`) where
+	// everything AFTER the program token is forwarded VERBATIM and must never be read
+	// as an anonctl flag. It cannot share the flag-anywhere loop below (which would
+	// steal a `--json` or `-p` meant for the program), so it parses in its own
+	// function.
+	if verb == "exec" {
+		return parseExec(cmd, args[1:])
+	}
 
 	// Separate flags from the single optional positional (the account name).
 	// Flags may appear before OR after the name (`rm --purge-account work` and
@@ -195,6 +217,63 @@ func Parse(args []string) (*Command, error) {
 		return nil, fmt.Errorf("%s takes at most one account name (got %d)", verb, len(positionals))
 	}
 	return cmd, nil
+}
+
+// parseExec parses `exec`'s bespoke grammar: `exec [--as <name>] <program>
+// [args...]`. Unlike every other verb, `exec` has TWO positional roles (an account
+// selector and a program) plus a verbatim tail, so the shared "one optional
+// positional" convention does not extend to it. It deliberately diverges: the
+// account is chosen by an explicit `--as <name>` flag (default `anon`, `<name>` ->
+// `anon-<name>`, resolved by ResolveAccount exactly like the positional verbs),
+// and the FIRST non-flag token is the PROGRAM. Everything from the program token
+// onward is captured VERBATIM into Program + ExecArgs and is NEVER interpreted as
+// an anonctl flag, so `anonctl exec pi -p "hi there"` reaches pi as-is (a `--json`
+// or `-p` after the program is the program's, not anonctl's).
+//
+// Why a flag, not a positional name: `anonctl exec pi ...` must run the program
+// `pi` on the default account, so the first positional has to be the program;
+// there is no unambiguous positional slot left for the account name. `--as` names
+// it explicitly instead of guessing. `--as` is only honoured BEFORE the program
+// token (after it, `--as` is just a forwarded arg), consistent with the verbatim
+// tail.
+//
+// A missing program is a loud usage error (exec must run something). SkipTorExitCheck
+// rides `exec` too (its verify gate is the same as use/verify), but ONLY before the
+// program token.
+func parseExec(cmd *Command, rest []string) (*Command, error) {
+	var wantAsValue bool
+	for i := 0; i < len(rest); i++ {
+		a := rest[i]
+		if wantAsValue {
+			cmd.Account = ResolveAccount(a)
+			wantAsValue = false
+			continue
+		}
+		switch {
+		case a == "--as":
+			wantAsValue = true
+		case strings.HasPrefix(a, "--as="):
+			cmd.Account = ResolveAccount(strings.TrimPrefix(a, "--as="))
+		case a == "--skip-tor-exit-check":
+			cmd.SkipTorExitCheck = true
+		case strings.HasPrefix(a, "-"):
+			return nil, fmt.Errorf("exec: unknown flag %q (exec's own flags must come BEFORE the program; anything after the program is forwarded to it)", a)
+		default:
+			// The first non-flag token is the PROGRAM. Stop flag parsing here: this token
+			// and everything after it are the program + its verbatim args, captured whole.
+			cmd.Program = a
+			cmd.ExecArgs = append([]string(nil), rest[i+1:]...)
+			if cmd.Account == "" {
+				cmd.Account = DefaultAccount
+			}
+			return cmd, nil
+		}
+	}
+	// Reaching here means the loop ended without ever finding a program token.
+	if wantAsValue {
+		return nil, fmt.Errorf("exec: --as needs a value (the account name, e.g. `--as work` for anon-work)")
+	}
+	return nil, fmt.Errorf("exec needs a program to run (usage: `anonctl exec [--as <name>] <program> [args...]`)")
 }
 
 // addExemption parses one `--allow` value through the lanexempt guardrail and

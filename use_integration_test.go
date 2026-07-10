@@ -96,6 +96,69 @@ func TestUseExecLoginShellDropsToAccount(t *testing.T) {
 	}
 }
 
+// TestExecProgramRunsAsAccount is the `integration`-tagged proof of the ONE-PROGRAM
+// face (execProgram) of the shared enter-primitive: it provisions a throwaway
+// account and proves that the SAME setpriv login-shell-command mechanism execProgram
+// builds (`setpriv --reuid --regid --init-groups <shell> -lc "<program> <args>"`)
+// runs the program as the account's UID AND forwards an arg with spaces as ONE
+// argument. It does NOT call execProgram directly (that syscall.Exec's and would
+// replace the test process); it exercises the identical drop + shellQuote'd command
+// string production builds.
+//
+// It always tears the throwaway account down, and SKIPS (never fails) without root /
+// setpriv / useradd, so `go test -tags integration ./...` still passes unprivileged.
+func TestExecProgramRunsAsAccount(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("exec integration requires root (provisions an account, setpriv drops to it); skipping")
+	}
+	for _, bin := range []string{"setpriv", "useradd", "userdel", "getent", "id", "printf"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not available; skipping", bin)
+		}
+	}
+
+	ctx := context.Background()
+	r := provision.ExecRunner{}
+	account := cli.ResolveAccount("execitest")
+
+	if _, err := provision.Add(ctx, r, account); err != nil {
+		t.Fatalf("provision.Add(%s): %v", account, err)
+	}
+	defer func() { _, _ = provision.Rm(ctx, r, account, true /* purgeAccount */) }()
+
+	uid, gid, shell, _, err := accountLoginFields(ctx, r, account)
+	if err != nil {
+		t.Fatalf("accountLoginFields(%s): %v", account, err)
+	}
+
+	// The program runs AS the account: a login-shell command running `id -u` prints the
+	// account's UID, proving the drop landed (the exact setpriv form execProgram builds).
+	out, _, derr := runCmd(ctx, "setpriv",
+		"--reuid", strconv.Itoa(uid), "--regid", strconv.Itoa(gid), "--init-groups",
+		shell, "-lc", "id -u")
+	if derr != nil {
+		t.Fatalf("setpriv program run as %s failed: %v (out=%q)", account, derr, out)
+	}
+	if got := strings.TrimSpace(out); got != strconv.Itoa(uid) {
+		t.Errorf("program ran as uid %q, want %d (the account's UID); the drop did not land", got, uid)
+	}
+
+	// An arg with spaces is forwarded as ONE argument: build the SAME shellQuote'd
+	// command string execProgram builds for `printf %s\0 <arg>` and assert the shell
+	// hands printf the single spaced arg (its NUL-terminated echo equals the arg).
+	spaced := "hello there world"
+	command := shellQuote("printf") + " " + shellQuote("%s") + " " + shellQuote(spaced)
+	argOut, _, aErr := runCmd(ctx, "setpriv",
+		"--reuid", strconv.Itoa(uid), "--regid", strconv.Itoa(gid), "--init-groups",
+		shell, "-lc", command)
+	if aErr != nil {
+		t.Fatalf("setpriv spaced-arg run as %s failed: %v (out=%q)", account, aErr, argOut)
+	}
+	if argOut != spaced {
+		t.Errorf("forwarded arg = %q, want %q (a spaced arg must reach the program as ONE argument, not re-split)", argOut, spaced)
+	}
+}
+
 // runCmd runs a command and returns trimmed stdout/stderr + the exec error.
 func runCmd(ctx context.Context, name string, args ...string) (string, string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
