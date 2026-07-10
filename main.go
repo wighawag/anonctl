@@ -265,8 +265,8 @@ func resolveAddExemptions(cmd *cli.Command) ([]lanexempt.Exempt, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := make([]lanexempt.Exempt, 0, len(d.AllowDirect))
-	for _, raw := range d.AllowDirect {
+	out := make([]lanexempt.Exempt, 0, len(d.Allow))
+	for _, raw := range d.Allow {
 		e, perr := lanexempt.Parse(raw)
 		if perr != nil {
 			return nil, fmt.Errorf("default exemption %q in defaults.json is invalid: %w", raw, perr)
@@ -639,27 +639,22 @@ func verifyParams(store accountconfig.Store, account string, st provision.Accoun
 	}
 }
 
-// exemptProbePort is the concrete non-53 TCP port the split-tunnel verify probe
-// dials for a port-omitted (all-TCP) exemption: it must pick ONE port, and every
-// non-53 TCP port on the host is exempted, so any plausible one proves the hole.
-// 8080 is the local-service port the feature exists for (a LAN LLM/proxy).
-const exemptProbePort = 8080
-
-// firstExemptHostPort renders the FIRST persisted exemption (raw IP|CIDR[:port])
+// firstExemptHostPort renders the FIRST persisted exemption (raw IP|CIDR:port)
 // into the dialable host:port string verify.LiveParams.Exempt expects, so the
 // split-tunnel-tight + lan-exemption-not-a-dns-hole assertions fire for an
 // exempted account (they run only when Exempt != ""). It verifies ONE exemption as
 // the representative proof that exemptions are wired end-to-end; an account with no
 // exemptions yields "" (the assertions are cleanly skipped, as today). A raw value
 // that no longer parses is skipped (it was validated at config time; a corrupt
-// record must not crash verify), falling through to the next.
+// record must not crash verify), falling through to the next. A port is mandatory,
+// so the exemption always renders its own concrete port.
 func firstExemptHostPort(raw []string) string {
 	for _, r := range raw {
 		e, err := lanexempt.Parse(r)
 		if err != nil {
 			continue
 		}
-		return e.HostPort(exemptProbePort)
+		return e.HostPort()
 	}
 	return ""
 }
@@ -784,7 +779,7 @@ func runUpdate(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		return 1
 	}
 	// Overlay the exemptions the operator passed on THIS update: an update that
-	// names --allow-direct sets the account's exemptions, an update that names none
+	// names --allow sets the account's exemptions, an update that names none
 	// leaves the persisted set intact (re-applying the same holes), so a plain
 	// endpoint change never silently drops a configured exemption.
 	exemptions, err := exemptionsForUpdate(cmd, cfg)
@@ -965,7 +960,7 @@ func forcingDeps() forcing.Deps {
 // the operator named on THIS invocation when any were given, else the account's
 // already-persisted exemptions (re-parsed from their raw form). This keeps a plain
 // `update --endpoint` from silently dropping configured holes while letting an
-// `update --allow-direct ...` replace the set.
+// `update --allow ...` replace the set.
 func exemptionsForUpdate(cmd *cli.Command, cfg accountconfig.Config) ([]lanexempt.Exempt, error) {
 	if len(cmd.Exemptions) > 0 {
 		return cmd.Exemptions, nil
@@ -1092,13 +1087,13 @@ func emitJSON(v any) int {
 }
 
 const usage = `usage:
-  anonctl add    [--endpoint <socks5h://host:port>] [--allow-direct <IP|CIDR[:port]>]... [<name>]
+  anonctl add    [--endpoint <socks5h://host:port>] [--allow <IP|CIDR:port>]... [<name>]
                                      provision the account + shim UID, install fail-closed forcing that
                                      survives reboot (default endpoint: the local Tor SocksPort) (root).
                                      CREATE-ONLY: refuses an existing account (use update to change its
                                      endpoint/exemptions, or rm then add to recreate).
-                                     --allow-direct punches a narrow private-only LAN hole (repeatable;
-                                     RFC1918/link-local only, never :53)
+                                     --allow punches a narrow private-only LAN hole (repeatable;
+                                     RFC1918/link-local only, an exact :port is REQUIRED, never :53)
   anonctl rm     [--purge-account] [<name>]
                                      remove forcing; --purge-account also deletes the account (root)
   anonctl seed-home [--from <dir>] [--force] [<name>]
@@ -1123,11 +1118,11 @@ const usage = `usage:
                                      is the separate mandatory-anonctl-gated-login idea. Run from your NORMAL
                                      (sudo-capable) account: inside an anon session use cannot re-elevate
                                      (anon has no sudo), so switching accounts means exit first, then re-run.
-  anonctl update|reconfigure [--endpoint <socks5h://host:port>] [--allow-direct <IP|CIDR[:port]>]... [<name>]
+  anonctl update|reconfigure [--endpoint <socks5h://host:port>] [--allow <IP|CIDR:port>]... [<name>]
                                      change the account's endpoint and re-apply fail-closed (no leak window) (root).
                                      With no --endpoint on a terminal it scans local socks5h ports and prompts
                                      (like add); non-interactively --endpoint is required.
-                                     --allow-direct here REPLACES the account's LAN holes (omit to keep them)
+                                     --allow here REPLACES the account's LAN holes (omit to keep them)
   anonctl --version | version       print the anonctl version
 
 Box-wide add-time defaults live under ` + "`/etc/anonctl`" + ` (create them yourself; a
@@ -1136,9 +1131,9 @@ fresh install ships neither, so the directory-exists convention stays opt-in):
     ` + "`sudo cp -r <src>/. /etc/anonctl/default-home/`" + `) and its contents seed every
     FRESH account's home. Its PRESENCE is the switch; there is no config key.
   - Default LAN exemptions: put them in ` + "`/etc/anonctl/defaults.json`" + `, e.g.
-    ` + "`{\"allowDirect\": [\"192.168.1.150:8080\"]}`" + `. A bare ` + "`add`" + ` applies them (a CLI
-    ` + "`--allow-direct`" + ` overrides; a default is still validated, never a quieter leak
-    path). Use ` + "`{\"allowDirect\": []}`" + ` for a valid no-op starting point. This is
+    ` + "`{\"allow\": [\"192.168.1.150:8080\"]}`" + `. A bare ` + "`add`" + ` applies them (a CLI
+    ` + "`--allow`" + ` overrides; a default is still validated, never a quieter leak
+    path; a port is mandatory). Use ` + "`{\"allow\": []}`" + ` for a valid no-op starting point. This is
     STRICT JSON: NO comments (a malformed defaults.json makes ` + "`add`" + ` fail loud).
 
 A bare verb targets the default account ` + "`anon`" + `; ` + "`<name>`" + ` targets ` + "`anon-<name>`" + `.

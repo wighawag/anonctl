@@ -139,11 +139,11 @@ func Generate(p Params) (string, error) {
 	// LAN exemptions (enabler half): RETURN the anon UID's traffic to an exempted
 	// private destination so it is NOT redirected into the shim and egresses the
 	// real NIC directly. Emitted BEFORE the DNS and catch-all TCP redirects so the
-	// exempt packet is never swallowed by them. The exemption NEVER carries clear
-	// DNS: an explicit :53 is rejected at the guardrail (internal/lanexempt) and a
-	// port-omitted (all-TCP) exemption excludes 53 (`tcp dport != 53`), so tcp/53 to
-	// the exempted host is NOT returned here and still hits the DNS redirect below
-	// (Tails leak-catalogue row 2).
+	// exempt packet is never swallowed by them. Each exemption names EXACTLY one
+	// non-53 TCP port (a port is mandatory and :53 is rejected at the guardrail,
+	// internal/lanexempt), so it can never carry clear DNS: tcp/53 to the exempted
+	// host is NOT returned here and still hits the DNS redirect below (Tails
+	// leak-catalogue row 2). There is no all-ports form to widen it (ADR-0007).
 	for _, e := range p.Exemptions {
 		w("        # LAN exemption (direct, not forced): %s", e.Raw)
 		w("        meta skuid %d %s return", p.AnonUID, exemptMatch(e))
@@ -191,22 +191,17 @@ func Generate(p Params) (string, error) {
 // exemptMatch builds the nft match clause for one exemption's destination,
 // SHARED by the nat `return` and the filter `accept` so the two halves can never
 // diverge (the enabler and the narrowing must target the exact same traffic). It
-// picks the ip/ip6 family from the exemption's address family, and either pins
-// the exact `tcp dport` or, for a port-omitted exemption, matches all TCP ports
-// EXCEPT the clear-DNS port 53 (`tcp dport != 53`). Excluding 53 is the nft half
-// of the row-2 fix: an all-ports exemption can never carry clear TCP/53 to a LAN
-// resolver (which would reveal the local network's public IP); 53 stays
-// redirected to the shim. An exact-port exemption cannot be :53 (the guardrail
-// rejects that), so the exact case needs no exclusion. It never matches UDP (the
-// forced path carries TCP; the exemption is TCP-only by construction).
+// picks the ip/ip6 family from the exemption's address family and pins the exact
+// `tcp dport`. A port is mandatory and :53 is rejected at the guardrail
+// (internal/lanexempt), so the port here is always a single non-53 TCP port:
+// there is no all-ports (`tcp dport != 53`) form any more, because an all-ports
+// hole to a host running a forwarding proxy is a deanonymization vector
+// (ADR-0007). It never matches UDP (the forced path carries TCP; the exemption is
+// TCP-only by construction).
 func exemptMatch(e lanexempt.Exempt) string {
 	family := "ip6"
 	if e.IsV4() {
 		family = "ip"
-	}
-	if e.Port == 0 {
-		// All TCP EXCEPT 53: an all-ports exemption must not open clear DNS to the LAN.
-		return fmt.Sprintf("%s daddr %s tcp dport != %d", family, exemptDst(e.Network), lanexempt.DNSPort)
 	}
 	return fmt.Sprintf("%s daddr %s tcp dport %d", family, exemptDst(e.Network), e.Port)
 }

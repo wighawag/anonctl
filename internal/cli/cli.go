@@ -59,12 +59,13 @@ type Command struct {
 	Endpoint string
 
 	// Exemptions are the parsed+validated LAN exemptions the operator asked for via
-	// the repeatable `--allow-direct <IP|CIDR[:port]>` flag (netcage's vocabulary):
-	// the private-only, host+port-scoped direct holes the anon UID may reach around
-	// the forced path. Each value is validated through lanexempt.Parse at the CLI
-	// boundary (public/hostname/:53 rejected LOUDLY), so a bad exemption is a parse
-	// error, never a silent leak. Meaningful only for the forcing verbs
-	// (add/update/reconfigure); ignored by list/status/rm/verify.
+	// the repeatable `--allow <IP|CIDR:port>` flag (netcage's vocabulary): the
+	// private-only, host+port-scoped direct holes the anon UID may reach around the
+	// forced path. A port is MANDATORY. Each value is validated through
+	// lanexempt.Parse at the CLI boundary (public/hostname/:53/port-omitted rejected
+	// LOUDLY), so a bad exemption is a parse error, never a silent leak. Meaningful
+	// only for the forcing verbs (add/update/reconfigure); ignored by
+	// list/status/rm/verify.
 	Exemptions []lanexempt.Exempt
 
 	// SkipTorExitCheck relaxes the anonymized-exit assertion's Tor-exit REQUIREMENT
@@ -121,7 +122,7 @@ func Parse(args []string) (*Command, error) {
 	// wantEndpointValue is set when `--endpoint` was seen and its value (the next
 	// token) is still pending, so `--endpoint socks5h://h:p` (space form) works
 	// alongside `--endpoint=socks5h://h:p`. wantExemptValue is the same pending
-	// state for the repeatable `--allow-direct` (space form).
+	// state for the repeatable `--allow` (space form).
 	var wantEndpointValue bool
 	var wantExemptValue bool
 	// wantSeedFromValue is the pending state for `--from <dir>` (space form) on
@@ -156,10 +157,10 @@ func Parse(args []string) (*Command, error) {
 			wantEndpointValue = true
 		case strings.HasPrefix(a, "--endpoint="):
 			cmd.Endpoint = strings.TrimPrefix(a, "--endpoint=")
-		case a == "--allow-direct":
+		case a == "--allow":
 			wantExemptValue = true
-		case strings.HasPrefix(a, "--allow-direct="):
-			if err := cmd.addExemption(verb, strings.TrimPrefix(a, "--allow-direct=")); err != nil {
+		case strings.HasPrefix(a, "--allow="):
+			if err := cmd.addExemption(verb, strings.TrimPrefix(a, "--allow=")); err != nil {
 				return nil, err
 			}
 		case strings.HasPrefix(a, "-"):
@@ -172,7 +173,7 @@ func Parse(args []string) (*Command, error) {
 		return nil, fmt.Errorf("%s: --endpoint needs a value (socks5h://host:port)", verb)
 	}
 	if wantExemptValue {
-		return nil, fmt.Errorf("%s: --allow-direct needs a value (an RFC1918/link-local IP or CIDR, optionally :port)", verb)
+		return nil, fmt.Errorf("%s: --allow needs a value (an RFC1918/link-local IP or CIDR with a mandatory :port)", verb)
 	}
 	if wantSeedFromValue {
 		return nil, fmt.Errorf("%s: --from needs a value (the template directory to seed the home from)", verb)
@@ -196,15 +197,15 @@ func Parse(args []string) (*Command, error) {
 	return cmd, nil
 }
 
-// addExemption parses one `--allow-direct` value through the lanexempt guardrail
-// and appends it to the command. A public/hostname/:53 value is rejected LOUDLY
-// here (the fail-loud-at-config-time security gate is surfaced at the CLI
+// addExemption parses one `--allow` value through the lanexempt guardrail and
+// appends it to the command. A public/hostname/:53/port-omitted value is rejected
+// LOUDLY here (the fail-loud-at-config-time security gate is surfaced at the CLI
 // boundary), so an operator can never punch an anonymity leak from the command
 // line; the error names the verb + the offending value.
 func (c *Command) addExemption(verb, raw string) error {
 	e, err := lanexempt.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("%s: --allow-direct: %w", verb, err)
+		return fmt.Errorf("%s: --allow: %w", verb, err)
 	}
 	c.Exemptions = append(c.Exemptions, e)
 	return nil

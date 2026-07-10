@@ -23,7 +23,7 @@ import (
 
 // TestLiveVerifyParamsThreadsExemptionEndToEnd is the end-to-end proof of the
 // wiring this task threads: an operator's LAN exemption, PERSISTED in the account
-// config (the same field `add --allow-direct` writes), must be READ BACK by
+// config (the same field `add --allow` writes), must be READ BACK by
 // verifyParams into verify.LiveParams.Exempt, so that a live `anonctl verify`
 // runs BOTH exemption assertions (split-tunnel-tight AND lan-exemption-not-a-dns-
 // hole) for that account. Unlike the internal/verify integration test (which sets
@@ -85,7 +85,7 @@ func TestLiveVerifyParamsThreadsExemptionEndToEnd(t *testing.T) {
 		}
 	}()
 
-	// PERSIST the account config WITH the exemption, exactly as `add --allow-direct`
+	// PERSIST the account config WITH the exemption, exactly as `add --allow`
 	// would, in a SCRATCH store (never the real /etc). This is the record
 	// verifyParams reads back.
 	store := accountconfig.Store{BaseDir: t.TempDir()}

@@ -26,55 +26,55 @@ func TestParseAcceptsPrivateHostPort(t *testing.T) {
 	}
 }
 
-// TestParsePortOmittedMeansAllTCP proves the port-omitted form (a bare IP/CIDR)
-// means "all TCP ports on this host" (Port == 0), per the acceptance criterion.
-func TestParsePortOmittedMeansAllTCP(t *testing.T) {
-	for _, raw := range []string{"10.0.0.5", "192.168.0.0/24"} {
-		e, err := lanexempt.Parse(raw)
-		if err != nil {
-			t.Fatalf("Parse(%q): %v", raw, err)
+// TestParseRejectsPortOmittedLoudly proves the port-omitted form (a bare IP/CIDR,
+// no `:port`) is REJECTED loudly, naming the value and telling the user to add
+// `:port`. The all-ports form used to open EVERY TCP port except 53, which is a
+// deanonymization leak if the exempted host runs any forwarding proxy on some
+// other port; the only defensible granularity is "reach exactly this service", so
+// a port is now MANDATORY (see docs/adr/0007).
+func TestParseRejectsPortOmittedLoudly(t *testing.T) {
+	for _, raw := range []string{"10.0.0.5", "192.168.0.0/24", "192.168.1.150", "169.254.1.1"} {
+		_, err := lanexempt.Parse(raw)
+		if err == nil {
+			t.Errorf("Parse(%q) must reject a port-omitted (all-ports) exemption", raw)
+			continue
 		}
-		if e.Port != 0 {
-			t.Errorf("Parse(%q).Port = %d, want 0 (all TCP ports)", raw, e.Port)
+		if !strings.Contains(err.Error(), raw) {
+			t.Errorf("Parse(%q) error should name the offending value; got: %v", raw, err)
+		}
+		if !strings.Contains(err.Error(), ":port") {
+			t.Errorf("Parse(%q) error should instruct the user to add :port; got: %v", raw, err)
 		}
 	}
 }
 
 // TestHostPortRendersProbeTarget proves the dialable host:port the verify probe
-// needs: an exemption with an explicit port renders that port; a port-omitted
-// (all-TCP) exemption falls back to the caller's default probe port (the probe
-// must pick ONE concrete non-53 TCP port to dial, since every non-53 port is
-// exempted).
+// needs: an exemption renders its own exact host+port (a port is mandatory, so it
+// always carries a concrete port).
 func TestHostPortRendersProbeTarget(t *testing.T) {
 	withPort, err := lanexempt.Parse("192.168.1.150:8080")
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if got := withPort.HostPort(9999); got != "192.168.1.150:8080" {
-		t.Errorf("HostPort with explicit port = %q, want 192.168.1.150:8080", got)
-	}
-	omitted, err := lanexempt.Parse("192.168.1.150")
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if got := omitted.HostPort(8080); got != "192.168.1.150:8080" {
-		t.Errorf("HostPort with omitted port = %q, want the default 192.168.1.150:8080", got)
+	if got := withPort.HostPort(); got != "192.168.1.150:8080" {
+		t.Errorf("HostPort = %q, want 192.168.1.150:8080 (the exemption's own port)", got)
 	}
 }
 
 // TestParseAcceptsEveryPrivateRange proves all four accepted ranges (the three
-// RFC1918 blocks + link-local) parse, mirroring netcage's --allow-direct guardrail
-// verbatim.
+// RFC1918 blocks + link-local) parse, mirroring netcage's --allow guardrail
+// verbatim. A port is now mandatory, so each value carries an explicit `:port`
+// (including the whole-block CIDR forms).
 func TestParseAcceptsEveryPrivateRange(t *testing.T) {
 	for _, raw := range []string{
 		"10.1.2.3:22",
 		"172.16.5.5:443",
 		"192.168.1.150:8080",
-		"169.254.1.1:80", // link-local
-		"10.0.0.0/8",     // whole private block, CIDR
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-		"169.254.0.0/16",
+		"169.254.1.1:80",  // link-local
+		"10.0.0.0/8:8080", // whole private block, CIDR:port
+		"172.16.0.0/12:443",
+		"192.168.0.0/16:8080",
+		"169.254.0.0/16:80",
 	} {
 		if _, err := lanexempt.Parse(raw); err != nil {
 			t.Errorf("Parse(%q) should accept a private destination, got: %v", raw, err)
@@ -145,20 +145,18 @@ func TestParseRejectsPort53Loudly(t *testing.T) {
 	}
 }
 
-// TestParseAcceptsNonDNSPortsAndOmitted proves the reject is scoped to 53 ONLY: a
-// nearby port and the port-omitted (all-TCP) form still parse. The all-TCP form is
-// where hole (2) lives, closed at the nft layer (53 excluded from the accept), not
-// by rejecting the exemption; so it must still be a VALID exemption here.
-func TestParseAcceptsNonDNSPortsAndOmitted(t *testing.T) {
+// TestParseAcceptsNonDNSPorts proves the reject is scoped to 53 ONLY: a nearby
+// port (and DoT/853) on an exact-port exemption still parses. The all-ports form
+// is gone (port-omitted is rejected), so every accepted value names an exact port.
+func TestParseAcceptsNonDNSPorts(t *testing.T) {
 	for _, raw := range []string{
 		"192.168.1.1:52",
 		"192.168.1.1:54",
-		"192.168.1.1:853", // DoT is encrypted DNS, not the clear-DNS leak this guards
-		"192.168.1.1",     // port-omitted (all TCP): valid; nft excludes 53
-		"192.168.0.0/24",  // whole-subnet, port-omitted: valid; nft excludes 53
+		"192.168.1.1:853",   // DoT is encrypted DNS, not the clear-DNS leak this guards
+		"192.168.0.0/24:80", // whole-subnet with an exact port
 	} {
 		if _, err := lanexempt.Parse(raw); err != nil {
-			t.Errorf("Parse(%q) should accept a non-53 / port-omitted exemption; got: %v", raw, err)
+			t.Errorf("Parse(%q) should accept a non-53 exact-port exemption; got: %v", raw, err)
 		}
 	}
 }

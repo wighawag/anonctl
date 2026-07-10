@@ -460,11 +460,12 @@ func TestEscapedLeakCounterStillCatchesARealLeak(t *testing.T) {
 }
 
 // TestLiveLANExemptionNotADNSHole is the integration proof of Tails leak-catalogue
-// row 2: with an all-TCP LAN exemption ACTIVE for a private host, a direct clear
+// row 2: with an exact-port LAN exemption ACTIVE for a private host, a direct clear
 // DNS query (tcp AND udp 53) from the anon UID to that exempted host must NOT
-// egress as clear DNS to the LAN resolver: 53 is excluded from the exemption
-// (guardrail + nft), so the nat chain still redirects tcp/udp 53 to the shim and
-// the counter keyed on the LAN daddr never moves. It exercises the SAME live probe
+// egress as clear DNS to the LAN resolver: the exemption pins a single non-53 TCP
+// port (a port is mandatory; :53 is rejected at the guardrail), so the nat chain
+// still redirects tcp/udp 53 to the shim and the counter keyed on the LAN daddr
+// never moves. It exercises the SAME live probe
 // (clearLANDNSReached) `anonctl verify` uses, feeding the pure assertion, against a
 // real kernel ruleset, isolated to throwaways.
 func TestLiveLANExemptionNotADNSHole(t *testing.T) {
@@ -521,7 +522,7 @@ func TestLiveLANExemptionNotADNSHole(t *testing.T) {
 		}
 	}()
 
-	exemptAll, err := lanexempt.Parse(exemptHost) // port-omitted: all TCP except 53
+	exemptEntry, err := lanexempt.Parse(exempt) // exact host:port (a port is mandatory)
 	if err != nil {
 		t.Fatalf("lanexempt.Parse: %v", err)
 	}
@@ -533,7 +534,7 @@ func TestLiveLANExemptionNotADNSHole(t *testing.T) {
 		DNSPort:      dnsPort,
 		EndpointHost: "127.0.0.1",
 		EndpointPort: 9050,
-		Exemptions:   []lanexempt.Exempt{exemptAll},
+		Exemptions:   []lanexempt.Exempt{exemptEntry},
 	}
 	if err := nftables.Apply(ctx, nr, p); err != nil {
 		t.Fatalf("apply ruleset with exemption: %v", err)
@@ -566,7 +567,8 @@ func TestLiveLANExemptionNotADNSHole(t *testing.T) {
 	}
 	// BOTH exemption assertions must FIRE (they run only with an exemption active)
 	// and PASS: split-tunnel-tight (the hole opens but does not widen) and
-	// lan-exemption-not-a-dns-hole (53 is excluded, redirected to the shim).
+	// lan-exemption-not-a-dns-hole (the exemption pins one non-53 port; 53 stays
+	// redirected to the shim).
 	for _, name := range []string{verify.AssertSplitTunnelTight, verify.AssertLANExemptionNotADNSHole} {
 		a, ok := byName[name]
 		if !ok {

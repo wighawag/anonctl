@@ -11,11 +11,11 @@
 //     DefaultHomeDir + DefaultHomePresent expose that path and probe.
 //
 //   - The DEFAULT LAN EXEMPTIONS live in `/etc/anonctl/defaults.json`
-//     (`{"allowDirect": ["192.168.1.50:11434"]}`), root-owned. `add` applies them
-//     when given no `--allow-direct`. They are STORED RAW and re-validated through
+//     (`{"allow": ["192.168.1.50:11434"]}`), root-owned. `add` applies them
+//     when given no `--allow`. They are STORED RAW and re-validated through
 //     lanexempt at the CLI boundary exactly like a flag value, so a default can
-//     never be a quieter path to a leak than the flag (a public / :53 default is
-//     rejected loudly, never silently punched).
+//     never be a quieter path to a leak than the flag (a public / :53 /
+//     port-omitted default is rejected loudly, never silently punched).
 //
 // The `/etc` read is a SHARED system location, so the base directory is behind a
 // configurable lever (Store.BaseDir), exactly as marker.Store / accountconfig.Store
@@ -48,11 +48,11 @@ const defaultHomeName = "default-home"
 // only the values `add` reads when a flag is omitted. It carries NO home path (the
 // default home is a directory-exists convention, not a configured path).
 type Defaults struct {
-	// AllowDirect are the default LAN exemptions in their RAW `IP|CIDR[:port]` form,
-	// applied by `add` when no `--allow-direct` flag is given. Stored raw and
+	// Allow are the default LAN exemptions in their RAW `IP|CIDR:port` form (a port
+	// is mandatory), applied by `add` when no `--allow` flag is given. Stored raw and
 	// re-validated through lanexempt at the CLI boundary (a default is Parse-gated
 	// exactly like a flag), so a default is never a quieter leak path.
-	AllowDirect []string `json:"allowDirect,omitempty"`
+	Allow []string `json:"allow,omitempty"`
 }
 
 // Store is the filesystem seam for the box-wide defaults, isolating the shared

@@ -16,16 +16,17 @@ func TestReadMissingIsEmptyNotError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read on missing file: %v", err)
 	}
-	if len(d.AllowDirect) != 0 {
-		t.Errorf("expected empty AllowDirect, got %v", d.AllowDirect)
+	if len(d.Allow) != 0 {
+		t.Errorf("expected empty Allow, got %v", d.Allow)
 	}
 }
 
-// TestReadAllowDirect: a defaults.json with allowDirect is parsed.
-func TestReadAllowDirect(t *testing.T) {
+// TestReadAllow: a defaults.json with the `allow` key is parsed. A port is
+// mandatory now, so the fixture values carry explicit ports.
+func TestReadAllow(t *testing.T) {
 	base := t.TempDir()
 	if err := os.WriteFile(filepath.Join(base, "defaults.json"),
-		[]byte(`{"allowDirect":["192.168.1.50:11434","10.0.0.0/8"]}`), 0o644); err != nil {
+		[]byte(`{"allow":["192.168.1.50:11434","10.0.0.0/8:8080"]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	s := defaults.Store{BaseDir: base}
@@ -33,8 +34,8 @@ func TestReadAllowDirect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	if len(d.AllowDirect) != 2 || d.AllowDirect[0] != "192.168.1.50:11434" {
-		t.Errorf("AllowDirect = %v", d.AllowDirect)
+	if len(d.Allow) != 2 || d.Allow[0] != "192.168.1.50:11434" {
+		t.Errorf("Allow = %v", d.Allow)
 	}
 }
 
