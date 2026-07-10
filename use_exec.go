@@ -10,7 +10,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/wighawag/anonctl/internal/provision"
+	"github.com/wighawag/anoncore/provision"
 )
 
 // execLoginShell is the REAL shell drop behind `anonctl use`: the INTERACTIVE face

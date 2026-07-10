@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wighawag/anonctl/internal/endpoint"
+	"github.com/wighawag/anoncore/endpoint"
 )
 
 // swapScanSeams installs fake scan/TTY/prompt seams for the endpoint-choice flow

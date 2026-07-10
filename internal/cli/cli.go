@@ -9,16 +9,17 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/wighawag/anoncore/account"
 	"github.com/wighawag/anonctl/internal/lanexempt"
 )
 
 // DefaultAccount is the account a BARE verb (no name) targets. anonctl OWNS this
-// generic "anonymized account" naming (distinct from anon-pi's `anon-pi`).
-const DefaultAccount = "anon"
-
-// namePrefix is the prefix anonctl puts on a NAMED account: `add work` becomes
-// `anon-work`. The user names the suffix; anonctl owns the prefix.
-const namePrefix = DefaultAccount + "-"
+// generic "anonymized account" naming (distinct from anon-pi's `anon-pi`). The
+// account-NAME vocabulary (this default, ResolveAccount, ShimAccount) was
+// extracted DOWN into anoncore/account so the shared core (anoncore/provision)
+// can build account names without depending on anonctl's CLI surface; cli
+// re-exports it here so anonctl's own callers are unchanged.
+const DefaultAccount = account.DefaultAccount
 
 // Command is a fully-parsed anonctl invocation. It is the pure output of Parse:
 // which verb, which resolved account (already `anon` / `anon-<name>`), and the
@@ -293,22 +294,16 @@ func (c *Command) addExemption(verb, raw string) error {
 // ResolveAccount maps a user-typed name to the actual Unix account name. An empty
 // name or the literal `anon` is the default account; any other name `x` becomes
 // `anon-x`. A name the user already spelled with anonctl's `anon-` prefix is NOT
-// double-prefixed (`anon-work` stays `anon-work`, never `anon-anon-work`).
-func ResolveAccount(name string) string {
-	name = strings.TrimSpace(name)
-	if name == "" || name == DefaultAccount {
-		return DefaultAccount
-	}
-	if strings.HasPrefix(name, namePrefix) {
-		return name
-	}
-	return namePrefix + name
-}
+// double-prefixed (`anon-work` stays `anon-work`, never `anon-anon-work`). The
+// implementation lives in anoncore/account (shared with anoncore/provision); this
+// is a thin re-export so anonctl's callers keep the cli.ResolveAccount name.
+func ResolveAccount(name string) string { return account.ResolveAccount(name) }
 
 // ShimAccount returns the dedicated shim service-account name for an anon
 // account: `anon` -> `anon-shim`, `anon-<name>` -> `anon-<name>-shim`. Each anon
 // account gets its OWN shim UID (a separate service account) so that later only
 // the shim UID, never the anon UID, may reach the upstream endpoint (story 12/14).
 // The `-shim` suffix mirrors the validated manual recipe, which created
-// `anon-shim` for `anon`.
-func ShimAccount(account string) string { return account + "-shim" }
+// `anon-shim` for `anon`. The implementation lives in anoncore/account (shared
+// with anoncore/provision); this is a thin re-export.
+func ShimAccount(acct string) string { return account.ShimAccount(acct) }

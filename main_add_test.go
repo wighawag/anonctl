@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wighawag/anonctl/internal/provision"
+	"github.com/wighawag/anoncore/provision"
 )
 
 // `add` is create-only: an account that already EXISTS is refused up front, before

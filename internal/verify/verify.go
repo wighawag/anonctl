@@ -55,8 +55,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/wighawag/anonctl/internal/endpoint"
-	"github.com/wighawag/anonctl/internal/sudoprobe"
+	"github.com/wighawag/anoncore/endpoint"
+	"github.com/wighawag/anoncore/sudoprobe"
 )
 
 // SchemaVersion is the version of the `--json` report CONTRACT. It evolves

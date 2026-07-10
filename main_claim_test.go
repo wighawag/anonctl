@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/wighawag/anonctl/internal/accountconfig"
-	"github.com/wighawag/anonctl/internal/endpoint"
+	"github.com/wighawag/anoncore/accountconfig"
+	"github.com/wighawag/anoncore/endpoint"
 )
 
 // swapConfigListStore points the claim-set store at a scratch dir (never the real

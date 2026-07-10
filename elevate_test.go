@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wighawag/anonctl/internal/ui"
+	"github.com/wighawag/anoncore/ui"
 )
 
 // disableColorForTest forces the CLI's stderr styler to plain for the duration of a

@@ -41,7 +41,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/wighawag/anonctl/internal/accountconfig"
+	"github.com/wighawag/anoncore/accountconfig"
 )
 
 // UnitName is the templated unit's base name. It is an INSTANCE template (the

@@ -40,7 +40,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/wighawag/anonctl/internal/accountconfig"
+	"github.com/wighawag/anoncore/accountconfig"
 	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anonctl/internal/nftables"
 	"github.com/wighawag/anonctl/internal/systemd"

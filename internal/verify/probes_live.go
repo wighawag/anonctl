@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/wighawag/anonctl/internal/lanexempt"
-	"github.com/wighawag/anonctl/internal/sudoprobe"
+	"github.com/wighawag/anoncore/sudoprobe"
 	"github.com/wighawag/anonctl/internal/systemd"
 )
 

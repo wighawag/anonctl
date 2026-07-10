@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wighawag/anonctl/internal/endpoint"
+	"github.com/wighawag/anoncore/endpoint"
 	"github.com/wighawag/anonctl/internal/socks5hfixture"
-	"github.com/wighawag/anonctl/internal/sudoprobe"
+	"github.com/wighawag/anoncore/sudoprobe"
 )
 
 // --- Report: greenness, exit code, no-short-circuit (the CI-gating contract) ---

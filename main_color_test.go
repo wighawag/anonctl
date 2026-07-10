@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wighawag/anonctl/internal/ui"
+	"github.com/wighawag/anoncore/ui"
 )
 
 // errorf must never leak escape codes when its stream's styler is disabled (a pipe,

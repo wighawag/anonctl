@@ -10,12 +10,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wighawag/anonctl/internal/accountconfig"
+	"github.com/wighawag/anoncore/accountconfig"
 	"github.com/wighawag/anonctl/internal/cli"
-	"github.com/wighawag/anonctl/internal/endpoint"
+	"github.com/wighawag/anoncore/endpoint"
 	"github.com/wighawag/anonctl/internal/forcing"
-	"github.com/wighawag/anonctl/internal/marker"
-	"github.com/wighawag/anonctl/internal/provision"
+	"github.com/wighawag/anoncore/marker"
+	"github.com/wighawag/anoncore/provision"
 	"github.com/wighawag/anonctl/internal/verify"
 )
 

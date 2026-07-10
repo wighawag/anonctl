@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wighawag/anonctl/internal/accountconfig"
-	"github.com/wighawag/anonctl/internal/endpoint"
+	"github.com/wighawag/anoncore/accountconfig"
+	"github.com/wighawag/anoncore/endpoint"
 	"github.com/wighawag/anonctl/internal/systemd"
 )
 
