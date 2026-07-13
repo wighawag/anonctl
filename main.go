@@ -1063,6 +1063,18 @@ func buildConfig(ctx context.Context, r provision.Runner, account, rawEndpoint s
 	if err != nil {
 		return accountconfig.Config{}, err
 	}
+	// Allocate this account's shim loopback ports from the documented anonctl range,
+	// avoiding every OTHER account's already-reserved pair. Without this a second
+	// account falls back to the constant defaults (19050/19053) and its shim
+	// crash-loops on `bind: address already in use`, so `verify` times out (curl exit
+	// 28) with no shim to relay its traffic. Allocation reads the on-disk config set
+	// (the reservation LEDGER), excluding THIS account so a name that somehow already
+	// has a record does not block its own re-derivation; a full range is a loud
+	// failure, never a silent colliding default.
+	ports, err := allocatePortsFor(account)
+	if err != nil {
+		return accountconfig.Config{}, err
+	}
 	return accountconfig.Config{
 		Account:       account,
 		AnonUID:       anonUID,
@@ -1070,8 +1082,29 @@ func buildConfig(ctx context.Context, r provision.Runner, account, rawEndpoint s
 		EndpointHost:  ep.Host,
 		EndpointPort:  atoiOr(ep.Port, 0),
 		EndpointClass: ep.Class,
+		RelayPort:     ports.relay,
+		DNSPort:       ports.dns,
 		Exemptions:    rawExemptions(exemptions),
 	}, nil
+}
+
+// allocatePortsFor reads the on-disk config set (via the same configListStore seam
+// claimEndpoint uses) and allocates a free relay/DNS pair for account, excluding
+// account's own record so a re-derivation never collides with itself. A failure to
+// READ the ledger is loud (a corrupt sibling config must not silently disable the
+// collision guard, exactly as claimEndpoint treats a read error).
+func allocatePortsFor(account string) (portPair, error) {
+	configs, err := configListStore.List()
+	if err != nil {
+		return portPair{}, fmt.Errorf("allocating shim ports: reading account configs: %w", err)
+	}
+	var others []accountconfig.Config
+	for _, c := range configs {
+		if c.Account != account {
+			others = append(others, c)
+		}
+	}
+	return allocatePortPair(others)
 }
 
 // resolveEndpoint turns the raw --endpoint value into a validated, credential-free
