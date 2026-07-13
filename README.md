@@ -1,6 +1,51 @@
 # anonctl
 
-Force **all of a Unix account's egress through an anonymizer, at the kernel level, fail-closed**, so anything that account runs (a shell, arbitrary tools, an editor, a script) cannot leak your real IP or DNS. anonctl provisions a dedicated account, installs per-UID kernel forcing that redirects the account's TCP into a per-account SOCKS relay (or drops it), and ships a `verify` leak-test that PROVES the account is anonymized rather than asking you to trust it.
+**Give one Unix account a leak-proof internet connection.** anonctl forces everything that account does (a shell, any tool, an editor, a script) through an anonymizer like Tor, enforced by the Linux kernel, fail-closed: if the anonymizer is down, that account's traffic is dropped, never sent in the clear. It ships a `verify` command that PROVES the account is anonymized instead of asking you to trust it.
+
+## TL;DR
+
+```sh
+# 1. install (Linux, root)
+curl -fsSL https://github.com/wighawag/anonctl/releases/latest/download/install.sh | sudo sh
+
+# 2. provision the `anon` account and force it through your local Tor SOCKS port
+sudo anonctl add
+
+# 3. PROVE it is anonymized (anonymized exit IP, remote DNS, a direct dial DROPPED)
+sudo anonctl verify
+
+# 4. drop into an anonymized shell (only opens on a green verify)
+sudo anonctl use
+```
+
+You need a running **socks5h endpoint** to anonymize through. If you run Tor, anonctl finds it automatically (`socks5h://127.0.0.1:9050`); otherwise point it at any SOCKS5 endpoint with `--endpoint`. anonctl does not run the endpoint for you; keeping Tor (or your proxy) up is your job.
+
+## Contents
+
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Install](#install) ([script](#install-script-recommended) · [go install](#go-install) · [manual](#manual-download))
+- [Usage](#usage): the verbs
+- [Seeding a home and box-wide defaults](#seeding-a-home-and-box-wide-add-time-defaults) ([worked example: an anonymized `pi` account](#worked-example-an-anonymized-pi-account-wired-to-a-lan-model))
+- [Choosing an endpoint on add](#choosing-an-endpoint-on-add-scan-and-offer)
+- [`verify` is the trust anchor](#verify-is-the-trust-anchor)
+- [`use` is a safe front door, not the protection](#use-is-a-safe-front-door-not-the-protection)
+- [`exec`: run one program in the account](#exec-run-one-program-in-the-account-uses-one-program-sibling)
+- [What anonctl guarantees and what it does NOT](#what-anonctl-guarantees-and-what-it-does-not)
+- [Operating notes](#operating-notes)
+- [Decisions (ADRs)](#decisions-adrs)
+
+## How it works
+
+In one breath: anonctl gives a dedicated Unix account a leak-proof connection, enforced by the kernel, and proves it.
+
+- **Kernel-forced, not app-configured.** The forcing is a per-UID nftables rule that redirects the account's TCP into a per-account SOCKS relay (the shim). It does not rely on `HTTP_PROXY`/`ALL_PROXY`, which raw sockets and DNS ignore and therefore leak.
+- **Fail-closed.** If the anonymizer is unreachable, the account's traffic is dropped, never sent in the clear. An anon account with no forcing loaded is dropped, not free: there is never a window of un-anonymized egress, even at boot.
+- **DNS goes remote too.** Names resolve over the endpoint (DNS-over-SOCKS-TCP, socks5h), never as a plaintext local query.
+- **Proven, not promised.** `verify` runs live leak probes (anonymized exit IP, remote DNS, a direct dial DROPPED, IPv4 + IPv6) and exits non-zero on any failure.
+- **A manager, not a wrapper.** Like ufw/firewalld, anonctl is not in the data path. It sets up and verifies the kernel rules + shim; at runtime you just `sudo -iu anon` (or `anonctl use`) and the kernel does the rest.
+
+The long version: Force **all of a Unix account's egress through an anonymizer, at the kernel level, fail-closed**, so anything that account runs (a shell, arbitrary tools, an editor, a script) cannot leak your real IP or DNS. anonctl provisions a dedicated account, installs per-UID kernel forcing that redirects the account's TCP into a per-account SOCKS relay (or drops it), and ships a `verify` leak-test that PROVES the account is anonymized rather than asking you to trust it.
 
 The forcing is done by the **kernel**, not by each tool's own proxy awareness. This is the opposite of app-level `HTTP_PROXY`/`ALL_PROXY` (which raw sockets and DNS ignore, and which therefore leaks). If the anonymizer is unreachable, the account's traffic is **dropped, never sent in the clear** (fail-closed). That is the whole point of the tool, and `verify` exists to prove it.
 
@@ -20,15 +65,13 @@ The one thing to get right: unlike a sibling tool that finds its helper next to 
 
 ### Install script (recommended)
 
-```sh
-curl -fsSL https://github.com/wighawag/anonctl/releases/latest/download/install.sh | sh
-```
-
-This detects your architecture (amd64 / arm64 / armv7 / armv6), downloads the latest release, **verifies its sha256 checksum** (and refuses to install on a mismatch, never install an unverified anonymity tool), and installs **both** `anonctl` and `anonctl-shim` to `/usr/local/bin`, placing `anonctl-shim` at `/usr/local/bin/anonctl-shim` (the shim unit's ExecStart path). Because it writes to `/usr/local/bin`, **run it as root** (in a root shell or with `sudo`):
+The installer writes to `/usr/local/bin`, so **run it as root** (with `sudo`, or from a root shell drop the `sudo`):
 
 ```sh
 curl -fsSL https://github.com/wighawag/anonctl/releases/latest/download/install.sh | sudo sh
 ```
+
+This detects your architecture (amd64 / arm64 / armv7 / armv6), downloads the latest release, **verifies its sha256 checksum** (and refuses to install on a mismatch, never install an unverified anonymity tool), and installs **both** `anonctl` and `anonctl-shim` to `/usr/local/bin`, placing `anonctl-shim` at `/usr/local/bin/anonctl-shim` (the shim unit's ExecStart path).
 
 Override with env vars:
 
@@ -60,6 +103,22 @@ sudo install -m 0755 anonctl-shim /usr/local/bin/anonctl-shim
 ```
 
 ## Usage
+
+The verbs at a glance (a **bare verb** targets the default `anon` account; `<name>` targets `anon-<name>`):
+
+| Verb | What it does | Root |
+| --- | --- | --- |
+| `add` | Provision an account and force its egress through the anonymizer | yes |
+| `verify` | PROVE an account is anonymized (non-zero exit on any leak) | yes |
+| `use` | Verify, then open a shell as the account, **only on green** | yes |
+| `exec` | Verify, then run one program as the account, **only on green** | yes |
+| `list` | List the anon accounts on the box | no |
+| `status` | Show one account's state | no |
+| `seed-home` | Copy a template dir into an account's home | yes |
+| `update` / `reconfigure` | Re-point an account at a new endpoint, fail-closed | yes |
+| `rm` | Remove forcing (`--purge-account` also deletes the account) | yes |
+
+Full synopsis:
 
 ```
 anonctl add    [--endpoint <socks5h://host:port>] [--allow <IP|CIDR:port>]... [<name>]   provision + force an account (root)
@@ -218,6 +277,17 @@ Like `use`, the drop + program run is in the **normal binary** (no `-tags integr
 ## What anonctl guarantees and what it does NOT
 
 anonctl's one **guarantee** is **per-UID fail-closed anonymized egress**: every TCP and DNS packet from the forced account is pushed through the anonymizer, fail-closed, and `verify` proves it. Knowing the boundary of that guarantee means the residual risk is documented, not surprising. anonctl is as candid here as its sibling netcage is in "What netcage hides and what it does NOT". The full rationale for each decision below lives in [`docs/adr/`](docs/adr/) (cross-referenced throughout), so this section states the boundary rather than re-arguing it.
+
+The boundary in one table (details in the two subsections below):
+
+| Defended (the guarantee) | NOT defended (accepted residual) |
+| --- | --- |
+| A tool picking the wrong proxy, or none | An adversary who already has **root** on the box |
+| A **DNS leak** (names resolve remotely) | A process **changing its UID** away from the forced one |
+| An **anonymizer-down** leak (fail-closed drop) | A **compromised kernel** |
+| **Cross-identification** of two accounts (bounded, see below) | **Host reconnaissance**: the account can still read `/etc/passwd`, hostname, machine-id, LAN neighbours |
+
+For egress that is out of scope, the right tool is a namespace-strength one like [netcage](https://github.com/wighawag/netcage); for host-visibility, a VM or sandbox. Being honest about the boundary is in scope; that is what this section is.
 
 ### Defended (this is the guarantee)
 
