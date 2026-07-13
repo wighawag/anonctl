@@ -145,11 +145,12 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		return 1
 	}
 
-	res, err := provision.Add(ctx, r, cmd.Account)
-	if err != nil {
-		errorf("add: %v", err)
-		return 1
-	}
+	// CREATE-LAST ORDERING: everything that can fail, be refused, or need an ANSWER
+	// (exemption resolution, the interactive endpoint prompt, the cross-identification
+	// guard) runs BEFORE provision.Add creates the account. So a Ctrl+C at the prompt,
+	// a refused shared endpoint, or an invalid default leaves the box UNTOUCHED (no
+	// half-provisioned account to clean up). The account is created only once every
+	// question is answered and every guard has passed.
 
 	// Resolve the effective LAN exemptions: the ones the operator named on THIS
 	// invocation when any were given, else the box-wide defaults from
@@ -157,6 +158,43 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	// SAME lanexempt guardrail the CLI flag uses (resolveDefaultExemptions), so a
 	// default can never be a quieter path to a leak than the flag.
 	exemptions, err := resolveAddExemptions(cmd)
+	if err != nil {
+		errorf("add: %v", err)
+		return 1
+	}
+
+	// Resolve the endpoint. With an explicit --endpoint, parse it as-is. With NONE,
+	// SCAN the local socks5h ports and choose: default to a confirmed Tor endpoint,
+	// prompt interactively when there is a TTY (annotating any peruser endpoint already
+	// in use by another account), and fall back fail-closed non-interactively
+	// (Tor-if-confirmed, else refuse) rather than blindly configuring a dead 9050. The
+	// interactive prompt is CANCELLABLE: a Ctrl+C surfaces immediately (no Enter
+	// needed), and because we have not created the account yet, it leaves nothing
+	// behind.
+	var ep endpoint.Endpoint
+	if cmd.Endpoint == "" {
+		ep, err = chooseEndpointInteractive(ctx, cmd.Account, "add")
+	} else {
+		ep, err = resolveEndpoint(cmd.Endpoint)
+	}
+	if err != nil {
+		errorf("add: %v", err)
+		return 1
+	}
+
+	// CROSS-IDENTIFICATION GUARD: refuse pointing THIS account at a socks-peruser
+	// endpoint already claimed by a DIFFERENT account (they would exit identically and
+	// become cross-identifiable). A tor-shared endpoint is share-safe and never
+	// refused. This runs BEFORE the account is created, so a refusal leaves the box
+	// untouched.
+	if err := claimEndpoint(cmd.Account, ep); err != nil {
+		errorf("add: %v", err)
+		return 1
+	}
+
+	// All questions answered and all guards passed: NOW create the account + its
+	// dedicated shim UID.
+	res, err := provision.Add(ctx, r, cmd.Account)
 	if err != nil {
 		errorf("add: %v", err)
 		return 1
@@ -176,36 +214,10 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		}
 	}
 
-	// Resolve the endpoint. With an explicit --endpoint, use it as-is (unchanged).
-	// With NONE, SCAN the local socks5h ports and choose: default to a confirmed Tor
-	// endpoint, prompt interactively when there is a TTY (annotating any peruser
-	// endpoint already in use by another account), and fall back fail-closed
-	// non-interactively (Tor-if-confirmed, else refuse) rather than blindly
-	// configuring a dead 9050. An empty result means "use the plain Tor default"
-	// (chooseEndpointInteractive never returns "" without an error).
-	endpointArg := cmd.Endpoint
-	if endpointArg == "" {
-		chosen, cerr := chooseEndpointInteractive(cmd.Account, "add")
-		if cerr != nil {
-			errorf("add: %v", cerr)
-			return 1
-		}
-		endpointArg = chosen.URL()
-	}
-
-	// Build the at-rest config from the just-provisioned UIDs and the chosen
-	// endpoint, then install the forcing.
-	cfg, err := buildConfig(ctx, r, cmd.Account, endpointArg, exemptions)
+	// Build the at-rest config from the just-provisioned UIDs and the chosen endpoint,
+	// then install the forcing.
+	cfg, err := buildConfig(ctx, r, cmd.Account, ep.URL(), exemptions)
 	if err != nil {
-		errorf("add: %v", err)
-		return 1
-	}
-	// CROSS-IDENTIFICATION GUARD: refuse pointing THIS account at a socks-peruser
-	// endpoint already claimed by a DIFFERENT account (they would exit identically and
-	// become cross-identifiable). A tor-shared endpoint is share-safe and never
-	// refused. This runs BEFORE any nft/systemd mutation, so a refusal leaves the box
-	// untouched (the account is provisioned but not forced onto a colliding endpoint).
-	if err := claimEndpoint(cmd.Account, cfg.Endpoint()); err != nil {
 		errorf("add: %v", err)
 		return 1
 	}
@@ -837,7 +849,7 @@ func runUpdate(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 			errorf("%s: --endpoint is required non-interactively (the new socks5h endpoint to point the account at); run `anonctl %s %s` on a terminal to scan and choose", cmd.Verb, cmd.Verb, accountArg(cmd.Account))
 			return 2
 		}
-		chosen, cerr := chooseEndpointInteractive(cmd.Account, cmd.Verb)
+		chosen, cerr := chooseEndpointInteractive(ctx, cmd.Account, cmd.Verb)
 		if cerr != nil {
 			errorf("%s: %v", cmd.Verb, cerr)
 			return 1
@@ -959,7 +971,7 @@ func peruserOwners() (map[string]string, error) {
 // claimEndpoint before any mutation (the annotation is advisory; the Claim is the
 // enforcement). verb names the caller so the non-interactive refusal points at the
 // right command to re-run interactively.
-func chooseEndpointInteractive(account, verb string) (endpoint.Endpoint, error) {
+func chooseEndpointInteractive(ctx context.Context, account, verb string) (endpoint.Endpoint, error) {
 	owners, err := peruserOwners()
 	if err != nil {
 		return endpoint.Endpoint{}, err
@@ -974,7 +986,33 @@ func chooseEndpointInteractive(account, verb string) (endpoint.Endpoint, error) 
 		}
 		return chosen, nil
 	}
-	return promptEndpointChoice(offers)
+	return promptEndpointChoice(ctx, offers)
+}
+
+// readLineContext reads one newline-terminated line from r, but returns as soon as
+// ctx is cancelled (Ctrl+C / SIGTERM) EVEN IF the blocking read has not yet seen a
+// newline. The read runs on a goroutine; whichever of (a line arrives) or (ctx is
+// done) happens first wins. On a cancel it returns ctx.Err() with a friendly
+// "cancelled" wrapping so the operator sees the interrupt immediately instead of
+// having to press Enter to unblock the read. The goroutine may linger on the
+// abandoned stdin read until the process exits; that is fine, the process is on its
+// way out (a cancelled add returns non-zero right after).
+func readLineContext(ctx context.Context, r io.Reader) (string, error) {
+	type result struct {
+		line string
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		line, err := bufio.NewReader(r).ReadString('\n')
+		ch <- result{line, err}
+	}()
+	select {
+	case <-ctx.Done():
+		return "", fmt.Errorf("cancelled: %w", ctx.Err())
+	case res := <-ch:
+		return res.line, res.err
+	}
 }
 
 // promptEndpointChoice renders the confirmed offers (evidence only, never labelling
@@ -984,7 +1022,7 @@ func chooseEndpointInteractive(account, verb string) (endpoint.Endpoint, error) 
 // peruser offer is shown "in use by <account>" and is not selectable. When there is
 // no default and the operator just hits enter, it re-prompts once via the custom
 // path being required.
-func promptEndpointChoice(offers []endpoint.Offer) (endpoint.Endpoint, error) {
+func promptEndpointChoice(ctx context.Context, offers []endpoint.Offer) (endpoint.Endpoint, error) {
 	def, hasDefault := endpoint.DefaultOffer(offers)
 	fmt.Fprintln(promptWriter, "anonctl: no --endpoint given; scanning local socks5h ports (evidence only, provider not labelled):")
 	if len(offers) == 0 {
@@ -1006,7 +1044,15 @@ func promptEndpointChoice(offers []endpoint.Offer) (endpoint.Endpoint, error) {
 		fmt.Fprint(promptWriter, "choose a number or type a socks5h://host:port: ")
 	}
 
-	line, _ := bufio.NewReader(promptReader).ReadString('\n')
+	line, rerr := readLineContext(ctx, promptReader)
+	if rerr != nil {
+		// A cancelled context (Ctrl+C at the prompt) surfaces IMMEDIATELY here, without
+		// waiting for the operator to press Enter: the blocking stdin read races the
+		// context so the interrupt is observed the moment it arrives, not on the next
+		// keystroke. runAdd resolves the endpoint BEFORE creating the account, so a
+		// cancel here leaves the box untouched (no half-provisioned account).
+		return endpoint.Endpoint{}, rerr
+	}
 	line = strings.TrimSpace(line)
 	switch {
 	case line == "" && hasDefault:

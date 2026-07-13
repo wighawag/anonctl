@@ -245,10 +245,12 @@ Inside the account, `pi` starts on `Ornith 1.0 35B` (non-thinking) against the L
 
 With no `--endpoint`, `add` **scans** the common local SOCKS ports (9050 Tor, 9150 Tor Browser, 1080 generic), **confirms** each open port actually speaks SOCKS5 (an open port is not enough), and offers the confirmed ones. It presents **evidence only** and never labels the exit provider (a SOCKS proxy does not announce Tor/Mullvad, so a label would be a dangerous lie); the strongest thing it says is the port-conventional "likely Tor" prior, which you can override.
 
-- **Interactive** (a terminal): a numbered menu with a confirmed **Tor endpoint pre-selected as the default**; press Enter for the default, type a number, or type a `socks5h://host:port`. A `socks-peruser` endpoint already **in use by another account** is shown as such and is not selectable (see [the cross-identification boundary](#the-cross-identification-boundary)).
+- **Interactive** (a terminal): a numbered menu with a confirmed **Tor endpoint pre-selected as the default**; press Enter for the default, type a number, or type a `socks5h://host:port`. A `socks-peruser` endpoint already **in use by another account** is shown as such and is not selectable (see [the cross-identification boundary](#the-cross-identification-boundary)). The prompt is **cancellable**: **Ctrl+C** aborts immediately (you do NOT need to press Enter first), and because the account is created **only after** you answer, cancelling leaves the box untouched (no half-provisioned account).
 - **Non-interactive** (a script / CI / piped stdin): no prompt. It picks the confirmed Tor default if present, else **fails closed** (`no endpoint confirmed; pass --endpoint ...`) rather than silently configuring a dead `9050`.
 
 Either way the chosen endpoint still passes the cross-identification guard before any rules are applied. Pass `--endpoint socks5h://host:port` to skip the scan entirely.
+
+**`add` creates the account LAST.** Exemption resolution, the endpoint choice (including the interactive prompt), and the cross-identification guard all run **before** the account and its shim UID are provisioned. So a cancelled prompt, a refused shared endpoint, or an invalid default leaves **nothing** behind: the `useradd` happens only once every question is answered and every guard has passed. (Previously `add` provisioned first and could leave a half-created account if you cancelled at the prompt.)
 
 ## verify is the trust anchor
 

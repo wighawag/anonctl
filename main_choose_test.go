@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -35,7 +36,7 @@ func offerEp(port string, class endpoint.ShareClass) endpoint.Endpoint {
 func TestChooseEndpointNonInteractivePicksTor(t *testing.T) {
 	swapScanSeams(t, []endpoint.Endpoint{offerEp("9050", endpoint.ClassTorShared)}, false, "")
 	swapConfigListStore(t) // empty claim set
-	got, err := chooseEndpointInteractive("anon", "add")
+	got, err := chooseEndpointInteractive(context.Background(), "anon", "add")
 	if err != nil {
 		t.Fatalf("chooseEndpointForAdd: %v", err)
 	}
@@ -49,7 +50,7 @@ func TestChooseEndpointNonInteractivePicksTor(t *testing.T) {
 func TestChooseEndpointNonInteractiveFailsClosed(t *testing.T) {
 	swapScanSeams(t, []endpoint.Endpoint{offerEp("1080", endpoint.ClassSocksPeruser)}, false, "")
 	swapConfigListStore(t)
-	if _, err := chooseEndpointInteractive("anon", "add"); !errors.Is(err, endpoint.ErrNoEndpointConfirmed) {
+	if _, err := chooseEndpointInteractive(context.Background(), "anon", "add"); !errors.Is(err, endpoint.ErrNoEndpointConfirmed) {
 		t.Errorf("non-interactive add with no Tor = %v, want ErrNoEndpointConfirmed", err)
 	}
 }
@@ -60,7 +61,7 @@ func TestChooseEndpointNonInteractiveFailsClosed(t *testing.T) {
 func TestChooseEndpointNonInteractiveRefusalNamesVerb(t *testing.T) {
 	swapScanSeams(t, []endpoint.Endpoint{offerEp("1080", endpoint.ClassSocksPeruser)}, false, "")
 	swapConfigListStore(t)
-	_, err := chooseEndpointInteractive("anon", "update")
+	_, err := chooseEndpointInteractive(context.Background(), "anon", "update")
 	if err == nil {
 		t.Fatalf("expected a fail-closed error for update with no Tor")
 	}
@@ -76,7 +77,7 @@ func TestChooseEndpointInteractiveDefaultOnEnter(t *testing.T) {
 		offerEp("1080", endpoint.ClassSocksPeruser),
 	}, true, "\n")
 	swapConfigListStore(t)
-	got, err := chooseEndpointInteractive("anon", "add")
+	got, err := chooseEndpointInteractive(context.Background(), "anon", "add")
 	if err != nil {
 		t.Fatalf("chooseEndpointForAdd: %v", err)
 	}
@@ -92,7 +93,7 @@ func TestChooseEndpointInteractiveNumberPick(t *testing.T) {
 		offerEp("1080", endpoint.ClassSocksPeruser),
 	}, true, "2\n")
 	swapConfigListStore(t)
-	got, err := chooseEndpointInteractive("anon", "add")
+	got, err := chooseEndpointInteractive(context.Background(), "anon", "add")
 	if err != nil {
 		t.Fatalf("chooseEndpointForAdd: %v", err)
 	}
@@ -105,7 +106,7 @@ func TestChooseEndpointInteractiveNumberPick(t *testing.T) {
 func TestChooseEndpointInteractiveTyped(t *testing.T) {
 	swapScanSeams(t, nil, true, "socks5h://127.0.0.1:1234\n")
 	swapConfigListStore(t)
-	got, err := chooseEndpointInteractive("anon", "add")
+	got, err := chooseEndpointInteractive(context.Background(), "anon", "add")
 	if err != nil {
 		t.Fatalf("chooseEndpointForAdd: %v", err)
 	}
@@ -124,7 +125,7 @@ func TestChooseEndpointAnnotatesAndRefusesTaken(t *testing.T) {
 	s := swapConfigListStore(t)
 	writeConfig(t, s, "anon-a", 1080, endpoint.ClassSocksPeruser) // 1080 taken by anon-a
 
-	_, err := chooseEndpointInteractive("anon-new", "add")
+	_, err := chooseEndpointInteractive(context.Background(), "anon-new", "add")
 	if err == nil {
 		t.Errorf("picking a taken peruser endpoint must be refused")
 	}
