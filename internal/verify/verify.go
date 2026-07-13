@@ -426,11 +426,21 @@ func (e TorExitEvidence) confirmsTor() bool { return e.CheckTorProject || e.Onio
 //     NEITHER registry confirms fails, UNLESS skipTorCheck relaxes that half;
 //   - otherwise it passes.
 //
-// The load-bearing half (exit differs from host => forced egress) is NEVER relaxed:
-// skipTorCheck only drops the Tor-exit sub-requirement, and a skipped pass says so
-// loudly. The detail always NAMES the registries consulted and warns they can lag,
-// so a red is understood as "no registry confirmed this exit", not a definitive
-// "you are not on Tor".
+// hostIP is OPTIONAL: on the tor-shared DEFAULT path the live layer does NOT take a
+// direct host baseline (that request would reveal the real IP for a diff that the
+// Tor-exit confirmation already proves), so hostIP is empty and the proof is the
+// Tor-exit confirmation alone. When hostIP IS supplied (every non-tor-shared
+// endpoint, and a tor-shared endpoint under --skip-tor-exit-check), the exit-differs
+// -from-host check is the proof and is NEVER relaxed. An empty hostIP therefore
+// disables ONLY the equality guard, never a required proof: the tor-shared branch
+// still demands registry confirmation.
+//
+// The load-bearing half (forced egress) is NEVER relaxed: skipTorCheck only drops
+// the Tor-exit sub-requirement (falling back to the exit-differs-from-host proof,
+// which is why it forces a host baseline), and a skipped pass says so loudly. The
+// detail always NAMES the registries consulted and warns they can lag, so a red is
+// understood as "no registry confirmed this exit", not a definitive "you are not on
+// Tor".
 //
 // It is pure so the verdict is unit-tested against the fixture without real Tor;
 // the live check feeds it the real probe output.
@@ -450,9 +460,17 @@ func AnonymizedExitAssertion(hostIP, exitIP string, ev TorExitEvidence, class en
 		return a
 	}
 	// tor-shared: the exit should be a Tor exit. Confirmed by EITHER registry passes.
+	// On the tor-shared DEFAULT path the direct host baseline is NOT taken (it would
+	// reveal the real IP for a redundant diff), so hostIP is empty here: the proof is
+	// the Tor-exit confirmation, and the Detail says so honestly rather than claiming a
+	// host-diff that was never measured.
 	if ev.confirmsTor() {
 		a.Ok = true
-		a.Detail = "exit IP " + exitIP + " differs from host " + hostIP + " and is a Tor exit (" + torSourceDetail(ev) + ")"
+		if hostIP == "" {
+			a.Detail = "exit IP " + exitIP + " is a Tor exit (" + torSourceDetail(ev) + "); forced egress proven by the Tor-exit confirmation (no direct host-IP baseline taken)"
+		} else {
+			a.Detail = "exit IP " + exitIP + " differs from host " + hostIP + " and is a Tor exit (" + torSourceDetail(ev) + ")"
+		}
 		return a
 	}
 	// Neither registry confirmed it. Either skip (relax the Tor-exit half, loudly) or

@@ -378,6 +378,39 @@ func TestAnonymizedExitAssertion_SkipTorExitCheckRelaxesOnlyTheTorHalf(t *testin
 	}
 }
 
+// needsHostBaseline is the policy for WHETHER the identifying direct host-IP request
+// is made: only when the exit-differs-from-host diff is the actual proof. On the
+// tor-shared DEFAULT path (confirmation available, not skipped) it must be OFF, so
+// the real IP is never fetched.
+func TestNeedsHostBaseline(t *testing.T) {
+	if needsHostBaseline(endpoint.ClassTorShared, false) {
+		t.Error("tor-shared default must NOT take the host baseline: the Tor-exit confirmation is the proof, so the identifying real-IP request is skipped")
+	}
+	if !needsHostBaseline(endpoint.ClassTorShared, true) {
+		t.Error("tor-shared under --skip-tor-exit-check WAIVES the Tor confirmation, so the exit-differs diff is the fallback proof and the host baseline IS needed")
+	}
+	if !needsHostBaseline(endpoint.ClassSocksPeruser, false) {
+		t.Error("socks-peruser has no Tor confirmation, so the exit-differs diff is the ONLY proof and the host baseline IS needed")
+	}
+}
+
+// On the tor-shared default path hostIP is empty (no baseline taken). A confirmed
+// Tor exit must still PASS on the confirmation alone, and the detail must be HONEST:
+// it must NOT claim a host-diff that was never measured.
+func TestAnonymizedExitAssertion_TorDefaultPassesWithoutHostBaseline(t *testing.T) {
+	ev := TorExitEvidence{CheckTorProject: true}
+	a := AnonymizedExitAssertion("", "198.51.100.7", ev, endpoint.ClassTorShared, false)
+	if !a.Ok {
+		t.Fatalf("a confirmed Tor exit must PASS on the confirmation alone (no host baseline); got %+v", a)
+	}
+	if strings.Contains(a.Detail, "differs from host") {
+		t.Errorf("detail must NOT claim a host-diff when no baseline was taken; got %q", a.Detail)
+	}
+	if !strings.Contains(a.Detail, "Tor-exit confirmation") {
+		t.Errorf("detail must name the actual proof (the Tor-exit confirmation); got %q", a.Detail)
+	}
+}
+
 // onionooBodyConfirmsExit is strict: it confirms ONLY a running Exit relay that owns
 // the IP, so it can rescue a real Tor exit but never invent one.
 func TestOnionooBodyConfirmsExit(t *testing.T) {

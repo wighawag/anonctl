@@ -218,9 +218,32 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	// up front, so this path is only ever reached for a genuinely new account.
 	fmt.Printf("%s %s (shim %s, endpoint %s)\n", outStyle.Green("provisioned + forced"), outStyle.Bold(res.Account), res.Shim, cfg.Endpoint().URL())
 	fmt.Printf("%s anonctl does NOT manage the endpoint's own service; enable your endpoint (e.g. `systemctl enable --now tor.service`) so it is up at boot\n", outStyle.Yellow("note:"))
-	fmt.Printf("run `%s` to prove the account is anonymized\n", outStyle.Cyan(verifyHint(cmd.Account)))
+
+	// Prove it INLINE: run the SAME verify gate `verify`/`use` run (assertions +
+	// per-check progress + marker-on-green), so `add` ends with a live proof instead
+	// of only a homework instruction. This is warn-and-continue, NOT a hard gate: the
+	// forcing is already installed and fail-closed (the account is DROPPED, never free,
+	// even with the endpoint down), so an add that provisioned correctly must still
+	// exit 0 even when anonymization cannot YET be proven (typically the endpoint is
+	// not up at add-time). A RED report is surfaced loudly with the named follow-up so
+	// the operator knows to bring the endpoint up and re-run `verify`; it never turns a
+	// correct provisioning into a failure. See
+	// work/notes/ideas/host-ip-fetch-off-by-default-and-verify-on-add.md.
+	rep := addVerifyReport(ctx, r, cmd, verifyProgress(false))
+	fmt.Print(colorizeReport(rep.Human()))
+	if rep.Ok() {
+		fmt.Printf("%s the account is anonymized (proven now); re-run `%s` after any reboot or Tor/kernel/nftables change\n", outStyle.Green("verified:"), outStyle.Cyan(verifyHint(cmd.Account)))
+	} else {
+		fmt.Printf("%s the account is provisioned + forced (fail-closed: DROPPED, never leaking), but anonymization could NOT be proven yet - commonly the endpoint is not up. Bring your endpoint up, then run `%s` to prove it\n", outStyle.Yellow("note:"), outStyle.Cyan(verifyHint(cmd.Account)))
+	}
 	return 0
 }
+
+// addVerifyReport runs the shared verify gate for `add`'s inline proof. It is a
+// package var mirroring useVerifyReport/execVerifyReport so a unit test can drive
+// runAdd's tail (the inline verify + its green/red messaging) without a real probe
+// run; production wires the real verifyAndMark (assertions + marker-on-green).
+var addVerifyReport = verifyAndMark
 
 // The seed-home seams: package vars so the unit tests drive the add/seed-home
 // wiring without a real home or a real /etc read. Production wires the real

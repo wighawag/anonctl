@@ -8,10 +8,11 @@
 # 1. install (Linux, root)
 curl -fsSL https://github.com/wighawag/anonctl/releases/latest/download/install.sh | sudo sh
 
-# 2. provision the `anon` account and force it through your local Tor SOCKS port
+# 2. provision the `anon` account, force it through your local Tor SOCKS port,
+#    and PROVE it inline (Tor exit, remote DNS, a direct dial DROPPED)
 sudo anonctl add
 
-# 3. PROVE it is anonymized (anonymized exit IP, remote DNS, a direct dial DROPPED)
+# 3. re-prove any time (after a reboot, or a Tor/kernel/nftables change)
 sudo anonctl verify
 
 # 4. drop into an anonymized shell (only opens on a green verify)
@@ -251,9 +252,13 @@ Either way the chosen endpoint still passes the cross-identification guard befor
 
 ## verify is the trust anchor
 
-`verify` is the signature ONGOING verb: it does not assume anonymization, it PROVES it, and you re-run it **after setup, after a reboot, and after any Tor/kernel/nftables change**. It emits **named assertions**, exits **non-zero on any failure**, and supports `--json` (a versioned envelope with a derived top-level `ok`) so you can gate CI/automation on it. The assertions cover: the exit IP differs from the host's (and, for a Tor endpoint, is a Tor exit); DNS resolves remotely via the endpoint, never a plaintext local query; a direct (non-anonymized) connection from the account is actually DROPPED, for **both** IPv4 and IPv6, reported separately; the two bypass closures hold (the account can reach only its own shim's loopback port, and only the shim UID can reach the upstream endpoint); an ICMP echo (`ping`) from the account is DROPPED (no real-source-IP packet leaves); raw non-53 UDP from the account, **including UDP/443 (QUIC / HTTP-3)**, is DROPPED (SOCKS carries TCP only, so it is unrelayable); the concretely enumerable UID-transition escape vectors (sudo, the documented setuid network paths) do not leak, reported **honestly as best-effort, not exhaustive**; and, when a LAN split-tunnel is active, that it stays tight.
+`verify` is the signature ONGOING verb: it does not assume anonymization, it PROVES it, and you re-run it **after setup, after a reboot, and after any Tor/kernel/nftables change**. It emits **named assertions**, exits **non-zero on any failure**, and supports `--json` (a versioned envelope with a derived top-level `ok`) so you can gate CI/automation on it. The assertions cover: the forced exit is anonymized (for a Tor endpoint, proven by confirming the exit is a **Tor exit** via check.torproject.org / onionoo, fetched over Tor; for a non-Tor endpoint, or a Tor endpoint under `--skip-tor-exit-check`, proven by the exit IP **differing from the host's**); DNS resolves remotely via the endpoint, never a plaintext local query; a direct (non-anonymized) connection from the account is actually DROPPED, for **both** IPv4 and IPv6, reported separately; the two bypass closures hold (the account can reach only its own shim's loopback port, and only the shim UID can reach the upstream endpoint); an ICMP echo (`ping`) from the account is DROPPED (no real-source-IP packet leaves); raw non-53 UDP from the account, **including UDP/443 (QUIC / HTTP-3)**, is DROPPED (SOCKS carries TCP only, so it is unrelayable); the concretely enumerable UID-transition escape vectors (sudo, the documented setuid network paths) do not leak, reported **honestly as best-effort, not exhaustive**; and, when a LAN split-tunnel is active, that it stays tight.
 
 The live probes run in the **normal binary** (a `go install` / release build): probing is runtime behaviour that needs root, exactly like `add`/`rm`, not a test, so there is **no `-tags integration` rebuild** to verify. To run it you need **root**, the **endpoint up**, and the standard host tools the probes shell out to (`setpriv`, `nft`, `curl`, `ping`, and the installed `anonctl-shim` at `/usr/local/bin/anonctl-shim`, which verify execs in a hidden `-probe` mode as the anon UID). Any of those **missing, or a probe that could not run, is a LOUD failing assertion** naming what it needed, never a silent pass: verify exits non-zero. Fail-closed extends to the verifier itself: it never reports green unless it actually proved green, and it never reports green just because it could not probe.
+
+**The verifier does not gratuitously reveal your real IP.** The forced exit-IP probe egresses over the anonymizer (it is anonymized). The one probe that would touch a public IP-echo from the **direct** host path (revealing your real IP, to establish the exit-differs-from-host diff) is taken **only when that diff is actually the proof**: a non-Tor endpoint, or a Tor endpoint under `--skip-tor-exit-check`. On the **Tor default path** the exit is proven by the Tor-exit **confirmation** (fetched over Tor), so that redundant direct request is **skipped** and `verify` never sends a real-IP-revealing request just to prove anonymization. This closes a small timing/fingerprint correlation the direct baseline would otherwise hand a logging echo provider.
+
+**`add` proves it inline.** `anonctl add` runs this same `verify` gate at the end of provisioning and prints the report, so you see green (or exactly why not) immediately, without a separate step. It is **warn-and-continue, not a hard gate**: the forcing is installed fail-closed regardless (the account is DROPPED, never leaking, even with the endpoint down), so `add` still succeeds when anonymization cannot yet be proven (commonly because the endpoint is not up at add-time); it then tells you to bring the endpoint up and re-run `verify`. `verify` remains the standalone ongoing verb you re-run after every reboot or Tor/kernel/nftables change.
 
 ## use is a safe front door, NOT the protection
 

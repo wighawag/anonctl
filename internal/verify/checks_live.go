@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/wighawag/anoncore/endpoint"
 	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anonctl/internal/shim"
 )
@@ -89,14 +90,41 @@ const (
 // or the escaped-leak counter (offBoxReachedAsAnon) keyed on an OFF-BOX daddr that
 // only a genuine clear escape increments. The probes key on `meta skuid`, so they
 // run under setpriv --reuid to the anon UID.
+// needsHostBaseline reports whether the anonymized-exit probe must take the DIRECT
+// host-IP baseline (the request that reveals the REAL IP to the echo provider). It
+// is needed ONLY when the exit-differs-from-host diff is the actual proof of forced
+// egress: any non-tor-shared endpoint (where the diff is the ONLY available proof),
+// or a tor-shared endpoint under --skip-tor-exit-check (which WAIVES the Tor-exit
+// confirmation, so the diff becomes the fallback proof). On the tor-shared DEFAULT
+// path the exit is proven by the Tor-exit confirmation (fetched over Tor, itself
+// anonymized), so the identifying direct request is skipped. Pure so the policy is
+// unit-tested without a socket.
+func needsHostBaseline(class endpoint.ShareClass, skipTorCheck bool) bool {
+	return class != endpoint.ClassTorShared || skipTorCheck
+}
+
 func LiveChecks(ctx context.Context, p LiveParams) []Check {
 	checks := []Check{
 		{Name: AssertAnonymizedExit, Run: func(ctx context.Context) Assertion {
-			hostIP, herr := hostExitIP(ctx)
-			exitIP, ev, eerr := forcedExitIP(ctx, p)
-			if herr != nil {
-				return Assertion{Name: AssertAnonymizedExit, Err: herr}
+			// The DIRECT host-IP baseline reveals the REAL IP to the echo provider, so we
+			// only fetch it when the host-diff is actually the proof we need. On the Tor
+			// DEFAULT path the exit is proven by the Tor-exit CONFIRMATION (fetched OVER
+			// Tor, itself anonymized), which is a real positive proof and already a hard
+			// requirement, so the host-diff is redundant and the identifying direct request
+			// is skipped. It runs only when the diff is the ONLY (or the fallback) proof:
+			// a non-tor-shared endpoint, or a tor-shared endpoint with --skip-tor-exit-check
+			// (which WAIVES the Tor confirmation). See
+			// work/notes/ideas/host-ip-fetch-off-by-default-and-verify-on-add.md.
+			needHostBaseline := needsHostBaseline(p.Class, p.SkipTorExitCheck)
+			var hostIP string
+			if needHostBaseline {
+				var herr error
+				hostIP, herr = hostExitIP(ctx)
+				if herr != nil {
+					return Assertion{Name: AssertAnonymizedExit, Err: herr}
+				}
 			}
+			exitIP, ev, eerr := forcedExitIP(ctx, p)
 			if eerr != nil {
 				return Assertion{Name: AssertAnonymizedExit, Err: eerr}
 			}
