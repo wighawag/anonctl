@@ -3,9 +3,9 @@ title: Per-UID kernel-forced anonymized egress (anonctl v1)
 slug: per-uid-kernel-anonymized-egress
 ---
 
-> Launch snapshot. Records intent at creation, NOT maintained. Current truth: `docs/adr/` (decisions) + the code; remaining work: `work/tasks/ready/` tasks. (The technical-detail sections below are trimmed by `to-task` once the work is tasked: they move into tasks/ADRs and this prd settles to its durable framing: Problem / Solution / User Stories / Out of Scope.)
+> Launch snapshot. Records intent at creation, NOT maintained. Current truth: `docs/adr/` (decisions) + the code; remaining work: `work/tasks/ready/` tasks. (The technical-detail sections below are trimmed by `to-task` once the work is tasked: they move into tasks/ADRs and this spec settles to its durable framing: Problem / Solution / User Stories / Out of Scope.)
 
-> Architecture note: this prd was grilled after its first draft. The original "two mutually-exclusive backends (tor kernel-redirect vs socks shim)" model was collapsed into a SINGLE uniform socks5h-forcing mechanism where Tor is just the default endpoint, and the real axis became the endpoint's cross-user share-safety class. All six original open questions are resolved; the frontmatter carries no `needsAnswers`.
+> Architecture note: this spec was grilled after its first draft. The original "two mutually-exclusive backends (tor kernel-redirect vs socks shim)" model was collapsed into a SINGLE uniform socks5h-forcing mechanism where Tor is just the default endpoint, and the real axis became the endpoint's cross-user share-safety class. All six original open questions are resolved; the frontmatter carries no `needsAnswers`.
 
 ## Problem Statement
 
@@ -64,10 +64,10 @@ The signature ongoing verb is `verify`: run it after setup, after a reboot, and 
 
 ### Autonomy notes (the two gate axes, set the frontmatter flags accordingly)
 
-- **`humanOnly` (DECIDED):** NOT set on this prd. A human is expected to review before tasking regardless (the prd lands unstaged), but nothing here requires a human to DRIVE the tasking once the open questions are resolved. The individual tasks are strongly security- and root-sensitive (they install kernel firewall rules that, if wrong, silently leak a real IP or lock a user out of the network); the maintainer drives the build one task at a time, so no per-task gate was needed beyond the repo's `autoBuild: false`.
+- **`humanOnly` (DECIDED):** NOT set on this spec. A human is expected to review before tasking regardless (the spec lands unstaged), but nothing here requires a human to DRIVE the tasking once the open questions are resolved. The individual tasks are strongly security- and root-sensitive (they install kernel firewall rules that, if wrong, silently leak a real IP or lock a user out of the network); the maintainer drives the build one task at a time, so no per-task gate was needed beyond the repo's `autoBuild: false`.
 - **`needsAnswers` (DISCOVERED): NOT set (cleared after grilling).** The six original open questions were resolved in a grilling pass and folded into the tasks. The manual-recipe task still exists to VALIDATE the resolved nft/shim recipe empirically before Go code, but it is a validation step, not an unresolved fork.
 
-> Tasked. The Implementation and Testing detail that used to live here has moved into `work/tasks/` (what to build) and will be recorded, where it is durable rationale, in `docs/adr/` (why). This prd has settled to its durable framing below. The ~8 decisions the grilling produced (applies-as-root divergence from anon-pi; uniform socks5h-forcing that collapsed the two-backend split; endpoint share-class + `<account>@` isolation; own-static-Go-shim one-per-account; the `inet` fail-closed ruleset + two bypass closures; the LAN-exemption simpler-mechanism note; the marker schema/precedence/trust contract; the persistence mechanism + boot invariant) are each flagged in their tasks as an ADR to write with a real why.
+> Tasked. The Implementation and Testing detail that used to live here has moved into `work/tasks/` (what to build) and will be recorded, where it is durable rationale, in `docs/adr/` (why). This spec has settled to its durable framing below. The ~8 decisions the grilling produced (applies-as-root divergence from anon-pi; uniform socks5h-forcing that collapsed the two-backend split; endpoint share-class + `<account>@` isolation; own-static-Go-shim one-per-account; the `inet` fail-closed ruleset + two bypass closures; the LAN-exemption simpler-mechanism note; the marker schema/precedence/trust contract; the persistence mechanism + boot invariant) are each flagged in their tasks as an ADR to write with a real why.
 
 ## Out of Scope
 

@@ -30,7 +30,7 @@ The Go CLI skeleton and the account-provisioning half of `add`/`rm`, plus read-o
 
 ## Prompt
 
-> Goal: the anonctl CLI skeleton and the account + shim-UID provisioning behind `add`/`rm`, with read-only `list`/`status`. Stories 1, 2, 3, 22 of the `per-uid-kernel-anonymized-egress` prd. NO egress forcing here, that is `nftables-ruleset-install`.
+> Goal: the anonctl CLI skeleton and the account + shim-UID provisioning behind `add`/`rm`, with read-only `list`/`status`. Stories 1, 2, 3, 22 of the `per-uid-kernel-anonymized-egress` spec. NO egress forcing here, that is `nftables-ruleset-install`.
 >
 > FIRST, check drift: read the recipe finding from `manual-per-uid-recipe-validation` (in `work/notes/findings/`) for the exact account + dedicated-shim-UID layout, and `work/specs/tasked/per-uid-kernel-anonymized-egress.md` for the verb vocabulary. If the recipe landed a different account/UID layout than assumed here, follow the recipe, not this prose.
 >

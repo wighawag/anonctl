@@ -2,7 +2,13 @@
 title: Honest threat-model + README (what per-UID forcing defends against and what it does NOT)
 slug: threat-model-and-docs
 spec: per-uid-kernel-anonymized-egress
-blockedBy: [nftables-ruleset-install, verify-command, marker-contract, persistence-and-boot-invariant]
+blockedBy:
+  [
+    nftables-ruleset-install,
+    verify-command,
+    marker-contract,
+    persistence-and-boot-invariant,
+  ]
 covers: [29, 30]
 ---
 
@@ -32,7 +38,7 @@ The README / docs, at netcage's honesty bar, documenting the finished system and
 
 ## Prompt
 
-> Goal: the README / threat-model docs at netcage's honesty bar. Stories 29 (doc half) and 30 of the `per-uid-kernel-anonymized-egress` prd.
+> Goal: the README / threat-model docs at netcage's honesty bar. Stories 29 (doc half) and 30 of the `per-uid-kernel-anonymized-egress` spec.
 >
 > FIRST, check drift: read what actually landed (`work/tasks/done/` for the ruleset, verify, marker, persistence tasks, and any ADRs in `docs/adr/`) and document THAT, not this prose, this task lands last precisely so it describes the finished system.
 >

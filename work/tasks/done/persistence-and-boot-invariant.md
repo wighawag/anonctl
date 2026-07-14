@@ -2,7 +2,13 @@
 title: Reboot persistence (nftables.service include + per-account anonctl-shim@ unit) and the boot invariant
 slug: persistence-and-boot-invariant
 spec: per-uid-kernel-anonymized-egress
-blockedBy: [account-provisioning-and-cli-skeleton, socks-shim-binary, nftables-ruleset-install, verify-command]
+blockedBy:
+  [
+    account-provisioning-and-cli-skeleton,
+    socks-shim-binary,
+    nftables-ruleset-install,
+    verify-command,
+  ]
 covers: [19, 21, 26, 27]
 ---
 
@@ -34,7 +40,7 @@ Make the setup survive reboot and re-apply FAIL-CLOSED, with no window where the
 
 ## Prompt
 
-> Goal: reboot persistence (nftables.service include + per-account `anonctl-shim@<account>.service`) and the boot invariant, plus `update`/`reconfigure`. Stories 19, 21, 26, 27 of the `per-uid-kernel-anonymized-egress` prd.
+> Goal: reboot persistence (nftables.service include + per-account `anonctl-shim@<account>.service`) and the boot invariant, plus `update`/`reconfigure`. Stories 19, 21, 26, 27 of the `per-uid-kernel-anonymized-egress` spec.
 >
 > FIRST, check drift: confirm the ruleset (`nftables-ruleset-install`), the shim binary + its launch args (`socks-shim-binary`), and the account/shim-UID layout (`account-provisioning-and-cli-skeleton`) match what this persists. If any changed, adapt to what landed.
 >

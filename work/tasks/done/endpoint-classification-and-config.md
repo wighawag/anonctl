@@ -31,7 +31,7 @@ The pure-logic core that decides HOW an account is anonymized: which endpoint, w
 
 ## Prompt
 
-> Goal: the pure-logic endpoint model, share-class (`tor-shared` vs `socks-peruser`), the per-account `<account>@` isolation username, the socks-peruser-not-shared refusal, and scan-and-offer. Stories 4, 5, 6, 7, 8 of the `per-uid-kernel-anonymized-egress` prd.
+> Goal: the pure-logic endpoint model, share-class (`tor-shared` vs `socks-peruser`), the per-account `<account>@` isolation username, the socks-peruser-not-shared refusal, and scan-and-offer. Stories 4, 5, 6, 7, 8 of the `per-uid-kernel-anonymized-egress` spec.
 >
 > FIRST, check drift: read the Tor-isolation ground-truth finding from `manual-per-uid-recipe-validation` (Tor `IsolateSOCKSAuth` is default-on per SocksPort; a distinct SOCKS username gives a distinct circuit). This task's entire cross-user-safety guarantee rests on that; if the finding says otherwise, route to needs-attention. Read `CONTEXT.md` for `endpoint` and `endpoint share-class`.
 >

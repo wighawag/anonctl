@@ -29,7 +29,7 @@ This edits the same ruleset module as `nftables-ruleset-install`, hence the `blo
 
 ## Prompt
 
-> Goal: the narrow LAN exemption, a private-only, exact-`host:port` direct hole in the forced egress. Stories 23, 24 of the `per-uid-kernel-anonymized-egress` prd.
+> Goal: the narrow LAN exemption, a private-only, exact-`host:port` direct hole in the forced egress. Stories 23, 24 of the `per-uid-kernel-anonymized-egress` spec.
 >
 > FIRST, check drift: read `nftables-ruleset-install`'s landed ruleset and the recipe finding; this task inserts an `accept` BEFORE its drops, in the same module. If the ruleset shape changed, adapt to what landed.
 >

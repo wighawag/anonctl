@@ -23,13 +23,13 @@ Record the exact working recipe (the `nft` ruleset text, the shim/forwarder invo
 
 > Validated 2026-07-07 end-to-end on a real host (Debian 13 "trixie", kernel 6.12.90+deb13.1-amd64, Tor 0.4.9.9, nftables v1.1.3), maintainer at the root keyboard with the agent driving. anon UID = 30034, shim UID = 995. Recipe + observed outputs in `work/notes/findings/manual-per-uid-tor-recipe.md`; Tor isolation ground-truth in `work/notes/findings/tor-isolatesocksauth-default.md`. One deviation from the drafted recipe: the DNS-leak check. A transparent redirect means `dig @<resolver>` STILL returns an answer (silently rerouted to the shim), so "direct dig must fail" is the wrong assertion; the correct check is a black-hole resolver (`@192.0.2.1` still answers => intercepted) plus an nft counter proving zero udp/53 packets leave with an off-box dst (observed 0). Both confirmed no leak.
 
-- [x] On a real Linux host, the anon account's egress exits via Tor (check.torproject.org confirms; exit IP differs from the host). *(anon UID -> {"IsTor":true,"IP":"45.66.35.21"}; host 147.147.37.112.)*
-- [x] DNS from the anon account resolves remotely (verified no plaintext DNS leaves the box, e.g. by observing that a direct :53 attempt is dropped and resolution still works through the shim). *(black-hole `dig @192.0.2.1` still answers => transparently intercepted; nft escaped-leak counter = 0; shim DNS port resolves.)*
-- [x] A direct (non-shim) connection attempt from the anon UID is DROPPED (fail-closed demonstrated, not just configured), on BOTH IPv4 and IPv6. *(raw UDP/9999 -> "Operation not permitted"; IPv6 curl -> 000/exit7.)*
-- [x] Bypass closure (a): the anon UID cannot reach any loopback destination other than its own shim port. *(anon -> 127.0.0.1:9150 dropped (000); own relay port reachable.)*
-- [x] Bypass closure (b): the anon UID cannot connect directly to the Tor SocksPort (only the shim UID can). *(anon -> 127.0.0.1:9050 dropped (exit97); shim UID -> 9050 -> {"IsTor":true}.)*
-- [x] A `work/notes/findings/*.md` recipe doc is written with a `source:` line, containing the exact `nft` ruleset, the shim/forwarder invocation, the account/shim-UID layout, and the `<account>@` isolation detail. *(`work/notes/findings/manual-per-uid-tor-recipe.md`, fully validated with real outputs + shim source.)*
-- [x] A finding captures the Tor `IsolateSOCKSAuth`-is-default + per-username-circuit ground-truth with an external `source:` (Tor man page / Whonix). *(`work/notes/findings/tor-isolatesocksauth-default.md`, empirically confirmed + tor(1) man page + Whonix Stream Isolation cited.)*
+- [x] On a real Linux host, the anon account's egress exits via Tor (check.torproject.org confirms; exit IP differs from the host). _(anon UID -> {"IsTor":true,"IP":"45.66.35.21"}; host 147.147.37.112.)_
+- [x] DNS from the anon account resolves remotely (verified no plaintext DNS leaves the box, e.g. by observing that a direct :53 attempt is dropped and resolution still works through the shim). _(black-hole `dig @192.0.2.1` still answers => transparently intercepted; nft escaped-leak counter = 0; shim DNS port resolves.)_
+- [x] A direct (non-shim) connection attempt from the anon UID is DROPPED (fail-closed demonstrated, not just configured), on BOTH IPv4 and IPv6. _(raw UDP/9999 -> "Operation not permitted"; IPv6 curl -> 000/exit7.)_
+- [x] Bypass closure (a): the anon UID cannot reach any loopback destination other than its own shim port. _(anon -> 127.0.0.1:9150 dropped (000); own relay port reachable.)_
+- [x] Bypass closure (b): the anon UID cannot connect directly to the Tor SocksPort (only the shim UID can). _(anon -> 127.0.0.1:9050 dropped (exit97); shim UID -> 9050 -> {"IsTor":true}.)_
+- [x] A `work/notes/findings/*.md` recipe doc is written with a `source:` line, containing the exact `nft` ruleset, the shim/forwarder invocation, the account/shim-UID layout, and the `<account>@` isolation detail. _(`work/notes/findings/manual-per-uid-tor-recipe.md`, fully validated with real outputs + shim source.)_
+- [x] A finding captures the Tor `IsolateSOCKSAuth`-is-default + per-username-circuit ground-truth with an external `source:` (Tor man page / Whonix). _(`work/notes/findings/tor-isolatesocksauth-default.md`, empirically confirmed + tor(1) man page + Whonix Stream Isolation cited.)_
 
 ## Blocked by
 
@@ -37,9 +37,9 @@ Record the exact working recipe (the `nft` ruleset text, the shim/forwarder invo
 
 ## Prompt
 
-> Goal: prove the anonctl per-UID anonymized-egress model by hand on ONE account before any Go code, and record the working recipe as a finding the Go tasks will encode. This is story 31 of the `per-uid-kernel-anonymized-egress` prd and the root of every other task (they `blockedBy` this).
+> Goal: prove the anonctl per-UID anonymized-egress model by hand on ONE account before any Go code, and record the working recipe as a finding the Go tasks will encode. This is story 31 of the `per-uid-kernel-anonymized-egress` spec and the root of every other task (they `blockedBy` this).
 >
-> FIRST, check this task against current reality: the repo is greenfield (no Go code yet), so there is nothing to drift from except the prd. Read `work/specs/tasked/per-uid-kernel-anonymized-egress.md` (Solution + User Stories) and `CONTEXT.md` for the vocabulary (anon account, shim, endpoint, endpoint share-class, fail-closed/default-DROP, the two bypass closures, marker).
+> FIRST, check this task against current reality: the repo is greenfield (no Go code yet), so there is nothing to drift from except the spec. Read `work/specs/tasked/per-uid-kernel-anonymized-egress.md` (Solution + User Stories) and `CONTEXT.md` for the vocabulary (anon account, shim, endpoint, endpoint share-class, fail-closed/default-DROP, the two bypass closures, marker).
 >
 > Domain vocabulary: the forcing is UNIFORM (one mechanism, not a per-backend split): an nftables `meta skuid <anon-uid>` redirect of the account's TCP into a per-account shim that speaks socks5h, DNS resolved remotely over the endpoint. Tor is just the default endpoint (its SocksPort). Cross-user safety comes from dialing Tor with a per-account `<account>@` SOCKS username so `IsolateSOCKSAuth` (Tor's default) gives each account its own circuit/exit.
 >

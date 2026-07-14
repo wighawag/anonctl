@@ -6,10 +6,10 @@ name: ci
 # unit gate; release = cut a versioned build. They do not share a job.
 #
 # The single command below IS the repo's acceptance gate, verbatim from
-# `.dorfl.json` `verify` (gofmt check + go vet + go build + go test). Keeping it
+# `dorfl.json` `verify` (gofmt check + go vet + go build + go test). Keeping it
 # byte-for-byte identical means the push/PR gate and the local gate can never
 # drift; ci_workflow_test.go pins that (it reads both files and asserts a match),
-# so a change to `.dorfl.json` verify fails the build until this workflow is
+# so a change to `dorfl.json` verify fails the build until this workflow is
 # updated too.
 #
 # UNIT ONLY. The setup/verify integration suite (`go test -tags integration ./...`)
@@ -42,7 +42,7 @@ jobs:
           go-version: "1.26"
           check-latest: true
 
-      - name: Run the .dorfl.json verify gate (unit only)
-        # Verbatim from `.dorfl.json` `verify`. Do not edit here without editing
-        # .dorfl.json; ci_workflow_test.go enforces the two stay identical.
+      - name: Run the dorfl.json verify gate (unit only)
+        # Verbatim from `dorfl.json` `verify`. Do not edit here without editing
+        # dorfl.json; ci_workflow_test.go enforces the two stay identical.
         run: test -z "$(gofmt -l .)" && go vet ./... && go build ./... && go test ./...

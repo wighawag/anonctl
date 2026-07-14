@@ -2,7 +2,13 @@
 title: The fail-closed inet nftables ruleset with the two bypass closures (applied as root)
 slug: nftables-ruleset-install
 spec: per-uid-kernel-anonymized-egress
-blockedBy: [manual-per-uid-recipe-validation, account-provisioning-and-cli-skeleton, socks-shim-binary, endpoint-classification-and-config]
+blockedBy:
+  [
+    manual-per-uid-recipe-validation,
+    account-provisioning-and-cli-skeleton,
+    socks-shim-binary,
+    endpoint-classification-and-config,
+  ]
 covers: [9, 11, 13, 14, 32]
 ---
 
@@ -34,7 +40,7 @@ Generate and APPLY (as root, the ufw stance) the per-account nftables ruleset th
 
 ## Prompt
 
-> Goal: generate and apply, as root, the fail-closed `inet` nftables ruleset with the two bypass closures, the kernel half of anonctl's forcing. Stories 9, 11 (nft half), 13, 14 (nft half), 32 of the `per-uid-kernel-anonymized-egress` prd. This is the highest-stakes task: a wrong rule silently leaks a real IP or locks a user out of the network.
+> Goal: generate and apply, as root, the fail-closed `inet` nftables ruleset with the two bypass closures, the kernel half of anonctl's forcing. Stories 9, 11 (nft half), 13, 14 (nft half), 32 of the `per-uid-kernel-anonymized-egress` spec. This is the highest-stakes task: a wrong rule silently leaks a real IP or locks a user out of the network.
 >
 > FIRST, check drift: the exact `nft` ruleset text is the deliverable of `manual-per-uid-recipe-validation` (a `work/notes/findings/*.md` with `source:`). ENCODE that proven recipe, do not invent a fresh ruleset. Confirm the anon UID + shim UID from `account-provisioning-and-cli-skeleton` and the shim ports from `socks-shim-binary` match what this generates. If any dependency landed differently, route to needs-attention rather than build on a stale premise.
 >

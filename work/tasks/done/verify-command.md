@@ -36,7 +36,7 @@ Signature ongoing verb: it is meant to be re-run after setup, after a reboot, an
 
 ## Prompt
 
-> Goal: `anonctl verify`: the named-assertion, non-zero-exit, `--json` trust anchor that proves an account is anonymized, DNS is remote, direct egress is DROPPED, the bypass closures hold, and the split-tunnel stays tight. Stories 15, 16, 17, 18, 25 of the `per-uid-kernel-anonymized-egress` prd.
+> Goal: `anonctl verify`: the named-assertion, non-zero-exit, `--json` trust anchor that proves an account is anonymized, DNS is remote, direct egress is DROPPED, the bypass closures hold, and the split-tunnel stays tight. Stories 15, 16, 17, 18, 25 of the `per-uid-kernel-anonymized-egress` spec.
 >
 > FIRST, check drift: confirm the ruleset behaviour from `nftables-ruleset-install` and the recipe finding match the assertions here; verify tests the SAME closures that task installed. If they diverged, adapt to what landed.
 >
@@ -48,4 +48,4 @@ Signature ongoing verb: it is meant to be re-run after setup, after a reboot, an
 
 ## Requeue 2026-07-07
 
-A transient upstream 524 (Cloudflare timeout) aborted the previous run; substantial WIP is already on the branch (internal/verify/*.go + main wiring). CONTINUE from it: finish the verify command per the acceptance criteria, ensure the gate is green, do NOT restart from scratch.
+A transient upstream 524 (Cloudflare timeout) aborted the previous run; substantial WIP is already on the branch (internal/verify/\*.go + main wiring). CONTINUE from it: finish the verify command per the acceptance criteria, ensure the gate is green, do NOT restart from scratch.

@@ -29,7 +29,7 @@ Not a distro `redsocks` dependency: shipping our own keeps the leak-proof invari
 
 ## Prompt
 
-> Goal: anonctl's own static Go shim, a transparent TCP-to-SOCKS relay plus a DNS-over-SOCKS-TCP forwarder, one instance per account on a per-account loopback port. Stories 10, 11 (v6 in the shim), 12, 14 (shim half) of the `per-uid-kernel-anonymized-egress` prd.
+> Goal: anonctl's own static Go shim, a transparent TCP-to-SOCKS relay plus a DNS-over-SOCKS-TCP forwarder, one instance per account on a per-account loopback port. Stories 10, 11 (v6 in the shim), 12, 14 (shim half) of the `per-uid-kernel-anonymized-egress` spec.
 >
 > FIRST, check drift: read the recipe finding from `manual-per-uid-recipe-validation` for the exact shim invocation, loopback-port scheme, and `<account>@` isolation detail; follow it over this prose if they differ. Read `CONTEXT.md` for the `shim` / `endpoint` / `endpoint share-class` vocabulary.
 >
