@@ -77,11 +77,11 @@ work/
 
 ### The three capture buckets (different by polarity + mutability)
 
-| Bucket | What | Mutability | Leaves by |
-| --- | --- | --- | --- |
-| `notes/ideas/` | a _proposed_, pre-spec opportunity ("we might want to build this") | **editable** (refine the proposal in place) | deletion (when built/abandoned) |
-| `notes/observations/` | an _observed, unverified_ signal ("I noticed something maybe wrong") | **append-only** (add `## Update` notes; don't rewrite what was seen) | deletion (when no longer a useful signal) |
-| `notes/findings/` | _verified external/domain_ ground truth (a reverse-engineered protocol, an external API's real behaviour) | accumulates; durable | rarely — it is reference knowledge |
+| Bucket                | What                                                                                                      | Mutability                                                           | Leaves by                                 |
+| --------------------- | --------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- | ----------------------------------------- |
+| `notes/ideas/`        | a _proposed_, pre-spec opportunity ("we might want to build this")                                        | **editable** (refine the proposal in place)                          | deletion (when built/abandoned)           |
+| `notes/observations/` | an _observed, unverified_ signal ("I noticed something maybe wrong")                                      | **append-only** (add `## Update` notes; don't rewrite what was seen) | deletion (when no longer a useful signal) |
+| `notes/findings/`     | _verified external/domain_ ground truth (a reverse-engineered protocol, an external API's real behaviour) | accumulates; durable                                                 | rarely — it is reference knowledge        |
 
 > **`findings/` is for EXTERNAL/DOMAIN ground truth, NOT internal post-mortems.** A finding is durable knowledge about a _world the software integrates with_ (e.g. a Bluetooth/hardware protocol we reverse-engineered, a third-party API's undocumented behaviour) — it accumulates, it does not "resolve". An _internal_ investigation (why a test flakes, a perf regression) is NOT a finding: it is a transient `notes/observations/` signal that drives a fix task and/or an ADR. **ADRs — the durable _why_ of OUR technical decisions — live in `docs/adr/`** (format: `ADR-FORMAT.md`, alongside this contract), never in `work/notes/findings/`. So: observation = "spotted, unverified"; finding = "verified external ground truth"; ADR = "what WE decided and why".
 >
@@ -196,7 +196,7 @@ A finding (`work/notes/findings/<slug>.md`) is a capture-bucket note (no status 
 ---
 title: Human Readable Title
 slug: external-api-behaviour
-source: 'derived from src/<the-integrating-module> @ <commit>' # REQUIRED: what the source is AND how current (a date for external sources). Be specific & honest — there is NO separate confidence field; the source string carries the weight.
+source: "derived from src/<the-integrating-module> @ <commit>" # REQUIRED: what the source is AND how current (a date for external sources). Be specific & honest — there is NO separate confidence field; the source string carries the weight.
 ---
 ```
 
@@ -210,7 +210,7 @@ The autonomy gate is TWO orthogonal binary fields (both default to omitted = fal
 - **`humanOnly: true` — the DECIDED axis.** _Should a human drive this, regardless of how complete the spec is?_ A product/design/security/judgement call, or an `AGENTS.md`-type rule. Driven by a decision (in the spec conversation, or the tasker's own judgement). On a SPEC it means "a human must drive the tasking". On a TASK it is the NARROW "never-for-agents BY NATURE" guard (secrets/release/security) that **survives even when the task resides in the agent pool `work/tasks/ready/`**. Task `humanOnly` is NOT the tool for ordinary "a human should review this before the agent builds it" — that job belongs to POSITION (the runner births the task STAGED in `work/tasks/backlog/`; a human promotes the approved ones into the pool `work/tasks/ready/`). See "Task `humanOnly` is NARROW" below.
 - **`needsAnswers: true` — the DISCOVERED axis.** _Are there unresolved questions blocking autonomous progress?_ The spec is incomplete; **the open questions live in the body**. Once answered, the flag is cleared and an agent may proceed.
 - They are **orthogonal** — four honest states. e.g. `humanOnly:true, needsAnswers:false` = fully specified but a human must own it; `humanOnly:false, needsAnswers:true` = anyone can do it once the questions are answered.
-- **Repo policy `autoBuild`** answers the question the _repo_ owns: _may agents auto-build undeclared items here?_ The build member of the symmetric per-action gate family (`autoBuild`/`autoTask`/`observationTriage`). Per-repo config key (`.dorfl.json`), resolved like `integration`: **CLI flag (`--auto-build` / `--no-auto-build`) > env (`DORFL_AUTO_BUILD`) > per-repo config > global config > built-in default (`false`)**.
+- **Repo policy `autoBuild`** answers the question the _repo_ owns: _may agents auto-build undeclared items here?_ The build member of the symmetric per-action gate family (`autoBuild`/`autoTask`/`observationTriage`). Per-repo config key (`dorfl.json`), resolved like `integration`: **CLI flag (`--auto-build` / `--no-auto-build`) > env (`DORFL_AUTO_BUILD`) > per-repo config > global config > built-in default (`false`)**.
 
 **Predicate (same shape at both levels):** an item is **auto-eligible** iff `needsAnswers` is not `true` AND `humanOnly` is not `true` AND `autoBuild` is `true`. A human is never bound by it (a human may task/build a flagged item — the gate binds the agent, like the runner-vs-human stance on `verify`).
 
@@ -247,11 +247,11 @@ Consequences for the tasker heuristic (the `to-task` skill / the tasker review l
 
 The tasker-output integration combines `--propose`/`--merge` with the `tasksLandIn` placement default into three explicit, named modes:
 
-| Mode | How to invoke | What lands where | When to use |
-| --- | --- | --- | --- |
-| **`--propose`** (PR path) | `do spec:<slug> --propose` (or the configured default) | A work branch pushed; a PR opened against `main`. Tasks land in the PR's tree (typically `work/tasks/backlog/`); review is the PR diff. | A repo with a host (GitHub, …) and a PR-based review culture. Code/implementation review ALWAYS uses this path — a diff cannot be folder-gated. |
-| **`--merge` + land-in-staging** (PR-free review) | `do spec:<slug> --merge` with `tasksLandIn: pre-backlog` (or `--tasks-land-in pre-backlog`) | Tasks land DURABLY on `main` under `work/tasks/backlog/` (the staging folder, NOT eligible). A human promotes the approved ones `work/tasks/backlog/ → work/tasks/ready/`. | A bare / no-host / protected-`main` repo that still wants human review of ledger-file output. Review is a LEDGER POSITION a human moves, not an out-of-band PR. |
-| **`--merge` + land-in-pool** (trusted no-review fast path) | `do spec:<slug> --merge` with `tasksLandIn: ready` (or `--tasks-land-in ready`) and a trusted origin | Tasks land on `main` directly in the agent POOL `work/tasks/ready/` — immediately eligible for `do` / auto-pick. | A trusted, fast-iteration repo where the tasker's output is trusted to enter the pool without ledger-position review. The runner-deterministic placement precedence still forces STAGING for an untrusted origin. |
+| Mode                                                       | How to invoke                                                                                        | What lands where                                                                                                                                                           | When to use                                                                                                                                                                                                       |
+| ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`--propose`** (PR path)                                  | `do spec:<slug> --propose` (or the configured default)                                               | A work branch pushed; a PR opened against `main`. Tasks land in the PR's tree (typically `work/tasks/backlog/`); review is the PR diff.                                    | A repo with a host (GitHub, …) and a PR-based review culture. Code/implementation review ALWAYS uses this path — a diff cannot be folder-gated.                                                                   |
+| **`--merge` + land-in-staging** (PR-free review)           | `do spec:<slug> --merge` with `tasksLandIn: pre-backlog` (or `--tasks-land-in pre-backlog`)          | Tasks land DURABLY on `main` under `work/tasks/backlog/` (the staging folder, NOT eligible). A human promotes the approved ones `work/tasks/backlog/ → work/tasks/ready/`. | A bare / no-host / protected-`main` repo that still wants human review of ledger-file output. Review is a LEDGER POSITION a human moves, not an out-of-band PR.                                                   |
+| **`--merge` + land-in-pool** (trusted no-review fast path) | `do spec:<slug> --merge` with `tasksLandIn: ready` (or `--tasks-land-in ready`) and a trusted origin | Tasks land on `main` directly in the agent POOL `work/tasks/ready/` — immediately eligible for `do` / auto-pick.                                                           | A trusted, fast-iteration repo where the tasker's output is trusted to enter the pool without ledger-position review. The runner-deterministic placement precedence still forces STAGING for an untrusted origin. |
 
 Key rules:
 

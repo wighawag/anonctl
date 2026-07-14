@@ -15,11 +15,11 @@ import (
 
 // dorflVerify reads the verify command out of the repo's dorfl config (the single
 // source of truth for the acceptance gate). It prefers the current `dorfl.json`
-// and falls back to the legacy `.dorfl.json` dotfile, mirroring dorfl's own
+// and falls back to the legacy `dorfl.json` dotfile, mirroring dorfl's own
 // config-name precedence.
 func dorflVerify(t *testing.T) string {
 	t.Helper()
-	const preferred, legacy = "dorfl.json", ".dorfl.json"
+	const preferred, legacy = "dorfl.json", "dorfl.json"
 	name := preferred
 	raw, err := os.ReadFile(preferred)
 	if err != nil {
