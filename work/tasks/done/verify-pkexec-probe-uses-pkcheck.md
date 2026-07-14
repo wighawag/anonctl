@@ -1,7 +1,7 @@
 ---
 title: verify's pkexec probe must query polkit with pkcheck (non-interactive), not RUN pkexec - the real prompt fix
 slug: verify-pkexec-probe-uses-pkcheck
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: [30]
 ---

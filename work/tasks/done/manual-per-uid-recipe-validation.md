@@ -1,7 +1,7 @@
 ---
 title: Manually validate the per-UID recipe (nftables skuid redirect into a shim on a local Tor SOCKS port)
 slug: manual-per-uid-recipe-validation
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: [31]
 ---
@@ -39,7 +39,7 @@ Record the exact working recipe (the `nft` ruleset text, the shim/forwarder invo
 
 > Goal: prove the anonctl per-UID anonymized-egress model by hand on ONE account before any Go code, and record the working recipe as a finding the Go tasks will encode. This is story 31 of the `per-uid-kernel-anonymized-egress` prd and the root of every other task (they `blockedBy` this).
 >
-> FIRST, check this task against current reality: the repo is greenfield (no Go code yet), so there is nothing to drift from except the prd. Read `work/prds/tasked/per-uid-kernel-anonymized-egress.md` (Solution + User Stories) and `CONTEXT.md` for the vocabulary (anon account, shim, endpoint, endpoint share-class, fail-closed/default-DROP, the two bypass closures, marker).
+> FIRST, check this task against current reality: the repo is greenfield (no Go code yet), so there is nothing to drift from except the prd. Read `work/specs/tasked/per-uid-kernel-anonymized-egress.md` (Solution + User Stories) and `CONTEXT.md` for the vocabulary (anon account, shim, endpoint, endpoint share-class, fail-closed/default-DROP, the two bypass closures, marker).
 >
 > Domain vocabulary: the forcing is UNIFORM (one mechanism, not a per-backend split): an nftables `meta skuid <anon-uid>` redirect of the account's TCP into a per-account shim that speaks socks5h, DNS resolved remotely over the endpoint. Tor is just the default endpoint (its SocksPort). Cross-user safety comes from dialing Tor with a per-account `<account>@` SOCKS username so `IsolateSOCKSAuth` (Tor's default) gives each account its own circuit/exit.
 >

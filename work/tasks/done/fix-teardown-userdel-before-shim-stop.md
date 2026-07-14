@@ -1,7 +1,7 @@
 ---
 title: Fix teardown regression - rm --purge-account userdels the shim account before stopping its unit, aborting cleanup
 slug: fix-teardown-userdel-before-shim-stop
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: [22]
 ---

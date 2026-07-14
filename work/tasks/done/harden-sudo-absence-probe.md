@@ -1,7 +1,7 @@
 ---
 title: Harden the sudo-absence probe - do not trust `sudo -l -U` exit code alone (a lenient sudo build false-alarms)
 slug: harden-sudo-absence-probe
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: [30]
 ---

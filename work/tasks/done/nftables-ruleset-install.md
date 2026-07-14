@@ -1,7 +1,7 @@
 ---
 title: The fail-closed inet nftables ruleset with the two bypass closures (applied as root)
 slug: nftables-ruleset-install
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: [manual-per-uid-recipe-validation, account-provisioning-and-cli-skeleton, socks-shim-binary, endpoint-classification-and-config]
 covers: [9, 11, 13, 14, 32]
 ---

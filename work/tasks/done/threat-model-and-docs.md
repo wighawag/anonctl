@@ -1,7 +1,7 @@
 ---
 title: Honest threat-model + README (what per-UID forcing defends against and what it does NOT)
 slug: threat-model-and-docs
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: [nftables-ruleset-install, verify-command, marker-contract, persistence-and-boot-invariant]
 covers: [29, 30]
 ---

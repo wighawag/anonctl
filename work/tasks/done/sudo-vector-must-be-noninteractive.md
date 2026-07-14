@@ -1,7 +1,7 @@
 ---
 title: verify's sudo vector must use `sudo -n` - `sudo -l -U <account>` still pops a GNOME polkit prompt
 slug: sudo-vector-must-be-noninteractive
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: [30]
 ---

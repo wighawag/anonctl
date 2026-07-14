@@ -1,7 +1,7 @@
 ---
 title: Empirically audit the UID-transition escape surface on a real host (grounds the hardening + verify tasks)
 slug: empirical-uid-transition-escape-audit
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 humanOnly: true
 blockedBy: []
 covers: [30]

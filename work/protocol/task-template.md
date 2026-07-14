@@ -1,12 +1,12 @@
 ---
 title: <Human Readable Title>
 slug: <url-safe-slug>
-prd: <source-prd-slug> # slug of the work/prds/ready/<slug>.md this task derives from. REQUIRED iff `covers` is set; OMIT for a self-contained chore/refactor (covers: []).
+spec: <source-spec-slug> # slug of the work/specs/ready/<slug>.md this task derives from. REQUIRED iff `covers` is set; OMIT for a self-contained chore/refactor (covers: []).
 # humanOnly: true     # gate axis 1 (DECIDED, NARROW): NEVER-for-agents BY NATURE (secrets/release/security). Survives even in the pool work/tasks/ready/. OMIT otherwise — "review this before the agent builds" is the POSITION's job (the task is BIRTHED in work/tasks/backlog/), NOT humanOnly's.
 # needsAnswers: true  # gate axis 2 (DISCOVERED): open questions block autonomous work. OMIT otherwise. List them in the body.
-# promptGuidance.testFirst: true  # optional per-item NUDGE override: pin the test-first nudge ON (true) or OFF (false) for THIS task, regardless of the repo's resolved policy. OMIT to inherit (prd, else repo). NEVER an acceptance criterion — `verify` still decides pass/fail.
+# promptGuidance.testFirst: true  # optional per-item NUDGE override: pin the test-first nudge ON (true) or OFF (false) for THIS task, regardless of the repo's resolved policy. OMIT to inherit (spec, else repo). NEVER an acceptance criterion — `verify` still decides pass/fail.
 blockedBy: [] # slugs that must reach work/tasks/done/ first; [] = startable now
-covers: [] # optional: user-story numbers within `prd` this task covers
+covers: [] # optional: user-story numbers within `spec` this task covers
 ---
 
 <!-- open-questions -->
@@ -49,7 +49,7 @@ Exception: if a prototype produced a snippet that encodes a decision more precis
 >
 > FIRST, check this task against current reality (it is a launch snapshot and may have DRIFTED): does it still match the code in `tasks/done/`, the relevant ADRs, and the tasks it depends on? If a dependency landed differently than this task assumes, or an ADR superseded an assumption here, do NOT build on the stale premise — route the task to needs-attention with the discrepancy as the reason (WORK-CONTRACT.md "Drift is a needs-attention signal"). Building on a stale task produces wrong-but-compiling work.
 >
-> RECORD non-obvious in-scope decisions you make while building. When the task did not specify some behaviour and you have to CHOOSE (a new refusal/exit code, a clamp that reaches a second code path, a fail-loud-vs-fail-safe asymmetry, keeping vs collapsing a now-redundant distinction), do not leave the choice silent for a reviewer to reverse-engineer. Surface it so it can be ratified: if it meets the ADR gate (hard to reverse + surprising without context + a real trade-off — see `ADR-FORMAT.md`), write the durable WHY as an ADR in `docs/adr/`; otherwise note it briefly (e.g. a `## Decisions` line in the done record / PR description). An un-recorded in-scope decision is a review FINDING, not a silent default.
+> RECORD non-obvious in-scope decisions you make while building, DURABLY and LINKED from the done record. When the task did not specify some behaviour and you have to CHOOSE (a new refusal/exit code, a clamp that reaches a second code path, a fail-loud-vs-fail-safe asymmetry, keeping vs collapsing a now-redundant distinction), do not leave the choice silent for a reviewer to reverse-engineer. Surface it so it can be ratified: if it meets the ADR gate (hard to reverse + surprising without context + a real trade-off — see `ADR-FORMAT.md`), write the durable WHY as an ADR in `docs/adr/`; otherwise pick whichever durable home fits best — a module JSDoc at the choice site, an optional `## Decisions` block in the done record / PR description, or a dated observation note under `work/notes/observations/` — and link it from the done record so it is discoverable. An un-recorded in-scope decision is a review FINDING, not a silent default.
 
 ---
 

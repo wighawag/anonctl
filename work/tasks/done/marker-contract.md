@@ -1,7 +1,7 @@
 ---
 title: The /etc/anonctl/<account>.json marker (double-anonymization contract) written after verify passes
 slug: marker-contract
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: [account-provisioning-and-cli-skeleton, endpoint-classification-and-config, verify-command]
 covers: [20, 28, 29]
 ---
@@ -33,7 +33,7 @@ The marker file that sibling tools (anon-pi, netcage) read to detect "this accou
 
 > Goal: the `/etc/anonctl/<account>.json` marker contract, the dependency-free signal anon-pi/netcage read to avoid double-anonymization. Stories 20 (share-class in status), 28, 29 of the `per-uid-kernel-anonymized-egress` prd.
 >
-> FIRST, check drift: read the marker decision in `work/prds/tasked/per-uid-kernel-anonymized-egress.md` (Solution + the resolved marker decision) and confirm the `endpointClass` values match `endpoint-classification-and-config`. Read `CONTEXT.md` for the `marker` term.
+> FIRST, check drift: read the marker decision in `work/specs/tasked/per-uid-kernel-anonymized-egress.md` (Solution + the resolved marker decision) and confirm the `endpointClass` values match `endpoint-classification-and-config`. Read `CONTEXT.md` for the `marker` term.
 >
 > Domain vocabulary: the marker is a COORDINATION CLAIM, not a security proof. Fields: `schemaVersion`, `account`, `uid`, `endpointClass`, `createdAt`, `anonctlVersion`: and deliberately NO endpoint URL/creds (world-readable `/etc`). Precedence: file authoritative, name-prefix a hint, `status --json` a reader. Written only after `verify` passes.
 >

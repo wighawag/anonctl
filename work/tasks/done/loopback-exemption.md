@@ -1,7 +1,7 @@
 ---
 title: The loopback exemption (exact 127.0.0.1:port direct hole for a same-host service, via the unified --allow)
 slug: loopback-exemption
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: [allow-require-explicit-port-and-rename]
 covers: []
 ---

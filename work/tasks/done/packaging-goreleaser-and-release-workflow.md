@@ -1,7 +1,7 @@
 ---
 title: Packaging - goreleaser config + GitHub release workflow (both binaries, static, Linux multi-arch)
 slug: packaging-goreleaser-and-release-workflow
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: []
 ---

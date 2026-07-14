@@ -1,7 +1,7 @@
 ---
 title: Fix verify's sudoVector - it trusts the sudo exit code alone (the actual source of the no-uid-transition-egress false-alarm)
 slug: fix-verify-sudovector-exit-code
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: [30]
 ---

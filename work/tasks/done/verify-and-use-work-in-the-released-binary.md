@@ -1,7 +1,7 @@
 ---
 title: Make verify and use WORK in the released binary (the live probes are wrongly gated behind -tags integration)
 slug: verify-and-use-work-in-the-released-binary
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: [15, 16, 17, 18, 25]
 ---

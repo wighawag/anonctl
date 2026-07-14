@@ -1,7 +1,7 @@
 ---
 title: Standing per-UID default-deny so forcing-absent = dropped (fixes the reboot leak by construction)
 slug: fix-boot-invariant-nftables-not-enabled
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: [7, 26, 27]
 ---

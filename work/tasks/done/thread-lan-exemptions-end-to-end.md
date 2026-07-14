@@ -1,7 +1,7 @@
 ---
 title: Thread LAN exemptions end-to-end (CLI flag -> persisted config -> verifyParams) so the exemption verify assertions fire live
 slug: thread-lan-exemptions-end-to-end
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: [23, 25]
 ---

@@ -1,7 +1,7 @@
 ---
 title: The verify command (named assertions, non-zero exit, --json), the trust anchor
 slug: verify-command
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: [nftables-ruleset-install, lan-exemption]
 covers: [15, 16, 17, 18, 25]
 ---

@@ -1,7 +1,7 @@
 ---
 title: --allow requires an explicit port (drop the all-ports form) and rename --allow-direct -> --allow
 slug: allow-require-explicit-port-and-rename
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: []
 ---

@@ -1,7 +1,7 @@
 ---
 title: Fix anonctl verify - probes false-fail 5/9 assertions on a healthy account (they misuse the transparent relay)
 slug: fix-verify-probes-transparent-relay
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: [15, 16, 17, 25]
 ---

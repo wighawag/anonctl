@@ -1,7 +1,7 @@
 ---
 title: Grow verify with ICMP-drop and non-53-UDP (incl. QUIC/UDP-443) drop assertions
 slug: verify-icmp-and-non53-udp-drop-assertions
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: []
 ---

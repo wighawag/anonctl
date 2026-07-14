@@ -1,7 +1,7 @@
 ---
 title: Fix TestRmDisablesShimBeforeUserdel - it hits the real /etc/anonctl marker, so main is RED off-root
 slug: fix-rm-test-marker-isolation
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: [22]
 ---

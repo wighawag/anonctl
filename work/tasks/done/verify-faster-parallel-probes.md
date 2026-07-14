@@ -1,7 +1,7 @@
 ---
 title: Make verify faster - run the independent live probes in parallel and tighten the drop-detection timeouts
 slug: verify-faster-parallel-probes
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: [15, 18]
 ---

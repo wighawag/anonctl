@@ -1,7 +1,7 @@
 ---
 title: The narrow RFC1918 LAN exemption (exact host:port direct hole, private-only)
 slug: lan-exemption
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: [nftables-ruleset-install]
 covers: [23, 24]
 ---

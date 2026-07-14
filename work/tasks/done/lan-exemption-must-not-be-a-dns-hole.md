@@ -1,7 +1,7 @@
 ---
 title: The LAN exemption must never carry clear DNS (reject :53, and exclude 53 from the all-ports case) + verify it
 slug: lan-exemption-must-not-be-a-dns-hole
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: []
 ---

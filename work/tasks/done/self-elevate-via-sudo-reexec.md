@@ -1,7 +1,7 @@
 ---
 title: anonctl should self-elevate via sudo re-exec (CLI password prompt) instead of requiring a manual `sudo` prefix
 slug: self-elevate-via-sudo-reexec
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: []
 ---

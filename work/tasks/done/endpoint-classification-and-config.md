@@ -1,7 +1,7 @@
 ---
 title: Endpoint model, share-class classification, per-account isolation username, and socks-peruser sharing refusal
 slug: endpoint-classification-and-config
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: [manual-per-uid-recipe-validation]
 covers: [4, 5, 6, 7, 8]
 ---

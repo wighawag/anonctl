@@ -1,7 +1,7 @@
 ---
 title: anonctl use [<name>] - verify-then-shell safe front door (refuse to shell in if not anonymized)
 slug: anonctl-use-verify-then-shell
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: []
 ---

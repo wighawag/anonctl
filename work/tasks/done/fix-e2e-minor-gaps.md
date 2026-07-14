@@ -1,7 +1,7 @@
 ---
 title: Fix the minor e2e-validation gaps (leaked test seam, teardown residue, cosmetic message)
 slug: fix-e2e-minor-gaps
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: [22]
 ---

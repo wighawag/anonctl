@@ -1,7 +1,7 @@
 ---
 title: Harden the anon account against UID transition at add-time (no sudo, minimal PATH, nosuid guidance)
 slug: harden-anon-account-against-uid-transition
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: [empirical-uid-transition-escape-audit]
 covers: [30]
 ---

@@ -1,7 +1,7 @@
 ---
 title: Packaging - CI workflow running the unit gate on push/PR (anonctl has none)
 slug: packaging-ci-unit-gate-on-push
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: []
 ---

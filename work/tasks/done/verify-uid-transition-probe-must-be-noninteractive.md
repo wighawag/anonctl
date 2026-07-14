@@ -1,7 +1,7 @@
 ---
 title: verify's UID-transition probe must be non-interactive - pkexec pops a polkit prompt and false-flags on operator auth
 slug: verify-uid-transition-probe-must-be-noninteractive
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: [30]
 ---

@@ -1,7 +1,7 @@
 ---
 title: Fix verify FALSE-GREEN - the escaped-leak counter emits invalid nft for the no-port (all-TCP) closure probes
 slug: fix-verify-counter-false-green
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: [15, 17, 25]
 ---

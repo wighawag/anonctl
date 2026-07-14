@@ -1,7 +1,7 @@
 ---
 title: verify (and use) should show progress while probing - it currently prints nothing for several seconds
 slug: verify-progress-output
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: [15, 18]
 ---

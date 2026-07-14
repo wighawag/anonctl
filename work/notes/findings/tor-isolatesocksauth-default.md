@@ -13,7 +13,7 @@ source: |
 
 Tor's `IsolateSOCKSAuth` is **on by default** for every `SocksPort`. Two SOCKS connections that present **different** SOCKS authentication (username/password) are never placed on the same circuit, so each distinct SOCKS username gets its own circuit and (in general) its own exit relay. This is the mechanism anonctl relies on to make one shared host-wide Tor daemon safe to share across multiple anon accounts: dial Tor with a per-account `<account>@` SOCKS username (empty password) and each account is on its own circuit/exit, so two anonctl accounts on one Tor are not cross-identifiable.
 
-An **empty password** is sufficient: the username alone drives the isolation. The bare `<account>@` form the PRD specifies works.
+An **empty password** is sufficient: the username alone drives the isolation. The bare `<account>@` form the spec specifies works.
 
 ## External ground-truth (sources)
 
@@ -45,7 +45,7 @@ curl -s --socks5-hostname anon2:x@127.0.0.1:9050 https://check.torproject.org/ap
 curl -s --socks5-hostname anon:x@127.0.0.1:9050  https://check.torproject.org/api/ip
 #   -> {"IsTor":true,"IP":"45.84.107.33"}       <- SAME username -> SAME circuit/exit (stable)
 
-# EMPTY password form (the <account>@ the PRD specifies)
+# EMPTY password form (the <account>@ the spec specifies)
 curl -s --socks5-hostname "anon:@127.0.0.1:9050"        https://check.torproject.org/api/ip
 #   -> {"IsTor":true,"IP":"45.84.107.76"}
 curl -s --proxy "socks5h://anon@127.0.0.1:9050"         https://check.torproject.org/api/ip
@@ -58,4 +58,4 @@ Observed result: distinct SOCKS usernames land on distinct exits (`45.84.107.x` 
 
 ## Implication for anonctl
 
-The shim, when the endpoint is Tor (`tor-shared` share-class), must dial the SocksPort with SOCKS username = the account name (e.g. `anon`, `anon-<name>`) and an empty password. That is a **socks5h** dial (name resolved remotely by Tor). This is what makes a single host-wide Tor share-safe across accounts; a plain `socks-peruser` endpoint has no such per-username isolation and must be used by at most one account (per the PRD's endpoint share-class axis).
+The shim, when the endpoint is Tor (`tor-shared` share-class), must dial the SocksPort with SOCKS username = the account name (e.g. `anon`, `anon-<name>`) and an empty password. That is a **socks5h** dial (name resolved remotely by Tor). This is what makes a single host-wide Tor share-safe across accounts; a plain `socks-peruser` endpoint has no such per-username isolation and must be used by at most one account (per the spec's endpoint share-class axis).

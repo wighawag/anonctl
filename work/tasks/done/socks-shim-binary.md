@@ -1,7 +1,7 @@
 ---
 title: The static Go shim (transparent TCP-to-SOCKS relay + DNS-over-SOCKS-TCP forwarder)
 slug: socks-shim-binary
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: [manual-per-uid-recipe-validation]
 covers: [10, 11, 12, 14]
 ---

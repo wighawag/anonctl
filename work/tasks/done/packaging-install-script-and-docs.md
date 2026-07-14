@@ -1,7 +1,7 @@
 ---
 title: Packaging - install.sh + README install section (place both binaries, shim at /usr/local/bin)
 slug: packaging-install-script-and-docs
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: [packaging-goreleaser-and-release-workflow]
 covers: []
 ---

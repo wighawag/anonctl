@@ -1,7 +1,7 @@
 ---
 title: provision sudoRights (used by `anonctl status`) must use `sudo -n` too - it can still pop a prompt
 slug: status-sudo-probe-must-be-noninteractive
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: [30]
 ---

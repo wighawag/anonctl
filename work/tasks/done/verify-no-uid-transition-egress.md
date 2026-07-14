@@ -1,7 +1,7 @@
 ---
 title: verify assertion - best-effort no-uid-transition-egress (the enumerable escape vectors do not leak)
 slug: verify-no-uid-transition-egress
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: [empirical-uid-transition-escape-audit]
 covers: [30]
 ---

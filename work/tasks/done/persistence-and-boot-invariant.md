@@ -1,7 +1,7 @@
 ---
 title: Reboot persistence (nftables.service include + per-account anonctl-shim@ unit) and the boot invariant
 slug: persistence-and-boot-invariant
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: [account-provisioning-and-cli-skeleton, socks-shim-binary, nftables-ruleset-install, verify-command]
 covers: [19, 21, 26, 27]
 ---

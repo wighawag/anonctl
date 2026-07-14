@@ -1,6 +1,6 @@
 # CONTEXT: anonctl domain language
 
-The domain glossary for `anonctl`. Agents and skills use THIS vocabulary when naming modules, tests, and discussing the system. Architectural rationale lives in `docs/adr/` (decisions); product framing lives in `work/prds/`.
+The domain glossary for `anonctl`. Agents and skills use THIS vocabulary when naming modules, tests, and discussing the system. Architectural rationale lives in `docs/adr/` (decisions); product framing lives in `work/specs/`.
 
 ## What anonctl is
 
@@ -30,7 +30,7 @@ anonctl is a SETUP + VERIFY MANAGER, not a runtime wrapper: it is NOT in the dat
 - **add-time defaults**: anonctl's BOX-WIDE defaults under `/etc/anonctl/`, the values `add` falls back to when the operator names no flag, so a bare `anonctl add <name>` lands a ready-to-use account. Two of them, sourced differently: the **default home** is a directory-EXISTS convention (`/etc/anonctl/default-home/` present = seed a fresh account from it; there is NO config key, populate it with `sudo cp`), and the **default LAN exemptions** live in `/etc/anonctl/defaults.json` (`{"allow":[...]}`, root-owned). A CLI flag OVERRIDES a default; a default exemption is re-validated through the SAME `lanexempt` guardrail as the flag (a port is mandatory too), so it is never a quieter path to a leak. See ADR-0006 and ADR-0007.
 - **update / reconfigure**: the verb that changes an account's endpoint (`--endpoint`) and re-applies the rules FAIL-CLOSED, re-applying the nft rules (an atomic table replace: the default-DROP is never absent) BEFORE restarting the shim, so there is never a window of un-anonymized egress during a reconfigure.
 - **promptGuidance**: the per-repo NUDGE namespace in `.dorfl.json` whose members (currently just `testFirst`) strengthen the wording in the worker's in-band prompt. NOT a gate: the `verify` step is still the only acceptance bar. Omitted means off; absence is the default.
-- **work/ contract**: the on-disk system this repo uses, defined by the reference docs in **`work/protocol/`** (copied here by `setup`): `WORK-CONTRACT.md` (the contract), `CLAIM-PROTOCOL.md`, `REVIEW-PROTOCOL.md`, `task-template.md`, `prd-template.md`, `ADR-FORMAT.md`. Three REGIME umbrellas (`notes/` capture buckets, `tasks/` the build board, `prds/` the prd lifecycle) plus top-level `questions/` and `protocol/`. One markdown file per item, status = the folder it lives in (never a field). Capture buckets: `notes/ideas/` (proposed), `notes/observations/` (spotted, unverified, append-only), `notes/findings/` (verified external/domain ground truth, each with a `source:`). ADRs (`docs/adr/`, format in `work/protocol/ADR-FORMAT.md`) record what WE decided and why.
+- **work/ contract**: the on-disk system this repo uses, defined by the reference docs in **`work/protocol/`** (copied here by `setup`): `WORK-CONTRACT.md` (the contract), `CLAIM-PROTOCOL.md`, `REVIEW-PROTOCOL.md`, `task-template.md`, `spec-template.md`, `ADR-FORMAT.md`. Three REGIME umbrellas (`notes/` capture buckets, `tasks/` the build board, `specs/` the spec lifecycle) plus top-level `questions/` and `protocol/`. One markdown file per item, status = the folder it lives in (never a field). Capture buckets: `notes/ideas/` (proposed), `notes/observations/` (spotted, unverified, append-only), `notes/findings/` (verified external/domain ground truth, each with a `source:`). ADRs (`docs/adr/`, format in `work/protocol/ADR-FORMAT.md`) record what WE decided and why.
 
 ## Sibling tools (context, not dependencies)
 
@@ -45,5 +45,5 @@ Standing per-change rules agents must follow in this repo.
 
 ## Skills this repo uses
 
-- Required: `setup` (onboarding/migration), `to-prd`, `to-task`.
+- Required: `setup` (onboarding/migration), `to-spec`, `to-task`.
 - Recommended: `review`, `grill-me`.

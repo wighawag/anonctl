@@ -1,7 +1,7 @@
 ---
 title: Fix the release - install.sh is not published as a release asset, so the curl one-liner 404s
 slug: fix-release-ship-install-script-asset
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: []
 covers: []
 ---

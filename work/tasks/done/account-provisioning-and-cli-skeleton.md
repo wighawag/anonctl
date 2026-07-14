@@ -1,7 +1,7 @@
 ---
 title: CLI verb skeleton + account and shim-UID provisioning (add / rm / list / status)
 slug: account-provisioning-and-cli-skeleton
-prd: per-uid-kernel-anonymized-egress
+spec: per-uid-kernel-anonymized-egress
 blockedBy: [manual-per-uid-recipe-validation]
 covers: [1, 2, 3, 22]
 ---
@@ -32,7 +32,7 @@ The Go CLI skeleton and the account-provisioning half of `add`/`rm`, plus read-o
 
 > Goal: the anonctl CLI skeleton and the account + shim-UID provisioning behind `add`/`rm`, with read-only `list`/`status`. Stories 1, 2, 3, 22 of the `per-uid-kernel-anonymized-egress` prd. NO egress forcing here, that is `nftables-ruleset-install`.
 >
-> FIRST, check drift: read the recipe finding from `manual-per-uid-recipe-validation` (in `work/notes/findings/`) for the exact account + dedicated-shim-UID layout, and `work/prds/tasked/per-uid-kernel-anonymized-egress.md` for the verb vocabulary. If the recipe landed a different account/UID layout than assumed here, follow the recipe, not this prose.
+> FIRST, check drift: read the recipe finding from `manual-per-uid-recipe-validation` (in `work/notes/findings/`) for the exact account + dedicated-shim-UID layout, and `work/specs/tasked/per-uid-kernel-anonymized-egress.md` for the verb vocabulary. If the recipe landed a different account/UID layout than assumed here, follow the recipe, not this prose.
 >
 > Domain vocabulary: `anon` is the default account, `anon-<name>` are named ones; anonctl OWNS this generic naming. Each account has its OWN dedicated shim UID (a separate service account) so that later only the shim UID, never the anon UID, may reach the upstream endpoint. anonctl APPLIES changes itself as root (the ufw stance), so provisioning runs privileged.
 >
