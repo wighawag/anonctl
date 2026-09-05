@@ -1,12 +1,12 @@
+<!-- SOURCE OF RECORD for the card, with LIVE TEXT; preview.svg is this file
+     with both strings outlined, and that is what the build renders.
+     Built deliberately AWAY from sibling memonaut, which owns plate #12141a,
+     muted #8e97a8, a bottom-left radial accent glow and a 120x6 accent rule
+     under the wordmark. This card: its own near-black plate, NO glow, NO rule
+     (so the mark's green path is the only accent object anywhere), and ring-arc
+     texture, which is this mark's own motif rather than a sibling's. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640">
-  <defs>
-    <radialGradient id="glow" cx="18%" cy="82%" r="62%">
-      <stop offset="0" stop-color="#2fbf71" stop-opacity="0.16"/>
-      <stop offset="1" stop-color="#2fbf71" stop-opacity="0"/>
-    </radialGradient>
-  </defs>
-  <rect width="1280" height="640" fill="#12141a"/>
-  <rect width="1280" height="640" fill="url(#glow)"/>
+  <rect width="1280" height="640" fill="#0c1310"/>
 
   <g stroke="#eef1f6" fill="none" opacity="0.05" stroke-linecap="round">
     <g transform="translate(1000,8) scale(1.05)">
@@ -26,7 +26,6 @@
     <path d="M138 140 V204 H236" fill="none" stroke="#2fbf71" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
   </g>
 
-  <text x="532.93" y="338.9" style="font-family:'Outfit SemiBold';font-size:180.9955px;fill:#eef1f6">anonctl</text>
-  <rect x="538" y="369" width="120" height="6" rx="3" fill="#2fbf71"/>
-  <text x="537.45" y="421.03" style="font-family:'Outfit SemiBold';font-size:27.7072px;fill:#8e97a8">An anonymous identity per Unix account, proven</text>
+  <text x="532.93" y="354.76" style="font-family:'Outfit SemiBold';font-size:180.9955px;fill:#eef1f6">anonctl</text>
+  <text x="537.45" y="410.63" style="font-family:'Outfit SemiBold';font-size:27.7072px;fill:#94a3b8">An anonymous identity per Unix account, proven</text>
 </svg>

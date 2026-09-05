@@ -30,6 +30,8 @@ Run `./build.sh` to regenerate everything. It is deterministic: two runs produce
 - **The `a`'s descender is short on purpose.** An earlier version ran it further down and the mark read as a **q**; making the spiral flow continuously out of the stem (the way a drawn `@` really is built) read as a **9**. Both are in `concepts/sheet17.png` and `concepts/sheet18.png`.
 - **The green leaves through the ring's gap and crosses the ring nowhere else.** That is the fail-closed shape: one hole, everything else sealed. Routing it across the arc would say the opposite of what the tool does.
 - **The card's safe margin is 40px and nothing crosses it**, including the faint texture rings. One of them originally did.
+- **The card has no accent rule under the wordmark and no accent glow, and the plate is `#0c1310`, not `#12141a`.** All three are deliberate distance from sibling project **memonaut**, which owns amber on a `#12141a` plate with a bottom-left radial glow and a 120x6 accent rule. The first version of this card followed the same default layout table memonaut had followed and came out looking like memonaut in green. Dropping the rule also means the mark's green path is the only accent object anywhere on the card, which is the stricter stance sibling **netcage** takes.
+- **The card texture is ring arcs, this mark's own motif.** netcage's texture is lanes and memonaut's is rounded-rect outlines; reusing either would make this card read as theirs.
 - **`build.sh` fails before rendering if the three files' mark geometry diverges.** The same three path strings live in `logo.svg`, `icon.svg` and `preview.src.svg` because each needs different ink and framing. Do not "simplify" the check away; verify it still fires by perturbing one number and running the build.
 
 ## Palette
@@ -39,10 +41,10 @@ Run `./build.sh` to regenerate everything. It is deterministic: two runs produce
 | Accent (the forced path) | `#2fbf71` |
 | Ink, light background | `#0f172a` |
 | Ink, dark background / card | `#eef1f6` |
-| Card plate | `#12141a` |
-| Muted (tagline) | `#8e97a8` |
+| Card plate | `#0c1310` |
+| Muted (tagline) | `#94a3b8` |
 
-Deliberately **not** Tor purple. anonctl is endpoint-agnostic (Tor is only the default endpoint), so wearing Tor's colour would be a claim the tool does not make.
+Deliberately **not** Tor purple. anonctl is endpoint-agnostic (Tor is only the default endpoint), so wearing Tor's colour would be a claim the tool does not make. It is also clear of the siblings' accents: netcage cyan `#06b6d4`, memonaut amber `#ffb020`, anonseed violet `#8b5cf6`. Per-project accent on a shared dark plate is this family's convention.
 
 ## Type, and how to re-derive it
 
@@ -55,7 +57,7 @@ Solved values (sizes are solved to a measured **ink box**, never to a nominal po
 | `anonctl` | 600 px | `180.9955px` | text `x=532.93 y=338.9` (ink starts x=538) |
 | `An anonymous identity per Unix account, proven` | 600 px | `27.7072px` | text `x=537.45 y=421.03` (ink starts x=538, ink top y=401) |
 
-Both strings are set to the same 600px ink width so the type block has one left edge and one right edge, tied together by the accent rule (120x6 at x=538, y=369).
+Both strings are set to the same 600px ink width so the type block has one left edge and one right edge. There is deliberately no accent rule between them (see above); the shared 600px width is what ties the block together. The two-line block is 192px tall and centred on y=320, like the mark.
 
 Re-derive after any copy change (three iterations converge, since text width is linear in size):
 
