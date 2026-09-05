@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640">
+  <defs>
+    <radialGradient id="glow" cx="18%" cy="82%" r="62%">
+      <stop offset="0" stop-color="#2fbf71" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#2fbf71" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1280" height="640" fill="#12141a"/>
+  <rect width="1280" height="640" fill="url(#glow)"/>
+
+  <g stroke="#eef1f6" fill="none" opacity="0.05" stroke-linecap="round">
+    <g transform="translate(1000,8) scale(1.05)">
+      <path d="M120 180 A66 66 0 1 1 174 142" stroke-width="18"/>
+    </g>
+    <g transform="translate(880,398) scale(0.62)">
+      <path d="M120 180 A66 66 0 1 1 174 142" stroke-width="18"/>
+    </g>
+    <g transform="translate(1090,300) scale(0.4)">
+      <path d="M120 180 A66 66 0 1 1 174 142" stroke-width="18"/>
+    </g>
+  </g>
+
+  <g transform="translate(78.9,116.9) scale(1.6185)" style="color: #eef1f6">
+    <path d="M120 180 A66 66 0 1 1 174 142" fill="none" stroke="currentColor" stroke-width="18" stroke-linecap="round"/>
+    <path d="M138 140 V96 a10 10 0 0 0 -10 -10 H98 a10 10 0 0 0 -10 10 V120 a10 10 0 0 0 10 10 H130" fill="none" stroke="currentColor" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M138 140 V204 H236" fill="none" stroke="#2fbf71" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <text x="532.93" y="338.9" style="font-family:'Outfit SemiBold';font-size:180.9955px;fill:#eef1f6">anonctl</text>
+  <rect x="538" y="369" width="120" height="6" rx="3" fill="#2fbf71"/>
+  <text x="537.45" y="421.03" style="font-family:'Outfit SemiBold';font-size:27.7072px;fill:#8e97a8">An anonymous identity per Unix account, proven</text>
+</svg>

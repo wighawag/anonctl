@@ -1,4 +1,6 @@
-# anonctl
+<div align="center">
+<a href="https://github.com/wighawag/anonctl"><img alt="anonctl: an anonymous identity per Unix account, proven" src="https://raw.githubusercontent.com/wighawag/anonctl/main/media/preview.png" width="640" /></a>
+</div>
 
 **Give one Unix account a leak-proof internet connection.** anonctl forces everything that account does (a shell, any tool, an editor, a script) through an anonymizer like Tor, enforced by the Linux kernel, fail-closed: if the anonymizer is down, that account's traffic is dropped, never sent in the clear. It ships a `verify` command that PROVES the account is anonymized instead of asking you to trust it.
 

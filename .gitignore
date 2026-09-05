@@ -4,3 +4,6 @@
 
 # goreleaser build output
 /dist/
+
+# fontconfig cache written by media/build.sh (vendored-font lookup, not an asset)
+/media/.fc/

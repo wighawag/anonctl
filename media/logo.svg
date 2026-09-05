@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="38 38 207 175" width="207" height="175" style="color: #0f172a" role="img" aria-label="anonctl">
+  <path d="M120 180 A66 66 0 1 1 174 142" fill="none" stroke="currentColor" stroke-width="18" stroke-linecap="round"/>
+  <path d="M138 140 V96 a10 10 0 0 0 -10 -10 H98 a10 10 0 0 0 -10 10 V120 a10 10 0 0 0 10 10 H130" fill="none" stroke="currentColor" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M138 140 V204 H236" fill="none" stroke="#2fbf71" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
