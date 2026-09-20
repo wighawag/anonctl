@@ -46,6 +46,17 @@ An anon account's forcing must SURVIVE a reboot and re-apply FAIL-CLOSED, with n
 
 - **The shim's path is resolved from the ACTUAL install location** (sibling of the running `anonctl`, then `$PATH`, then the conventional `/usr/local/bin/anonctl-shim` if it really exists), closing a second FHS assumption: the unit used to hard-code `/usr/local/bin/anonctl-shim` regardless of `$PREFIX`, which `install.sh` compensated for by symlinking that path. That workaround is gone, and a custom `PREFIX` now simply works. `verify`'s own anon-UID probe uses the SAME resolution, because a probe pinned to `/usr/local/bin` would leave the trust anchor unusable on precisely the hosts this change targets.
 
+- **The resolved path is baked VERBATIM: never resolve the symlink.** This is a second, delayed-action form of the same fail-open bug, and it is easy to reintroduce while "tidying up" the code. On NixOS every tool has two absolute paths:
+
+  ```
+  /run/current-system/sw/bin/nft                            <- STABLE: repointed on every rebuild
+  /nix/store/<hash>-nftables-1.1.6/bin/nft                  <- what EvalSymlinks/realpath/readlink -f gives
+  ```
+
+  `exec.LookPath` returns the `$PATH` entry verbatim, which is the stable one, and `filepath.Abs` preserves it (it only `Clean`s an already-absolute path). `filepath.EvalSymlinks` would return the store path, which is correct on the day it is written and WRONG the moment the package is updated or the system rebuilt: the old store path is garbage-collected, `ExecStart` points at a file that no longer exists, the loader fails `203/EXEC`, and the account is silently unjailed with no baseline default-deny. That failure would surface weeks after the install with nothing in the config having changed, which makes it far harder to diagnose than the original bug. On Debian `LookPath` yields `/usr/sbin/nft` and the identical code works, so this is one code path, not a distro branch. Pinned by `TestResolverBinaryNeverBakesAResolvedSymlinkTarget`.
+
+  The same trap catches the SHIM by a different route: `os.Executable()` resolves symlinks (it reads `/proc/self/exe`), so the "sibling of the running anonctl" rule yields a store path whenever anonctl is itself invoked through a stable symlink, which is the normal shape of a Nix-packaged install. `Resolver.preferStableAlias` therefore swaps in a `$PATH` entry when one names the SAME file (compared by inode; the resolved target is never returned), and keeps the sibling when `$PATH` holds a genuinely different binary, preserving version coherence between `anonctl` and `anonctl-shim`.
+
   `/bin/sh` in the loader's `ExecStart` is the one path still written literally. It exists on both targets (it is the last surviving entry in NixOS's `/bin`), and resolving it would be circular, since the resolution itself needs a shell-free absolute path. Noted so the "every binary is resolved" claim above is read precisely.
 
 ## Teardown ordering (amended from the e2e finding, BUG 1)

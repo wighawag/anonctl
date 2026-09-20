@@ -139,6 +139,114 @@ func TestIsUnitEnabledReportsAbsentAndForeignLinksAsNotEnabled(t *testing.T) {
 // /usr/bin/setpriv and /usr/sbin/nft do not exist on NixOS, and a unit carrying them
 // fails at boot. For the loader that failure is fail-OPEN.
 
+// THE GARBAGE-COLLECTION TIME BOMB. On NixOS every tool has two absolute paths: the
+// stable /run/current-system/sw/bin/<tool> symlink that each rebuild repoints, and
+// the /nix/store/<hash>-.../bin/<tool> path it currently points at. Baking the store
+// path works today and breaks the moment the package is updated or the system is
+// rebuilt: the old store path is garbage-collected, ExecStart points at a file that
+// no longer exists, the loader fails 203/EXEC, and the account is silently unjailed
+// with no baseline default-deny -- weeks later, with nothing in the config changed.
+//
+// exec.LookPath returns the $PATH entry VERBATIM, which is the stable one. This test
+// pins that anonctl never "tidies it up" by resolving it (EvalSymlinks/realpath).
+func TestResolverBinaryNeverBakesAResolvedSymlinkTarget(t *testing.T) {
+	root := t.TempDir()
+	// Mimic the NixOS layout: a real binary in a content-addressed "store", reached
+	// through a stable symlink dir.
+	store := filepath.Join(root, "nix", "store", "abc123-nftables-1.1.6", "bin")
+	stable := filepath.Join(root, "run", "current-system", "sw", "bin")
+	if err := os.MkdirAll(store, 0o755); err != nil {
+		t.Fatalf("mkdir store: %v", err)
+	}
+	if err := os.MkdirAll(stable, 0o755); err != nil {
+		t.Fatalf("mkdir stable: %v", err)
+	}
+	realBin := filepath.Join(store, "nft")
+	if err := os.WriteFile(realBin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write bin: %v", err)
+	}
+	stableBin := filepath.Join(stable, "nft")
+	if err := os.Symlink(realBin, stableBin); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	// A $PATH lookup yields the STABLE symlink, exactly as exec.LookPath does.
+	r := systemd.Resolver{Look: func(string) (string, error) { return stableBin, nil }}
+	got, err := r.Binary(systemd.NftBinaryName)
+	if err != nil {
+		t.Fatalf("Binary: %v", err)
+	}
+	if got != stableBin {
+		t.Errorf("Binary must return the $PATH entry VERBATIM (%q), got %q", stableBin, got)
+	}
+	if got == realBin {
+		t.Error("Binary resolved the symlink and would bake a garbage-collectable store path into the unit")
+	}
+}
+
+// os.Executable() RESOLVES symlinks (/proc/self/exe on Linux), so the "sibling of
+// the running anonctl" rule yields a store path whenever anonctl is itself invoked
+// through a stable symlink -- the normal case on NixOS. When a $PATH entry names the
+// SAME file, prefer it: it is the administrator-facing alias and survives rebuilds.
+func TestResolverShimPrefersAStablePathAliasOverAResolvedSibling(t *testing.T) {
+	root := t.TempDir()
+	store := filepath.Join(root, "nix", "store", "abc123-anonctl", "bin")
+	stable := filepath.Join(root, "run", "current-system", "sw", "bin")
+	for _, d := range []string{store, stable} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	realShim := filepath.Join(store, systemd.ShimBinaryName)
+	if err := os.WriteFile(realShim, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write shim: %v", err)
+	}
+	stableShim := filepath.Join(stable, systemd.ShimBinaryName)
+	if err := os.Symlink(realShim, stableShim); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	r := systemd.Resolver{
+		// os.Executable would hand back the RESOLVED store path.
+		Executable: func() (string, error) { return filepath.Join(store, "anonctl"), nil },
+		Look:       func(string) (string, error) { return stableShim, nil },
+	}
+	got, err := r.ShimBinary()
+	if err != nil {
+		t.Fatalf("ShimBinary: %v", err)
+	}
+	if got != stableShim {
+		t.Errorf("ShimBinary should prefer the stable $PATH alias %q, got %q (a store path is garbage-collected on the next rebuild)", stableShim, got)
+	}
+}
+
+// The stable-alias preference must NOT hijack a genuinely different binary: when the
+// $PATH entry is a DIFFERENT file, the sibling wins (version coherence between
+// anonctl and its shim).
+func TestResolverShimKeepsTheSiblingWhenPathHoldsADifferentBinary(t *testing.T) {
+	prefix := t.TempDir()
+	other := t.TempDir()
+	sibling := filepath.Join(prefix, systemd.ShimBinaryName)
+	if err := os.WriteFile(sibling, []byte("#!/bin/sh\n# ours\n"), 0o755); err != nil {
+		t.Fatalf("write sibling: %v", err)
+	}
+	stale := filepath.Join(other, systemd.ShimBinaryName)
+	if err := os.WriteFile(stale, []byte("#!/bin/sh\n# stale\n"), 0o755); err != nil {
+		t.Fatalf("write stale: %v", err)
+	}
+	r := systemd.Resolver{
+		Executable: func() (string, error) { return filepath.Join(prefix, "anonctl"), nil },
+		Look:       func(string) (string, error) { return stale, nil },
+	}
+	got, err := r.ShimBinary()
+	if err != nil {
+		t.Fatalf("ShimBinary: %v", err)
+	}
+	if got != sibling {
+		t.Errorf("ShimBinary should keep the sibling %q when $PATH holds a DIFFERENT binary, got %q", sibling, got)
+	}
+}
+
 func TestResolverBinaryReturnsAnAbsolutePath(t *testing.T) {
 	r := systemd.Resolver{
 		Look: func(name string) (string, error) { return "/nix/store/xyz/bin/" + name, nil },

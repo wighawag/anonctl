@@ -60,6 +60,45 @@ func TestInstallTemplateWritesTheUnitAndLoader(t *testing.T) {
 	}
 }
 
+// The unit dir does NOT exist on either target distro before anonctl runs:
+// /usr/local/lib/systemd/system is absent on a stock NixOS (where /usr/local does
+// not exist at all) and on a stock Debian. anonctl must CREATE it, including its
+// parents, rather than assume it.
+func TestInstallCommonCreatesAMissingUnitDirIncludingParents(t *testing.T) {
+	root := t.TempDir()
+	s := systemd.Store{
+		// Deliberately several levels deep and absent, mirroring usr/local/lib/systemd/system.
+		UnitDir:       filepath.Join(root, "usr", "local", "lib", "systemd", "system"),
+		EnvDir:        filepath.Join(root, "shim"),
+		RulesDir:      filepath.Join(root, "nftables"),
+		LegacyUnitDir: filepath.Join(root, "legacy-systemd"),
+	}
+	if _, err := os.Stat(s.UnitDir); !os.IsNotExist(err) {
+		t.Fatal("precondition: the unit dir must not exist yet")
+	}
+	tp, lp := scratchParams()
+	if err := s.InstallCommon(tp, lp); err != nil {
+		t.Fatalf("InstallCommon must create a missing unit dir: %v", err)
+	}
+	for _, name := range []string{systemd.UnitName, systemd.LoaderUnitName} {
+		if _, err := os.Stat(filepath.Join(s.UnitDir, name)); err != nil {
+			t.Errorf("unit %s not written into the created dir: %v", name, err)
+		}
+	}
+	// It must be world-traversable, as systemd expects for a unit dir.
+	info, err := os.Stat(s.UnitDir)
+	if err != nil {
+		t.Fatalf("stat unit dir: %v", err)
+	}
+	if info.Mode().Perm()&0o055 != 0o055 {
+		t.Errorf("unit dir mode %o is not world-readable/traversable; systemd must be able to read it", info.Mode().Perm())
+	}
+	// Enabling must likewise create the .wants dir rather than assume it.
+	if err := s.EnableUnit(systemd.LoaderUnitName, systemd.LoaderUnitName, systemd.LoaderWantedBy); err != nil {
+		t.Fatalf("EnableUnit must create a missing .wants dir: %v", err)
+	}
+}
+
 func TestWriteAccountPersistsEnvAndRuleFile(t *testing.T) {
 	s := scratchStore(t)
 	c := sampleConfig()

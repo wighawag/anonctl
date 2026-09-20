@@ -23,6 +23,7 @@ One mechanism runs on both distros, so every Debian test run exercises the NixOS
 **Two ordering rules are load-bearing, and both were found by review rather than by construction.** They are recorded here because both failures are invisible until a reboot:
 
 - *Resolve before mutating.* Resolution originally ran after the account was created and the live rules applied. Aborting there left an account that EXISTS with no unit installed, so the next boot loaded neither the baseline nor the forcing and the anon UID egressed with the host's real IP. That is strictly WORSE than the pre-0.4 behaviour it replaced, where a missing shim still left an enabled loader and the account was merely dropped. Resolution now runs in `runAdd` before `provision.Add` (`systemd.PreflightUnitBinaries`) and again at the top of `forcing.Install` before any mutation.
+- *Bake the `$PATH` entry verbatim; never resolve the symlink.* A delayed-action form of the same fail-open bug, flagged downstream before it could ship. On NixOS `/run/current-system/sw/bin/nft` is repointed on every rebuild and stays valid, while the `/nix/store/<hash>-.../bin/nft` that `EvalSymlinks`/`realpath` returns is garbage-collected on the next update, leaving `ExecStart` pointing at a missing file (`203/EXEC`), the loader dead, and the account unjailed WEEKS after the install with nothing in the config changed. `exec.LookPath` returns the `$PATH` entry verbatim and `filepath.Abs` preserves it, so the existing code was already correct, but `os.Executable` is NOT (it resolves `/proc/self/exe`), so the shim's sibling rule would have baked a store path for any symlink-invoked install. `Resolver.preferStableAlias` closes that, and `TestResolverBinaryNeverBakesAResolvedSymlinkTarget` pins the rule so it cannot be "tidied up" later.
 - *Enable before migrating, and adopt rather than delete.* The legacy sweep matches every `anonctl-shim@*.service` link, but `add` re-creates only the account being added, so a delete-only sweep silently de-enabled every OTHER account on a multi-account host: shims keep running, nothing looks wrong, and they never start after the next reboot. And migrating before enabling could leave the loader enabled in neither location if interrupted.
 
 **The shim's path is resolved from the real install location** (sibling of the running anonctl, then `$PATH`, then the conventional path if it exists), closing the second FHS assumption: the unit used to hard-code `/usr/local/bin/anonctl-shim` regardless of `$PREFIX`. `install.sh`'s compensating symlink was removed, and it now warns when `nft` or `setpriv` is absent.
@@ -44,12 +45,24 @@ One mechanism runs on both distros, so every Debian test run exercises the NixOS
 - [x] The migration leaves foreign units and foreign enablement symlinks untouched.
 - [x] Tests never touch the real `DefaultUnitDir` or the real legacy dir: `Store.LegacyUnitDir` is a field, and the integration test asserts both point at scratch.
 - [x] `gofmt` / `go vet` / `go build` / `go test ./...` green, and `go test -tags integration ./internal/systemd/` green (real `systemd-analyze verify` parses the generated units).
+- [x] The baked path is the `$PATH` entry verbatim, never a resolved symlink target; verified against the pre-fix behaviour by swapping in `EvalSymlinks` and watching the test fail.
+- [x] The unit dir and the `.wants` dir are CREATED when missing, including parents (neither exists on a stock Debian or NixOS), and the unit dir is world-traversable.
 - [ ] **NOT DISCHARGED: a real NixOS host runs `add`, `rm`, `verify`, and the forcing survives an actual reboot.** See below.
 
 ## What is NOT discharged
 
 **No part of the live acceptance has been run.** The session that built this had `no_new_privs` set, so `sudo` could not run: no root, no install, no reboot. The spec's acceptance explicitly demands proof by rebooting rather than by reasoning about unit paths, and that proof does not exist yet. What IS established is read-only measurement on a NixOS host plus a user-scope experiment (recorded in `work/notes/findings/systemd-enablement-target-and-nixos-fhs-gaps.md`), and a green unit + integration suite.
 
-Also blocking a live run: `nft` is not on `PATH` on telemaque at all, so that host needs nftables available (e.g. `networking.nftables.enable`) before `anonctl add` can succeed. With this change that now fails loudly at `add` instead of silently at boot, which is the intended behaviour.
+`nft` WAS missing on telemaque and is now installed (`pkgs.nftables` in systemPackages, my-boxes commit `62ac30a`), so that blocker is gone. Confirmed with the real resolver on the box:
+
+```
+nft      -> /run/current-system/sw/bin/nft
+setpriv  -> /run/current-system/sw/bin/setpriv
+preflight: cannot find the "anonctl-shim" binary (...); install it before forcing an account
+```
+
+Both are the STABLE aliases, not store paths. The preflight refusal is correct behaviour: anonctl-shim is not installed on that host yet, and the refusal happens before any account would be created.
+
+The remaining blocker is privilege, not the host: the session still has `NoNewPrivs: 1`, so `sudo` cannot run and no install, no `add`/`rm`/`verify` and no reboot can be performed from here. The live gate must be run by a human with root.
 
 Remaining follow-up work is tracked in `work/tasks/ready/verify-boot-enablement-and-loader-health.md`.

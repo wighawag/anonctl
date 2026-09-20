@@ -343,6 +343,22 @@ func (r Resolver) executable() (string, error) {
 // `add` fails at install time rather than emitting a unit that dies at the next
 // boot. It never falls back to a conventional FHS path: that is precisely the
 // assumption that produced a fail-open loader on NixOS.
+//
+// NEVER RESOLVE THE SYMLINK. exec.LookPath returns the $PATH entry VERBATIM, and
+// that is exactly what must be baked into the unit. On NixOS every tool has two
+// absolute paths:
+//
+//	/run/current-system/sw/bin/nft                      <- STABLE: repointed on every rebuild
+//	/nix/store/<hash>-nftables-1.1.6/bin/nft            <- what EvalSymlinks/realpath gives
+//
+// The store path is correct today and WRONG the moment nftables is updated or the
+// system is rebuilt: the old store path is garbage-collected, ExecStart points at a
+// file that no longer exists, the loader fails 203/EXEC, and the account is silently
+// unjailed with no baseline default-deny -- weeks after the install, with nothing in
+// the config having changed. filepath.Abs is safe here (it only Cleans an already
+// absolute path); filepath.EvalSymlinks would NOT be. On Debian LookPath yields
+// /usr/sbin/nft and the same code works, so this is one code path, not a distro
+// branch.
 func (r Resolver) Binary(name string) (string, error) {
 	path, err := r.look(name)
 	if err != nil {
@@ -355,6 +371,46 @@ func (r Resolver) Binary(name string) (string, error) {
 	return abs, nil
 }
 
+// preferStableAlias returns a $PATH entry that refers to the SAME FILE as candidate,
+// when one exists, and otherwise candidate unchanged.
+//
+// This exists because os.Executable() RESOLVES symlinks (it reads /proc/self/exe on
+// Linux). So when anonctl is itself invoked through a symlink -- which is the normal
+// case on NixOS, where /run/current-system/sw/bin/anonctl points into the store --
+// the "sibling of the running binary" rule yields a /nix/store/... path. Baking that
+// into a unit is the garbage-collection time bomb described on Binary above. If a
+// $PATH entry names the same inode, it is the administrator-facing alias and stays
+// valid across rebuilds, so prefer it.
+//
+// It is a general rule, not a NixOS branch: on Debian the sibling and the $PATH entry
+// are usually the same path already, so this changes nothing there. Note it compares
+// by inode and only ever RETURNS one of the two unresolved paths; it never bakes the
+// resolved target.
+func (r Resolver) preferStableAlias(candidate string) string {
+	onPath, err := r.look(ShimBinaryName)
+	if err != nil {
+		return candidate
+	}
+	if abs, aerr := filepath.Abs(onPath); aerr == nil && sameFile(abs, candidate) {
+		return abs
+	}
+	return candidate
+}
+
+// sameFile reports whether two paths name the same file, following symlinks. Used
+// only for COMPARISON; the resolved path is never returned or baked.
+func sameFile(a, b string) bool {
+	fa, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	fb, err := os.Stat(b)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(fa, fb)
+}
+
 // ShimBinary resolves the shim binary the template unit's ExecStart runs. It tries,
 // in order: the SIBLING of the running anonctl executable, then $PATH, then
 // DefaultShimBinaryPath if that file actually exists. The sibling rule comes first
@@ -363,11 +419,14 @@ func (r Resolver) Binary(name string) (string, error) {
 // work without the operator hand-editing the unit. The old behaviour (hard-code
 // /usr/local/bin/anonctl-shim regardless of PREFIX) is the fallback of last resort,
 // and only when the file is really there.
+// The sibling candidate is passed through preferStableAlias, because os.Executable
+// resolves symlinks and would otherwise hand back a garbage-collectable store path
+// on NixOS.
 func (r Resolver) ShimBinary() (string, error) {
 	if self, err := r.executable(); err == nil && self != "" {
 		sibling := filepath.Join(filepath.Dir(self), ShimBinaryName)
 		if st, serr := os.Stat(sibling); serr == nil && !st.IsDir() {
-			return sibling, nil
+			return r.preferStableAlias(sibling), nil
 		}
 	}
 	if path, err := r.look(ShimBinaryName); err == nil {
