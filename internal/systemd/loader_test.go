@@ -15,8 +15,48 @@ import (
 // loader, ordered EARLY (before the network is up) so the standing baseline
 // default-deny is present from the first moment the anon UID could act.
 
+// testNftPath is a stand-in for the ABSOLUTE nft path the resolver bakes in at
+// install time. It is deliberately NOT /usr/sbin/nft: that FHS path does not exist
+// on NixOS, and a loader unit carrying it fails at boot, which leaves the anon UID
+// with no baseline default-deny at all (fail-OPEN).
+const testNftPath = "/nix/store/fake-nftables/bin/nft"
+
+func mustLoaderUnit(t *testing.T, p systemd.LoaderParams) string {
+	t.Helper()
+	if p.NftPath == "" {
+		p.NftPath = testNftPath
+	}
+	unit, err := systemd.LoaderUnit(p)
+	if err != nil {
+		t.Fatalf("LoaderUnit: %v", err)
+	}
+	return unit
+}
+
+// The loader unit must never be generated with an unresolved nft path. This is the
+// fail-OPEN guard: the loader is what installs the standing baseline default-deny at
+// boot, so a unit that cannot run nft means the anon UID egresses freely with the
+// host's real IP, silently, after every reboot.
+func TestLoaderUnitRefusesWithoutAResolvedNftPath(t *testing.T) {
+	if _, err := systemd.LoaderUnit(systemd.LoaderParams{RulesGlob: "/etc/anonctl/nftables/*.nft"}); err == nil {
+		t.Fatal("LoaderUnit must refuse to generate without a resolved nft path (a unit that cannot load rules is fail-OPEN at boot)")
+	}
+}
+
+// The generated unit must carry the RESOLVED absolute nft path, not a hard-coded
+// FHS guess.
+func TestLoaderUnitBakesInTheResolvedNftPath(t *testing.T) {
+	unit := mustLoaderUnit(t, systemd.LoaderParams{NftPath: testNftPath})
+	if !strings.Contains(unit, testNftPath) {
+		t.Errorf("loader unit must invoke the RESOLVED nft path %q:\n%s", testNftPath, unit)
+	}
+	if strings.Contains(unit, "/usr/sbin/nft") {
+		t.Errorf("loader unit must not hard-code /usr/sbin/nft (absent on NixOS):\n%s", unit)
+	}
+}
+
 func TestLoaderUnitIsAnonctlOwnedAndEarly(t *testing.T) {
-	unit := systemd.LoaderUnit(systemd.LoaderParams{RulesGlob: "/etc/anonctl/nftables/*.nft"})
+	unit := mustLoaderUnit(t, systemd.LoaderParams{RulesGlob: "/etc/anonctl/nftables/*.nft"})
 	// A oneshot that loads the rules once at boot (RemainAfterExit so systemd tracks
 	// it as active after the load).
 	if !strings.Contains(unit, "Type=oneshot") {
@@ -41,7 +81,7 @@ func TestLoaderUnitIsAnonctlOwnedAndEarly(t *testing.T) {
 }
 
 func TestLoaderUnitLoadsAnonctlRulesNotAHostService(t *testing.T) {
-	unit := systemd.LoaderUnit(systemd.LoaderParams{RulesGlob: "/etc/anonctl/nftables/*.nft"})
+	unit := mustLoaderUnit(t, systemd.LoaderParams{RulesGlob: "/etc/anonctl/nftables/*.nft"})
 	// It loads anonctl's OWN per-account rule files (both the baseline and the
 	// forcing tables) via nft, independent of the host's nftables.service.
 	if !strings.Contains(unit, "ExecStart") {
@@ -61,7 +101,7 @@ func TestLoaderUnitLoadsAnonctlRulesNotAHostService(t *testing.T) {
 }
 
 func TestLoaderUnitToleratesEmptyRulesDir(t *testing.T) {
-	unit := systemd.LoaderUnit(systemd.LoaderParams{})
+	unit := mustLoaderUnit(t, systemd.LoaderParams{})
 	// An empty/absent rules dir must be a clean no-op at boot (the `for` over a
 	// possibly-empty glob), so boot never fails when no account is forced. It
 	// defaults the glob when none is passed.

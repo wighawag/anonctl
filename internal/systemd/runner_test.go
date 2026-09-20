@@ -27,24 +27,34 @@ func (r *fakeRunner) last() string {
 	return strings.Join(r.calls[len(r.calls)-1], " ")
 }
 
-func TestEnableNowEnablesAndStartsTheInstance(t *testing.T) {
+// Starting is now SEPARATE from enabling: `systemctl start` brings the instance up
+// now, while "comes back after a reboot" is anonctl's own .wants symlink
+// (Store.EnableUnit). The split exists because `systemctl enable` writes into
+// /etc/systemd/system whatever the unit dir is, and that dir is read-only on NixOS.
+func TestStartNowStartsTheInstanceWithoutEnabling(t *testing.T) {
 	r := &fakeRunner{}
-	if err := systemd.EnableNow(context.Background(), r, "anon"); err != nil {
-		t.Fatalf("EnableNow: %v", err)
+	if err := systemd.StartNow(context.Background(), r, "anon"); err != nil {
+		t.Fatalf("StartNow: %v", err)
 	}
-	// `enable --now` on the per-account instance: it comes up now AND after a reboot.
-	if got := r.last(); got != "systemctl enable --now anonctl-shim@anon.service" {
-		t.Errorf("EnableNow ran %q", got)
+	if got := r.last(); got != "systemctl start anonctl-shim@anon.service" {
+		t.Errorf("StartNow ran %q", got)
+	}
+	// It must NOT shell out to `systemctl enable`, which cannot work on a host whose
+	// config dir is read-only.
+	for _, call := range r.calls {
+		if strings.Contains(strings.Join(call, " "), "enable") {
+			t.Errorf("StartNow must not call systemctl enable: %q", call)
+		}
 	}
 }
 
-func TestDisableNowDisablesAndStopsTheInstance(t *testing.T) {
+func TestStopNowStopsTheInstanceWithoutDisabling(t *testing.T) {
 	r := &fakeRunner{}
-	if err := systemd.DisableNow(context.Background(), r, "anon-work"); err != nil {
-		t.Fatalf("DisableNow: %v", err)
+	if err := systemd.StopNow(context.Background(), r, "anon-work"); err != nil {
+		t.Fatalf("StopNow: %v", err)
 	}
-	if got := r.last(); got != "systemctl disable --now anonctl-shim@anon-work.service" {
-		t.Errorf("DisableNow ran %q", got)
+	if got := r.last(); got != "systemctl stop anonctl-shim@anon-work.service" {
+		t.Errorf("StopNow ran %q", got)
 	}
 }
 

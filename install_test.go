@@ -10,11 +10,14 @@ import (
 
 // anonctl ships an install.sh release asset and a README "Install" section, like
 // the sibling netcage, but with anonctl's ONE structural difference: the shim is
-// launched by a systemd unit whose ExecStart is a FIXED path
-// (internal/systemd.DefaultShimBinaryPath = /usr/local/bin/anonctl-shim), so the
-// install MUST place anonctl-shim there. "Just put both on PATH" is NOT enough.
+// launched by a systemd unit, whose ExecStart must be an ABSOLUTE path because a
+// unit has no useful inherited $PATH. anonctl RESOLVES that path when it writes the
+// unit, preferring the anonctl-shim sitting next to the running anonctl, so the
+// install contract is "both binaries in the SAME dir" rather than "the shim at one
+// fixed location". (Before 0.4 the unit hard-coded /usr/local/bin/anonctl-shim
+// regardless of $PREFIX, and install.sh symlinked that path to compensate.)
 // These tests pin the install contract so the script/docs cannot silently drift
-// from the unit's expected path or drop the checksum verification (never install
+// from how the unit is rendered, or drop the checksum verification (never install
 // an unverified anonymity tool).
 
 func installScript(t *testing.T) string {
@@ -35,20 +38,40 @@ func readme(t *testing.T) string {
 	return string(raw)
 }
 
-// install.sh must place anonctl-shim at the systemd unit's expected path
-// (DefaultShimBinaryPath). This is the ONE way anonctl's install differs from
-// netcage: the shim is not found as a sibling, it is launched by a unit at a
-// fixed ExecStart path. If DefaultShimBinaryPath ever changes, this test forces
-// install.sh to be updated too.
-func TestInstallScriptPlacesShimAtUnitPath(t *testing.T) {
+// install.sh must install BOTH binaries into the SAME directory, because that
+// co-location is what lets anonctl resolve the shim as its own sibling and render
+// the unit with a path that is correct for ANY $PREFIX.
+func TestInstallScriptCoLocatesBothBinaries(t *testing.T) {
 	sh := installScript(t)
-	if !strings.Contains(sh, systemd.DefaultShimBinaryPath) {
-		t.Errorf("install.sh must place the shim at the systemd unit's ExecStart path %q (internal/systemd.DefaultShimBinaryPath); not found", systemd.DefaultShimBinaryPath)
-	}
 	// Both binaries must be handled by name.
 	for _, bin := range []string{"anonctl", "anonctl-shim"} {
 		if !strings.Contains(sh, bin) {
 			t.Errorf("install.sh must install %q; not mentioned", bin)
+		}
+	}
+	// Both go to the SAME $dest.
+	for _, want := range []string{`install_one "$BIN"`, `install_one "$SHIM"`} {
+		if !strings.Contains(sh, want) {
+			t.Errorf("install.sh must install both binaries into the same dir (%q missing)", want)
+		}
+	}
+	// The pre-0.4 workaround must be GONE: symlinking the shim into the old fixed path
+	// is exactly the FHS assumption the unit no longer makes, and on NixOS
+	// /usr/local/bin is not on any default PATH anyway.
+	if strings.Contains(sh, "ln -sf \"$dest/$SHIM\" \"$SHIM_UNIT_PATH\"") {
+		t.Error("install.sh must no longer symlink the shim into the old fixed unit path; anonctl now renders the unit with the resolved path")
+	}
+}
+
+// anonctl bakes the absolute paths of nft and setpriv into the units it generates
+// and refuses to force an account without them. A loader unit that cannot run nft is
+// fail-OPEN at boot (no baseline default-deny), so the installer must surface a
+// missing prerequisite rather than let it be discovered after a reboot.
+func TestInstallScriptWarnsAboutMissingUnitBinaries(t *testing.T) {
+	sh := installScript(t)
+	for _, req := range []string{systemd.NftBinaryName, systemd.SetprivBinaryName} {
+		if !strings.Contains(sh, req) {
+			t.Errorf("install.sh must check for the unit prerequisite %q; not mentioned", req)
 		}
 	}
 }

@@ -34,11 +34,18 @@ func TestGeneratedTemplateUnitIsWellFormed(t *testing.T) {
 		UnitDir:  unitDir,
 		EnvDir:   filepath.Join(root, "shim"),
 		RulesDir: filepath.Join(root, "nftables"),
+		// The legacy sweep is pointed at scratch too, so this test can never remove a real
+		// unit from the host's /etc/systemd/system.
+		LegacyUnitDir: filepath.Join(root, "legacy-systemd"),
 	}
 	if store.UnitDir == systemd.DefaultUnitDir {
 		t.Fatal("test Store must not point at the real DefaultUnitDir")
 	}
-	if err := store.InstallCommon(systemd.TemplateParams{}, systemd.LoaderParams{}); err != nil {
+	if store.LegacyUnitDir == systemd.LegacyUnitDir {
+		t.Fatal("test Store must not point at the real LegacyUnitDir")
+	}
+	tp, lp := scratchParams()
+	if err := store.InstallCommon(tp, lp); err != nil {
 		t.Fatalf("InstallCommon: %v", err)
 	}
 

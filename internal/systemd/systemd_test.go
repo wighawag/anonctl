@@ -25,8 +25,56 @@ func sampleConfig() accountconfig.Config {
 
 // --- the templated unit (ONE unit for all accounts, the @ pattern) ---
 
+// testSetprivPath stands in for the ABSOLUTE setpriv path the resolver bakes in.
+// Deliberately NOT /usr/bin/setpriv: that path does not exist on NixOS, where a unit
+// carrying it dies 203/EXEC.
+const testSetprivPath = "/nix/store/fake-util-linux/bin/setpriv"
+
+func mustTemplateUnit(t *testing.T, p systemd.TemplateParams) string {
+	t.Helper()
+	if p.SetprivPath == "" {
+		p.SetprivPath = testSetprivPath
+	}
+	unit, err := systemd.TemplateUnit(p)
+	if err != nil {
+		t.Fatalf("TemplateUnit: %v", err)
+	}
+	return unit
+}
+
+// Neither binary path may be guessed. A unit naming a binary that is not there fails
+// only at the next boot, long after the operator saw `add` succeed, so generation
+// must refuse instead of falling back to a conventional FHS path.
+func TestTemplateUnitRefusesWithoutResolvedBinaryPaths(t *testing.T) {
+	if _, err := systemd.TemplateUnit(systemd.TemplateParams{SetprivPath: testSetprivPath}); err == nil {
+		t.Error("TemplateUnit must refuse to generate without a resolved shim binary path")
+	}
+	if _, err := systemd.TemplateUnit(systemd.TemplateParams{ShimBinaryPath: "/opt/anonctl/bin/anonctl-shim"}); err == nil {
+		t.Error("TemplateUnit must refuse to generate without a resolved setpriv path")
+	}
+}
+
+// The unit must carry the ACTUAL install path it was given, not /usr/local/bin. This
+// is the $PREFIX bug: install.sh honours PREFIX for the binaries but the unit used to
+// hard-code /usr/local/bin/anonctl-shim regardless.
+func TestTemplateUnitUsesTheResolvedPathsNotFHSGuesses(t *testing.T) {
+	unit := mustTemplateUnit(t, systemd.TemplateParams{ShimBinaryPath: "/opt/anonctl/bin/anonctl-shim"})
+	if !strings.Contains(unit, "/opt/anonctl/bin/anonctl-shim") {
+		t.Errorf("template unit must ExecStart the RESOLVED shim path, honouring a custom PREFIX:\n%s", unit)
+	}
+	if strings.Contains(unit, "/usr/local/bin/anonctl-shim") {
+		t.Errorf("template unit must not fall back to the hard-coded /usr/local/bin shim path:\n%s", unit)
+	}
+	if !strings.Contains(unit, testSetprivPath) {
+		t.Errorf("template unit must use the RESOLVED setpriv path:\n%s", unit)
+	}
+	if strings.Contains(unit, "/usr/bin/setpriv") {
+		t.Errorf("template unit must not hard-code /usr/bin/setpriv (absent on NixOS):\n%s", unit)
+	}
+}
+
 func TestTemplateUnitIsAnInstanceTemplate(t *testing.T) {
-	unit := systemd.TemplateUnit(systemd.TemplateParams{ShimBinaryPath: "/usr/local/bin/anonctl-shim"})
+	unit := mustTemplateUnit(t, systemd.TemplateParams{ShimBinaryPath: "/usr/local/bin/anonctl-shim"})
 	// A single instance TEMPLATE (`%i` = the account), NOT one unit per account: the
 	// per-account process boundary is the security boundary, and systemd's @-template
 	// gives each account its own supervised process from one unit file.
@@ -53,7 +101,7 @@ func TestTemplateUnitIsAnInstanceTemplate(t *testing.T) {
 }
 
 func TestTemplateUnitDoesNotHardcodeAnAccount(t *testing.T) {
-	unit := systemd.TemplateUnit(systemd.TemplateParams{ShimBinaryPath: "/usr/local/bin/anonctl-shim"})
+	unit := mustTemplateUnit(t, systemd.TemplateParams{ShimBinaryPath: "/usr/local/bin/anonctl-shim"})
 	// The template is account-agnostic: no concrete account name is baked in (that
 	// is what `%i` is for). A baked-in `anon` would make it a single-account unit.
 	for _, banned := range []string{"User=anon", "socks-user anon", "relay 127.0.0.1:19050"} {

@@ -58,6 +58,10 @@ type Deps struct {
 	ConfigStore accountconfig.Store
 	// SystemdStore persists the systemd unit / drop-in / per-account env + rule files.
 	SystemdStore systemd.Store
+	// Resolver turns the binary NAMES baked into the generated units (the shim,
+	// setpriv, nft) into absolute paths at install time. The zero value resolves
+	// against the real $PATH and the running executable; tests inject fakes.
+	Resolver systemd.Resolver
 }
 
 // Install turns on forcing for an already-provisioned account: it records the
@@ -73,6 +77,18 @@ type Deps struct {
 // the shim is not yet up, egress is DROPPED (fail-closed), never leaked.
 func Install(ctx context.Context, d Deps, c accountconfig.Config, exemptions []lanexempt.Exempt) error {
 	c = normalize(c)
+	// RESOLVE BEFORE MUTATING ANYTHING. The three binaries the generated units name
+	// (shim, setpriv, nft) are resolved FIRST, so an unresolvable one aborts Install
+	// before a single byte of host state changes. Doing this LATE would be a fail-OPEN
+	// regression: the account would already exist with live rules applied but NO unit
+	// installed and nothing enabled, so the next boot would load neither the baseline
+	// default-deny nor the forcing, and the anon UID would egress with the host's real
+	// IP. `add` additionally pre-flights this before it creates the account at all (see
+	// PreflightUnitBinaries), so reaching a failure here should be near-impossible.
+	tp, lp, err := systemd.ResolveUnitParams(d.Resolver)
+	if err != nil {
+		return fmt.Errorf("forcing: %w", err)
+	}
 	if err := d.ConfigStore.Write(c); err != nil {
 		return fmt.Errorf("forcing: persist account config: %w", err)
 	}
@@ -98,19 +114,45 @@ func Install(ctx context.Context, d Deps, c accountconfig.Config, exemptions []l
 	}
 
 	// Install the account-agnostic template unit + anonctl's early-boot loader unit
-	// (idempotent), reload systemd so they are picked up, ENABLE the loader (so the
-	// baseline + forcing load at the next boot, independent of the host's
-	// nftables.service), then enable --now the account's shim instance.
-	if err := d.SystemdStore.InstallCommon(systemd.TemplateParams{}, systemd.LoaderParams{}); err != nil {
+	// (idempotent).
+	if err := d.SystemdStore.InstallCommon(tp, lp); err != nil {
 		return fmt.Errorf("forcing: install common systemd artifacts: %w", err)
 	}
+	// ENABLE BEFORE MIGRATING. Both orders leave exactly one definition once the whole
+	// sequence completes, but only this one is safe if the sequence is INTERRUPTED: if
+	// the migration were to run first and then fail part-way, the legacy enablement
+	// symlink could already be gone while the new one had not been created yet, leaving
+	// the loader enabled in NEITHER location -- fail-open at the next boot on a host
+	// that was previously fine. Enabling first means at every instant at least one
+	// enabled, loadable definition exists. Nothing is re-read by systemd until the
+	// single daemon-reload below, so ordering these two does not expose a double
+	// definition.
+	//
+	// This replaces `systemctl enable`, which writes into /etc/systemd/system regardless
+	// of where the unit file lives and therefore cannot work on a host where that dir is
+	// read-only. The loader is enabled but NOT started: `add` already applied the live
+	// rules via nft, so it only needs to fire at the next boot.
+	if err := d.SystemdStore.EnableUnit(systemd.LoaderUnitName, systemd.LoaderUnitName, systemd.LoaderWantedBy); err != nil {
+		return err
+	}
+	if err := d.SystemdStore.EnableUnit(systemd.UnitName, systemd.InstanceName(c.Account), systemd.ShimWantedBy); err != nil {
+		return err
+	}
+	// Sweep any pre-0.4 units out of /etc/systemd/system. That dir OUTRANKS the current
+	// unit dir in systemd's load path, so a leftover copy would shadow what was just
+	// written and the host would keep running the OLD definition. The sweep RE-ENABLES
+	// every account it finds enabled in the legacy dir, not just this one, so a
+	// multi-account upgrade does not silently de-enable the accounts that are not being
+	// added right now. Done BEFORE daemon-reload so systemd never sees both at once.
+	if _, err := d.SystemdStore.MigrateLegacyUnits(); err != nil {
+		return fmt.Errorf("forcing: migrate legacy unit dir: %w", err)
+	}
+	// Reload AFTER the units, the symlinks and the migration are all in place, so
+	// systemd picks up exactly one coherent definition.
 	if err := systemd.DaemonReload(ctx, d.SystemdRunner); err != nil {
 		return err
 	}
-	if err := systemd.EnableLoader(ctx, d.SystemdRunner); err != nil {
-		return err
-	}
-	if err := systemd.EnableNow(ctx, d.SystemdRunner, c.Account); err != nil {
+	if err := systemd.StartNow(ctx, d.SystemdRunner, c.Account); err != nil {
 		return err
 	}
 	return nil
@@ -174,9 +216,13 @@ func Reconfigure(ctx context.Context, d Deps, c accountconfig.Config, exemptions
 // removal stays in the caller (rm already removes it), so this focuses on the
 // forcing artifacts.
 func Remove(ctx context.Context, d Deps, account string) error {
-	// Stop + disable the shim first so it is not left running against rules we are
-	// about to delete.
-	if err := systemd.DisableNow(ctx, d.SystemdRunner, account); err != nil {
+	// Stop + de-enable the shim first so it is not left running against rules we are
+	// about to delete. Stopping (the runner) and de-enabling (the symlink) are now two
+	// steps, because enablement no longer goes through systemctl.
+	if err := systemd.StopNow(ctx, d.SystemdRunner, account); err != nil {
+		return err
+	}
+	if err := d.SystemdStore.DisableUnit(systemd.InstanceName(account), systemd.ShimWantedBy); err != nil {
 		return err
 	}
 	// Delete only this account's forcing table AND its baseline table; ignore a
@@ -204,7 +250,7 @@ func Remove(ctx context.Context, d Deps, account string) error {
 		return fmt.Errorf("forcing: check remaining forced accounts: %w", err)
 	}
 	if !hasAccounts {
-		if err := systemd.DisableLoader(ctx, d.SystemdRunner); err != nil {
+		if err := d.SystemdStore.DisableUnit(systemd.LoaderUnitName, systemd.LoaderWantedBy); err != nil {
 			return err
 		}
 		// LAST account: also remove the SHARED account-agnostic artifacts (the template

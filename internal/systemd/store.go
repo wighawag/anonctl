@@ -45,16 +45,70 @@ type Store struct {
 	// RulesDir holds the persisted per-account nft rule files (`<account>.nft`) the
 	// drop-in loads at boot; DefaultRulesDir when empty.
 	RulesDir string
+	// LegacyUnitDir is the pre-0.4 unit dir that MigrateLegacyUnits sweeps;
+	// LegacyUnitDir (the package const) when empty. Behind a field so the migration is
+	// testable against a scratch dir instead of the host's real /etc/systemd/system.
+	LegacyUnitDir string
 }
 
-// DefaultStore returns the Store pointing at the real default locations.
+// UnitDirEnv lets an operator repoint the unit dir on a host whose layout does not
+// suit DefaultUnitDir. It is a SAFETY VALVE, not the intended path: the default is
+// chosen so that neither Debian nor NixOS needs it.
+const UnitDirEnv = "ANONCTL_UNIT_DIR"
+
+// knownUnitSearchDirs are the directories systemd actually reads system units from.
+// An override outside this set is almost certainly a mistake that would produce
+// forcing which never loads at boot, so it is WARNED about loudly rather than
+// accepted in silence. (Being absolute is not sufficient: /opt/anonctl/units is a
+// perfectly good absolute path that systemd will never look in.)
+var knownUnitSearchDirs = []string{
+	"/etc/systemd/system",
+	"/run/systemd/system",
+	"/usr/local/lib/systemd/system",
+	"/usr/lib/systemd/system",
+	"/lib/systemd/system",
+}
+
+// DefaultStore returns the Store pointing at the real default locations, honouring
+// the UnitDirEnv override when it names an absolute path.
+//
+// A malformed or suspicious override is never silently swallowed: a non-absolute
+// value is REFUSED with a warning (a relative unit dir is in no search path), and an
+// absolute value outside systemd's known search dirs is honoured but WARNED about,
+// because the operator has asked for something that will not be read at boot.
+// Silently ignoring either would leave the operator believing units went somewhere
+// they did not.
 func DefaultStore() Store {
-	return Store{UnitDir: DefaultUnitDir, EnvDir: DefaultEnvDir, RulesDir: DefaultRulesDir}
+	unitDir := DefaultUnitDir
+	if override := strings.TrimSpace(os.Getenv(UnitDirEnv)); override != "" {
+		switch {
+		case !filepath.IsAbs(override):
+			fmt.Fprintf(os.Stderr, "anonctl: ignoring %s=%q: it must be an ABSOLUTE path (a relative unit dir is in no systemd search path); using %s\n", UnitDirEnv, override, unitDir)
+		default:
+			unitDir = filepath.Clean(override)
+			if !isKnownUnitSearchDir(unitDir) {
+				fmt.Fprintf(os.Stderr, "anonctl: WARNING: %s=%q is not one of systemd's known unit search directories (%s). Units written there may never be loaded at boot, which would leave accounts unforced after a reboot. Verify with: systemctl show --property=UnitPath\n", UnitDirEnv, unitDir, strings.Join(knownUnitSearchDirs, ", "))
+			}
+		}
+	}
+	return Store{UnitDir: unitDir, EnvDir: DefaultEnvDir, RulesDir: DefaultRulesDir, LegacyUnitDir: LegacyUnitDir}
 }
 
-func (s Store) unitDir() string  { return orDefault(s.UnitDir, DefaultUnitDir) }
-func (s Store) envDir() string   { return orDefault(s.EnvDir, DefaultEnvDir) }
-func (s Store) rulesDir() string { return orDefault(s.RulesDir, DefaultRulesDir) }
+// isKnownUnitSearchDir reports whether dir is one of systemd's standard system unit
+// search directories.
+func isKnownUnitSearchDir(dir string) bool {
+	for _, known := range knownUnitSearchDirs {
+		if filepath.Clean(known) == dir {
+			return true
+		}
+	}
+	return false
+}
+
+func (s Store) unitDir() string   { return orDefault(s.UnitDir, DefaultUnitDir) }
+func (s Store) envDir() string    { return orDefault(s.EnvDir, DefaultEnvDir) }
+func (s Store) rulesDir() string  { return orDefault(s.RulesDir, DefaultRulesDir) }
+func (s Store) legacyDir() string { return orDefault(s.LegacyUnitDir, LegacyUnitDir) }
 
 func orDefault(v, def string) string {
 	if v == "" {
@@ -76,18 +130,219 @@ func (s Store) InstallCommon(tp TemplateParams, lp LoaderParams) error {
 	if lp.RulesGlob == "" {
 		lp.RulesGlob = filepath.Join(s.rulesDir(), "*.nft")
 	}
+	// Generate BOTH units before writing EITHER, so an unresolved binary path fails
+	// the whole install with nothing half-written.
+	templateText, err := TemplateUnit(tp)
+	if err != nil {
+		return err
+	}
+	loaderText, err := LoaderUnit(lp)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(s.unitDir(), dirModePublic); err != nil {
 		return fmt.Errorf("systemd: create unit dir %q: %w", s.unitDir(), err)
 	}
 	unitPath := filepath.Join(s.unitDir(), UnitName)
-	if err := writeFileMode(unitPath, []byte(TemplateUnit(tp)), unitMode); err != nil {
+	if err := writeFileMode(unitPath, []byte(templateText), unitMode); err != nil {
 		return fmt.Errorf("systemd: write template unit: %w", err)
 	}
 	loaderPath := filepath.Join(s.unitDir(), LoaderUnitName)
-	if err := writeFileMode(loaderPath, []byte(LoaderUnit(lp)), unitMode); err != nil {
+	if err := writeFileMode(loaderPath, []byte(loaderText), unitMode); err != nil {
+		// Do not leave the shim template behind without the loader. The loader is what
+		// installs the standing baseline default-deny at boot, so "template present, loader
+		// absent" is the fail-OPEN combination: a shim would be wired up with no resting
+		// deny behind it. Both units land, or neither does.
+		_ = os.Remove(unitPath)
 		return fmt.Errorf("systemd: write loader unit: %w", err)
 	}
 	return nil
+}
+
+// EnableUnit wires a unit to start at boot by creating anonctl's OWN enablement
+// symlink `<UnitDir>/<target>.wants/<linkName>` -> `<UnitDir>/<unitFile>`, which is
+// exactly the artifact `systemctl enable` would have produced, in a directory
+// anonctl can actually write.
+//
+// It does NOT shell out to `systemctl enable`, because that command always writes
+// into the CONFIG dir for the scope (/etc/systemd/system) regardless of where the
+// unit file lives, and that dir is a read-only Nix store symlink on NixOS. systemd
+// reads `<target>.wants/` from EVERY directory in the unit load path, so this
+// symlink is a genuine, boot-effective Wants= dependency (systemd.unit(5)).
+//
+// For the @-template, linkName is the INSTANCE (`anonctl-shim@work.service`) while
+// unitFile is the TEMPLATE (`anonctl-shim@.service`) -- the same instance-to-template
+// mapping systemctl uses. The symlink target must itself live in a unit search path,
+// which UnitDir does; it is written ABSOLUTE so it stays valid regardless of how the
+// .wants dir is reached. Idempotent: an existing link is replaced.
+//
+// CAVEAT worth knowing when reading a host by hand: because the symlink is not in
+// the config dir, `systemctl is-enabled` reports "disabled" for these units even
+// though they are genuinely wired to start at boot. Use IsUnitEnabled, or ask
+// systemd for the truth with `systemctl show <target> --property=Wants`.
+func (s Store) EnableUnit(unitFile, linkName, target string) error {
+	wantsDir := filepath.Join(s.unitDir(), target+".wants")
+	if err := os.MkdirAll(wantsDir, dirModePublic); err != nil {
+		return fmt.Errorf("systemd: create %q: %w", wantsDir, err)
+	}
+	linkPath := filepath.Join(wantsDir, linkName)
+	targetPath := filepath.Join(s.unitDir(), unitFile)
+	if err := os.Remove(linkPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("systemd: replace enablement symlink %q: %w", linkPath, err)
+	}
+	if err := os.Symlink(targetPath, linkPath); err != nil {
+		return fmt.Errorf("systemd: create enablement symlink %q -> %q: %w", linkPath, targetPath, err)
+	}
+	return nil
+}
+
+// DisableUnit removes anonctl's enablement symlink, the counterpart of EnableUnit.
+// A missing link is a clean no-op (idempotent teardown). The `.wants` dir itself is
+// removed only when it is empty, so disabling one account never de-enables another.
+func (s Store) DisableUnit(linkName, target string) error {
+	wantsDir := filepath.Join(s.unitDir(), target+".wants")
+	if err := os.Remove(filepath.Join(wantsDir, linkName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("systemd: remove enablement symlink for %q: %w", linkName, err)
+	}
+	if err := os.Remove(wantsDir); err != nil && !errors.Is(err, os.ErrNotExist) && !isNotEmpty(err) {
+		return fmt.Errorf("systemd: remove %q: %w", wantsDir, err)
+	}
+	return nil
+}
+
+// IsUnitEnabled reports whether anonctl's enablement symlink for linkName exists
+// AND points at the unit file in THIS Store's unit dir. It is the honest local
+// answer to "will this come back after a reboot", and exists because
+// `systemctl is-enabled` cannot see a symlink outside the config dir and would
+// report a false "disabled". A link pointing somewhere else counts as NOT enabled:
+// that is a stale or foreign definition, not anonctl's.
+func (s Store) IsUnitEnabled(unitFile, linkName, target string) (bool, error) {
+	linkPath := filepath.Join(s.unitDir(), target+".wants", linkName)
+	dest, err := os.Readlink(linkPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("systemd: read enablement symlink %q: %w", linkPath, err)
+	}
+	if !filepath.IsAbs(dest) {
+		dest = filepath.Join(filepath.Dir(linkPath), dest)
+	}
+	return filepath.Clean(dest) == filepath.Clean(filepath.Join(s.unitDir(), unitFile)), nil
+}
+
+// MigrateLegacyUnits removes anonctl's units and enablement symlinks from the
+// pre-0.4 unit dir (/etc/systemd/system), returning the paths it removed.
+//
+// This is MANDATORY, not cosmetic. /etc/systemd/system OUTRANKS the new unit dir in
+// systemd's load path, so a leftover copy there SHADOWS the newly installed one:
+// the operator would upgrade, see success, and keep running the OLD unit -- which on
+// a migrated host is precisely the unit whose hard-coded /usr/sbin/nft fails
+// fail-OPEN at boot. Leaving two definitions of the same unit is the one outcome
+// this must never produce.
+//
+// It MIGRATES rather than merely deletes. Every account it finds ENABLED in the
+// legacy dir is re-enabled in the current unit dir BEFORE its legacy symlink is
+// removed. That matters on a multi-account host: the legacy sweep necessarily
+// matches every `anonctl-shim@*.service` link, but the `add` that triggered it only
+// re-creates the link for the ONE account being added, so a delete-only sweep would
+// silently de-enable every OTHER account. Their shims keep running, so nothing looks
+// wrong until the next reboot, when they never come back. Re-enable-then-remove also
+// means an interrupted migration never leaves an account enabled in NEITHER dir.
+//
+// It is a no-op when the legacy dir IS the current unit dir, when the legacy dir does
+// not exist, or when it holds no anonctl files (the fresh-install and NixOS cases).
+// If anonctl files ARE present but cannot be removed, it fails LOUDLY rather than
+// leaving a shadowing copy behind.
+func (s Store) MigrateLegacyUnits() ([]string, error) {
+	legacy := s.legacyDir()
+	same, err := sameDir(legacy, s.unitDir())
+	if err != nil {
+		return nil, err
+	}
+	if same {
+		return nil, nil
+	}
+	unitFiles, links, err := s.legacyArtifacts(legacy)
+	if err != nil {
+		return nil, err
+	}
+	removed := make([]string, 0, len(unitFiles)+len(links))
+	// Enablement symlinks first: adopt each into the current unit dir, THEN drop the
+	// legacy one, so no account is ever enabled in neither place.
+	for _, link := range links {
+		linkName := filepath.Base(link)
+		// The target is the `.wants` dir's name minus the suffix, so an adopted link keeps
+		// the exact target it was enabled for.
+		target := strings.TrimSuffix(filepath.Base(filepath.Dir(link)), ".wants")
+		unitFile := UnitName
+		if linkName == LoaderUnitName {
+			unitFile = LoaderUnitName
+		}
+		if err := s.EnableUnit(unitFile, linkName, target); err != nil {
+			return removed, fmt.Errorf("systemd: adopt legacy enablement %q into %s: %w", link, s.unitDir(), err)
+		}
+		if err := os.Remove(link); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return removed, fmt.Errorf("systemd: remove shadowing legacy enablement symlink %q: %w", link, err)
+		}
+		removed = append(removed, link)
+	}
+	// The unit FILES last: they are what actually shadows, and by now every enablement
+	// they carried has been adopted.
+	for _, path := range unitFiles {
+		if err := os.Remove(path); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return removed, fmt.Errorf("systemd: remove shadowing legacy unit file %q (it would override the unit in %s): %w", path, s.unitDir(), err)
+		}
+		removed = append(removed, path)
+	}
+	return removed, nil
+}
+
+// legacyArtifacts lists anonctl-owned files in the legacy unit dir, split into the
+// unit FILES and the enablement SYMLINKS, because the two are handled differently
+// (a symlink is adopted before removal; a file is just removed). The shim sweep is a
+// glob because every per-account INSTANCE has its own link.
+func (s Store) legacyArtifacts(legacy string) (unitFiles, links []string, err error) {
+	for _, name := range []string{UnitName, LoaderUnitName} {
+		path := filepath.Join(legacy, name)
+		if _, serr := os.Lstat(path); serr == nil {
+			unitFiles = append(unitFiles, path)
+		} else if !errors.Is(serr, os.ErrNotExist) {
+			return nil, nil, fmt.Errorf("systemd: inspect legacy unit %q: %w", path, serr)
+		}
+	}
+	for _, pattern := range []string{
+		filepath.Join(legacy, ShimWantedBy+".wants", "anonctl-shim@*.service"),
+		filepath.Join(legacy, LoaderWantedBy+".wants", LoaderUnitName),
+	} {
+		matches, gerr := filepath.Glob(pattern)
+		if gerr != nil {
+			return nil, nil, fmt.Errorf("systemd: scan legacy enablement symlinks %q: %w", pattern, gerr)
+		}
+		links = append(links, matches...)
+	}
+	return unitFiles, links, nil
+}
+
+// sameDir reports whether two paths are the same directory, resolving symlinks. A
+// plain string compare is not enough: if the legacy dir reached the unit dir through
+// a symlinked component, the sweep would delete the units just written.
+func sameDir(a, b string) (bool, error) {
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true, nil
+	}
+	fa, err := os.Stat(a)
+	if err != nil {
+		return false, nil // a missing legacy dir is simply nothing to migrate
+	}
+	fb, err := os.Stat(b)
+	if err != nil {
+		return false, nil
+	}
+	return os.SameFile(fa, fb), nil
 }
 
 // RemoveCommon tears down the SHARED, account-agnostic artifacts InstallCommon
@@ -99,6 +354,11 @@ func (s Store) InstallCommon(tp TemplateParams, lp LoaderParams) error {
 // ONLY when they are empty (os.Remove refuses a non-empty dir), so it can never
 // rip out a survivor account's files even if called out of turn.
 func (s Store) RemoveCommon() error {
+	// Drop the loader's enablement symlink before its unit file, so a torn-down host
+	// never keeps a .wants symlink pointing at a unit that no longer exists.
+	if err := s.DisableUnit(LoaderUnitName, LoaderWantedBy); err != nil {
+		return err
+	}
 	for _, path := range []string{
 		filepath.Join(s.unitDir(), UnitName),
 		filepath.Join(s.unitDir(), LoaderUnitName),
@@ -106,6 +366,12 @@ func (s Store) RemoveCommon() error {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("systemd: remove %q: %w", path, err)
 		}
+	}
+	// The shim's `.wants` dir is removed too, but only when empty (DisableUnit's own
+	// rule), so a survivor account's enablement is never ripped out.
+	shimWants := filepath.Join(s.unitDir(), ShimWantedBy+".wants")
+	if err := os.Remove(shimWants); err != nil && !errors.Is(err, os.ErrNotExist) && !isNotEmpty(err) {
+		return fmt.Errorf("systemd: remove %q: %w", shimWants, err)
 	}
 	// Remove the anonctl-private dirs ONLY when empty: os.Remove on a non-empty dir
 	// fails (which we tolerate), so a survivor's files are never ripped out. An absent

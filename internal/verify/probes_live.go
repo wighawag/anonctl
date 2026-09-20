@@ -168,11 +168,24 @@ const torCheckURL = "https://check.torproject.org/api/ip"
 
 // probeShimBinary is the installed static shim binary verify execs (under setpriv)
 // as its dialer: `anonctl-shim -probe <network> <addr>`. It is the SAME binary the
-// per-account shim units run (internal/systemd.DefaultShimBinaryPath), already
-// installed and static, so verify reuses it and needs NO Go toolchain on the
-// user's host. It is a package var (not the bare constant) ONLY so the live probe
-// suite can point it at a throwaway-built shim; production leaves it at the default.
-var probeShimBinary = systemd.DefaultShimBinaryPath
+// per-account shim units run, already installed and static, so verify reuses it and
+// needs NO Go toolchain on the user's host. It is a package var (not a constant)
+// so the live probe suite can point it at a throwaway-built shim; when it is empty
+// (production), the path is RESOLVED per call by shimProbePath.
+var probeShimBinary = ""
+
+// shimProbePath resolves the shim binary the probe execs, using the SAME resolution
+// the unit writer uses (sibling of the running anonctl, then $PATH, then the
+// conventional path). It must NOT hard-code DefaultShimBinaryPath: that would make
+// `verify` -- the trust anchor -- fail on exactly the hosts this resolution exists
+// for, namely NixOS (where /usr/local/bin does not exist) and any custom $PREFIX
+// install. An explicitly-set probeShimBinary always wins, so tests keep control.
+func shimProbePath() (string, error) {
+	if probeShimBinary != "" {
+		return probeShimBinary, nil
+	}
+	return systemd.Resolver{}.ShimBinary()
+}
 
 // runSetprivProbe dials network/addr AS the given UID by exec'ing the installed
 // static shim binary in `-probe` mode under setpriv (so the connection egresses
@@ -187,12 +200,16 @@ func runSetprivProbe(ctx context.Context, uid int, network, addr string) (reache
 	if _, err := exec.LookPath("setpriv"); err != nil {
 		return false, "", fmt.Errorf("need setpriv on PATH to run the anon-UID probe (as `add`/`rm` need nft): %w", err)
 	}
-	if _, err := exec.LookPath(probeShimBinary); err != nil {
-		return false, "", fmt.Errorf("need the installed shim probe binary %q to run the anon-UID probe (install anonctl-shim there, or set the shim unit's ExecStart path): %w", probeShimBinary, err)
+	shimPath, err := shimProbePath()
+	if err != nil {
+		return false, "", fmt.Errorf("need the installed anonctl-shim binary to run the anon-UID probe (as `add`/`rm` need nft): %w", err)
+	}
+	if _, err := exec.LookPath(shimPath); err != nil {
+		return false, "", fmt.Errorf("need the installed shim probe binary %q to run the anon-UID probe: %w", shimPath, err)
 	}
 	cmd := exec.CommandContext(ctx, "setpriv",
 		"--reuid", strconv.Itoa(uid), "--clear-groups",
-		probeShimBinary, "-probe", network, addr)
+		shimPath, "-probe", network, addr)
 	out, runErr := cmd.CombinedOutput()
 	s := string(out)
 	// The shim probe ALWAYS prints exactly `REACHED` or `DROPPED:<reason>`. If we

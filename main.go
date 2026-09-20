@@ -192,6 +192,17 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		return 1
 	}
 
+	// The LAST guard before the box is touched: every binary the generated systemd
+	// units will name (the shim, setpriv, nft) must be resolvable NOW. If it is not,
+	// refuse while the host is still untouched. Discovering it after provision.Add
+	// would leave an account that EXISTS but whose units were never installed, so the
+	// next boot would load neither the baseline default-deny nor the forcing and the
+	// anon UID would egress with the host's real IP -- fail-OPEN, and silent.
+	if err := systemd.PreflightUnitBinaries(forcingDeps().Resolver); err != nil {
+		errorf("add: %v", err)
+		return 1
+	}
+
 	// All questions answered and all guards passed: NOW create the account + its
 	// dedicated shim UID.
 	res, err := provision.Add(ctx, r, cmd.Account)

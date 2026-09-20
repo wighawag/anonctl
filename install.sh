@@ -1,26 +1,28 @@
 #!/bin/sh
 # anonctl installer: download the latest release, verify its sha256 checksum, and
-# install BOTH binaries (anonctl + its required anonctl-shim helper), with the
-# shim landing at the path the systemd unit's ExecStart expects.
+# install BOTH binaries (anonctl + its required anonctl-shim helper) SIDE BY SIDE.
 #
 #   curl -fsSL https://github.com/wighawag/anonctl/releases/latest/download/install.sh | sh
 #
 # anonctl's whole job is root-level per-UID egress policy, so this installs to
 # /usr/local/bin by DEFAULT (root-writable, on a shared system PATH), NOT to
-# ~/.local/bin. That default is LOAD-BEARING, not just convention: the per-account
-# shim is launched by the `anonctl-shim@<account>.service` systemd unit whose
-# ExecStart is a FIXED path (internal/systemd.DefaultShimBinaryPath =
-# /usr/local/bin/anonctl-shim). Unlike the sibling netcage (which finds its helper
-# as a sibling of its own binary, so "both on PATH" suffices), anonctl's shim MUST
-# be reachable at that unit path or `anonctl add` cannot bring an account's shim up.
-# So this script places anonctl-shim at $PREFIX/anonctl-shim and warns loudly if
-# $PREFIX is not /usr/local/bin (the unit still looks at the fixed path).
+# ~/.local/bin.
+#
+# BOTH binaries MUST land in the SAME directory, and that is the one rule here that
+# is load-bearing. The per-account shim is launched by the
+# `anonctl-shim@<account>.service` unit, whose ExecStart must be an absolute path
+# (a systemd unit has no useful inherited $PATH). anonctl resolves that path when it
+# WRITES the unit, preferring the anonctl-shim sitting NEXT TO the running anonctl.
+# So a custom $PREFIX now works by itself: the unit is rendered with wherever the
+# shim actually is, and no symlink into /usr/local/bin is needed. (Before 0.4 the
+# unit hard-coded /usr/local/bin/anonctl-shim regardless of $PREFIX, which is why
+# this script used to symlink that path.)
 #
 # Options (environment variables):
 #   ANONCTL_VERSION   version tag to install (default: latest, e.g. v0.1.0)
-#   PREFIX            install dir (default: /usr/local/bin). Both binaries go here.
-#                     Keep it /usr/local/bin unless you know what you are doing:
-#                     the shim unit's ExecStart is the fixed path above.
+#   PREFIX            install dir (default: /usr/local/bin). Both binaries go here,
+#                     and they must stay together: anonctl finds the shim as its
+#                     own sibling when it renders the unit.
 #
 # anonctl is Linux-only: per-UID nftables `skuid` matching and the SO_ORIGINAL_DST
 # transparent redirect it relies on are Linux kernel primitives that do not exist
@@ -31,9 +33,9 @@ REPO="wighawag/anonctl"
 BIN="anonctl"
 SHIM="anonctl-shim"
 
-# The path the systemd shim unit's ExecStart expects (mirror of
-# internal/systemd.DefaultShimBinaryPath). The shim MUST be reachable here or
-# `anonctl add` cannot start an account's shim instance.
+# The conventional shim location (mirror of internal/systemd.DefaultShimBinaryPath).
+# It is now only anonctl's LAST-RESORT fallback when resolving the shim, not a path
+# the install must hit: anonctl prefers the shim sitting next to its own binary.
 SHIM_UNIT_PATH="/usr/local/bin/anonctl-shim"
 
 info() { printf '%s\n' "anonctl-install: $*" >&2; }
@@ -116,10 +118,9 @@ info "checksum ok"
 tar -xzf "$tmp/$archive" -C "$tmp" "$BIN" "$SHIM" || err "failed to extract $BIN and $SHIM"
 
 # --- install dir ------------------------------------------------------------
-# Default to /usr/local/bin (root-writable, on a shared system PATH, and the dir
-# the shim unit's fixed ExecStart path lives in). anonctl needs root anyway, so
-# unlike netcage we do NOT prefer a per-user ~/.local/bin: a per-user shim would
-# be invisible to the shim unit's fixed path.
+# Default to /usr/local/bin (root-writable, on a shared system PATH). anonctl needs
+# root anyway, so unlike netcage we do NOT prefer a per-user ~/.local/bin: a per-user
+# shim would be unreadable by the root-launched system unit.
 dest="${PREFIX:-/usr/local/bin}"
 mkdir -p "$dest" || err "cannot create install dir $dest (anonctl needs root; try: sudo sh, or PREFIX=/usr/local/bin sudo sh)"
 
@@ -136,21 +137,30 @@ info "installed:"
 info "  $dest/$BIN"
 info "  $dest/$SHIM"
 
-# --- shim path check --------------------------------------------------------
-# The shim unit's ExecStart is a FIXED path. If PREFIX moved the shim off it, the
-# install is INCOMPLETE: `anonctl add` will fail to start the shim. Symlink the
-# fixed path to where we put it, or tell the user how.
-if [ "$dest/$SHIM" != "$SHIM_UNIT_PATH" ]; then
-	if ln -sf "$dest/$SHIM" "$SHIM_UNIT_PATH" 2>/dev/null; then
-		info "symlinked $SHIM_UNIT_PATH -> $dest/$SHIM (the shim unit's ExecStart path)"
-	else
-		info ""
-		info "WARNING: the shim is at $dest/$SHIM but the systemd shim unit's ExecStart"
-		info "expects it at $SHIM_UNIT_PATH. \`anonctl add\` will NOT start the shim until"
-		info "the shim is reachable there. Fix it (as root), e.g.:"
-		info "  ln -sf $dest/$SHIM $SHIM_UNIT_PATH"
-	fi
+# --- shim co-location check -------------------------------------------------
+# No symlink into $SHIM_UNIT_PATH is created anymore: anonctl renders the unit with
+# the shim's ACTUAL path, preferring its own sibling. The only thing that must hold
+# is that the two binaries stayed together, so say so if they did not.
+if [ ! -x "$dest/$SHIM" ]; then
+	info ""
+	info "WARNING: $dest/$SHIM is missing or not executable. \`anonctl add\` resolves the"
+	info "shim as a sibling of the anonctl binary and will refuse to force an account"
+	info "until it can find it."
 fi
+
+# --- runtime prerequisites --------------------------------------------------
+# anonctl bakes the ABSOLUTE paths of nft and setpriv into the units it generates,
+# and REFUSES to force an account if it cannot resolve them (a unit naming a missing
+# binary would fail at the next boot, and for the nftables loader that failure is
+# fail-OPEN: no baseline default-deny, so the anon UID egresses freely). Flag a
+# missing prerequisite now rather than at `anonctl add` time.
+for req in nft setpriv; do
+	if ! command -v "$req" >/dev/null 2>&1; then
+		info ""
+		info "WARNING: \`$req\` was not found on PATH. \`anonctl add\` needs it and will refuse"
+		info "to force an account until it is installed."
+	fi
+done
 
 # --- PATH hint --------------------------------------------------------------
 case ":$PATH:" in

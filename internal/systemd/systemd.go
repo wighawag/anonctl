@@ -39,6 +39,9 @@ package systemd
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/wighawag/anoncore/accountconfig"
@@ -48,10 +51,37 @@ import (
 // trailing `@`), so `anonctl-shim@<account>.service` is one account's instance.
 const UnitName = "anonctl-shim@.service"
 
-// DefaultUnitDir is where the template unit file is installed (the standard
-// systemd system-unit dir for locally-installed units). Behind Store.UnitDir so
-// tests write a scratch dir instead of the real one.
-const DefaultUnitDir = "/etc/systemd/system"
+// DefaultUnitDir is where the template unit file is installed: systemd's own
+// load-path table calls it "System units installed by the administrator", which is
+// exactly what anonctl is, and it is the natural sibling of the /usr/local/bin
+// binary install. It is chosen over /etc/systemd/system because that directory is a
+// READ-ONLY Nix store symlink on NixOS, so anonctl could not install itself there at
+// all. It is chosen over /run/systemd/system (which IS writable on NixOS) because
+// /run is CLEARED AT BOOT: forcing that evaporates on reboot is worse than no
+// forcing, since the account still exists and still looks anonymized. This one
+// default works on both Debian and NixOS, so nothing here needs a distro check.
+// Behind Store.UnitDir so tests write a scratch dir instead of the real one.
+const DefaultUnitDir = "/usr/local/lib/systemd/system"
+
+// LegacyUnitDir is where anonctl <= 0.3.0 installed its units. It OUTRANKS
+// DefaultUnitDir in systemd's unit load path, so a unit file left behind here would
+// SHADOW the one in DefaultUnitDir and silently keep serving the old definition.
+// That is why migration (Store.MigrateLegacyUnits) is mandatory rather than
+// best-effort: two definitions of the same unit is the one unacceptable outcome.
+const LegacyUnitDir = "/etc/systemd/system"
+
+// ShimWantedBy / LoaderWantedBy are the targets whose `.wants/` directories carry
+// anonctl's own enablement symlinks. anonctl creates those symlinks ITSELF (see
+// Store.EnableUnit) rather than shelling out to `systemctl enable`, because
+// `systemctl enable` always writes into the CONFIG dir for the scope
+// (/etc/systemd/system) no matter where the unit file lives -- which is read-only on
+// NixOS, so the enable would fail even after the unit file moved somewhere writable.
+// systemd reads `<target>.wants/` from EVERY directory in the unit load path, so a
+// symlink anonctl places in its own unit dir is a real, boot-effective dependency.
+const (
+	ShimWantedBy   = "multi-user.target"
+	LoaderWantedBy = "sysinit.target"
+)
 
 // DefaultEnvDir holds the per-account EnvironmentFiles the template instances read
 // (`/etc/anonctl/shim/<account>.env`). Anonctl-private (0700/0600): it carries the
@@ -63,10 +93,23 @@ const DefaultEnvDir = "/etc/anonctl/shim"
 // (`<account>.baseline.nft`) and the per-account forcing table (`<account>.nft`).
 const DefaultRulesDir = "/etc/anonctl/nftables"
 
-// DefaultShimBinaryPath is where the template unit's ExecStart finds the shim
-// binary. It is a parameter (TemplateParams.ShimBinaryPath) so a packaging layout
-// can override it; this is the conventional default.
+// DefaultShimBinaryPath is the conventional location of the shim binary, used ONLY
+// as the last fallback by Resolver.ShimBinary. It is deliberately not trusted
+// blindly: install.sh honours $PREFIX, so the shim is frequently NOT here, and on
+// NixOS /usr/local/bin does not exist at all.
 const DefaultShimBinaryPath = "/usr/local/bin/anonctl-shim"
+
+// ShimBinaryName / SetprivBinaryName / NftBinaryName are the binaries whose
+// ABSOLUTE paths get baked into the generated units. They must be resolved at
+// install time (Resolver) rather than assumed: a systemd unit has no useful
+// inherited $PATH, so ExecStart must be absolute, but the conventional FHS
+// locations (/usr/bin/setpriv, /usr/sbin/nft) do not exist on NixOS, where /usr/bin
+// holds only `env` and /bin holds only `sh`.
+const (
+	ShimBinaryName    = "anonctl-shim"
+	SetprivBinaryName = "setpriv"
+	NftBinaryName     = "nft"
+)
 
 // LoaderUnitName is anonctl's OWN early-boot nftables loader unit. It is anonctl's
 // unit (not a host unit anonctl mutates), so `add` may enable it without touching
@@ -76,9 +119,15 @@ const LoaderUnitName = "anonctl-nftables.service"
 // TemplateParams parameterises the ONE template unit (account-agnostic: the
 // account is the `%i` instance, its per-account params come from the env file).
 type TemplateParams struct {
-	// ShimBinaryPath is the shim binary the ExecStart runs; DefaultShimBinaryPath
-	// when empty.
+	// ShimBinaryPath is the ABSOLUTE path to the shim binary the ExecStart runs.
+	// REQUIRED: TemplateUnit refuses to generate without it, so a unit naming a
+	// non-existent binary can never be written. Fill it via Resolver.ShimBinary.
 	ShimBinaryPath string
+	// SetprivPath is the ABSOLUTE path to setpriv, which the ExecStart uses to drop to
+	// the account's shim UID. REQUIRED, for the same reason as ShimBinaryPath: the old
+	// hard-coded /usr/bin/setpriv does not exist on NixOS, and a unit carrying it fails
+	// 203/EXEC at boot. Fill it via Resolver.Binary(SetprivBinaryName).
+	SetprivPath string
 	// EnvDir is the dir holding the per-account EnvironmentFiles; DefaultEnvDir when
 	// empty. The unit reads `<EnvDir>/%i.env`.
 	EnvDir string
@@ -102,11 +151,19 @@ func InstanceName(account string) string {
 // root only long enough to drop. ordering: After=network.target; it neither Wants=
 // nor After= the endpoint's own service (anonctl does not own the endpoint
 // lifecycle), and it is fail-closed by the nft rules if the endpoint is not yet up.
-func TemplateUnit(p TemplateParams) string {
-	bin := p.ShimBinaryPath
-	if bin == "" {
-		bin = DefaultShimBinaryPath
+//
+// It returns an ERROR rather than falling back to a conventional path when a
+// required binary path is missing. That is deliberate and load-bearing: a unit
+// generated with a wrong absolute path fails only at the NEXT BOOT, long after the
+// operator saw `add` succeed, so the failure must surface at install time instead.
+func TemplateUnit(p TemplateParams) (string, error) {
+	if strings.TrimSpace(p.ShimBinaryPath) == "" {
+		return "", fmt.Errorf("systemd: refusing to generate %s without a resolved shim binary path", UnitName)
 	}
+	if strings.TrimSpace(p.SetprivPath) == "" {
+		return "", fmt.Errorf("systemd: refusing to generate %s without a resolved %s path", UnitName, SetprivBinaryName)
+	}
+	bin := p.ShimBinaryPath
 	envDir := p.EnvDir
 	if envDir == "" {
 		envDir = DefaultEnvDir
@@ -114,11 +171,18 @@ func TemplateUnit(p TemplateParams) string {
 	var b strings.Builder
 	w := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
 
-	w("# anonctl per-account shim (generated). ONE @-template for all accounts:")
-	w("# `systemctl enable --now anonctl-shim@<account>` supervises that account's shim")
-	w("# under its OWN dedicated shim UID. The per-account process boundary IS the")
-	w("# security boundary (a distinct shim UID per account), which is why this is a")
-	w("# templated per-account unit, not a single multiplexer for all accounts.")
+	w("# anonctl per-account shim (generated). ONE @-template for all accounts: each")
+	w("# account runs as its OWN supervised instance under its OWN dedicated shim UID.")
+	w("# The per-account process boundary IS the security boundary (a distinct shim UID")
+	w("# per account), which is why this is a templated per-account unit and not a single")
+	w("# multiplexer for all accounts.")
+	w("#")
+	w("# Managed by `anonctl add` / `anonctl rm` -- do not enable this by hand. anonctl")
+	w("# writes its OWN enablement symlink into %s.wants/ next to this", ShimWantedBy)
+	w("# file, because `systemctl enable` writes into /etc/systemd/system whatever the")
+	w("# unit dir is, and that path is read-only on some hosts (NixOS). A consequence:")
+	w("# `systemctl is-enabled` will say \"disabled\" even when this IS wired to start at")
+	w("# boot. To check for real: systemctl show %s --property=Wants", ShimWantedBy)
 	w("[Unit]")
 	w("Description=anonctl forced-egress shim for account %%i")
 	// Order after the network is configured. Deliberately NOT tied to the endpoint's
@@ -135,7 +199,7 @@ func TemplateUnit(p TemplateParams) string {
 	// Drop to the account's dedicated shim UID (from the env file) via setpriv,
 	// exactly as the validated recipe runs the shim. The unit starts as root only to
 	// drop privilege; the shim itself never runs as root.
-	w("ExecStart=/usr/bin/setpriv --reuid ${ANONCTL_SHIM_UID} --regid ${ANONCTL_SHIM_UID} --clear-groups \\")
+	w("ExecStart=%s --reuid ${ANONCTL_SHIM_UID} --regid ${ANONCTL_SHIM_UID} --clear-groups \\", p.SetprivPath)
 	w("    %s \\", bin)
 	w("    -relay ${ANONCTL_RELAY_ADDR} \\")
 	w("    -dns ${ANONCTL_DNS_ADDR} \\")
@@ -146,8 +210,8 @@ func TemplateUnit(p TemplateParams) string {
 	w("RestartSec=2")
 	w("")
 	w("[Install]")
-	w("WantedBy=multi-user.target")
-	return b.String()
+	w("WantedBy=%s", ShimWantedBy)
+	return b.String(), nil
 }
 
 // DefaultUpstreamDNS is the resolver the shim reaches over the endpoint by
@@ -184,6 +248,13 @@ type LoaderParams struct {
 	// RulesGlob is the shell glob the ExecStart loads at boot; when empty it is
 	// `<DefaultRulesDir>/*.nft`.
 	RulesGlob string
+	// NftPath is the ABSOLUTE path to the nft binary the ExecStart loads the rules
+	// with. REQUIRED. This is the most safety-critical of the three resolved paths: the
+	// loader is what installs the STANDING BASELINE DEFAULT-DENY at boot, so if it
+	// fails, the inversion ADR-0005 relies on never happens and the anon UID egresses
+	// FREELY with the host's real IP -- fail-OPEN, and silent. The old hard-coded
+	// /usr/sbin/nft does not exist on NixOS, which is exactly that scenario.
+	NftPath string
 }
 
 // LoaderUnit generates anonctl's OWN early-boot nftables loader unit
@@ -202,7 +273,13 @@ type LoaderParams struct {
 // network is configured). The load itself iterates the glob, so a missing/empty
 // rules dir is a clean no-op and boot never fails when no account is forced. It is
 // a oneshot with RemainAfterExit so systemd tracks it as active after the load.
-func LoaderUnit(p LoaderParams) string {
+//
+// Like TemplateUnit it refuses to generate without a resolved binary path, because
+// this unit failing is fail-OPEN at boot rather than fail-closed.
+func LoaderUnit(p LoaderParams) (string, error) {
+	if strings.TrimSpace(p.NftPath) == "" {
+		return "", fmt.Errorf("systemd: refusing to generate %s without a resolved %s path", LoaderUnitName, NftBinaryName)
+	}
 	glob := p.RulesGlob
 	if glob == "" {
 		glob = DefaultRulesDir + "/*.nft"
@@ -230,11 +307,113 @@ func LoaderUnit(p LoaderParams) string {
 	// a missing/empty dir is a clean no-op (the for-loop body never runs), so boot
 	// never fails when no account is forced. Each file is a self-contained atomic
 	// `nft -f` load of that account's own table.
-	w("ExecStart=/bin/sh -c 'for f in %s; do [ -e \"$f\" ] && /usr/sbin/nft -f \"$f\"; done'", glob)
+	w("ExecStart=/bin/sh -c 'for f in %s; do [ -e \"$f\" ] && %s -f \"$f\"; done'", glob, p.NftPath)
 	w("")
 	w("[Install]")
-	w("WantedBy=sysinit.target")
-	return b.String()
+	w("WantedBy=%s", LoaderWantedBy)
+	return b.String(), nil
+}
+
+// Resolver turns a binary NAME into the ABSOLUTE path that gets baked into a
+// generated unit. Both lookups are injectable so the resolution rules are
+// unit-testable with no root and no dependency on the host's actual $PATH.
+type Resolver struct {
+	// Look resolves a bare name against $PATH; exec.LookPath when nil.
+	Look func(name string) (string, error)
+	// Executable reports the running anonctl binary's own path; os.Executable when nil.
+	Executable func() (string, error)
+}
+
+func (r Resolver) look(name string) (string, error) {
+	if r.Look != nil {
+		return r.Look(name)
+	}
+	return exec.LookPath(name)
+}
+
+func (r Resolver) executable() (string, error) {
+	if r.Executable != nil {
+		return r.Executable()
+	}
+	return os.Executable()
+}
+
+// Binary resolves a required helper binary (setpriv, nft) to an absolute path via
+// $PATH. It returns a LOUD error naming the binary when it cannot be found, so
+// `add` fails at install time rather than emitting a unit that dies at the next
+// boot. It never falls back to a conventional FHS path: that is precisely the
+// assumption that produced a fail-open loader on NixOS.
+func (r Resolver) Binary(name string) (string, error) {
+	path, err := r.look(name)
+	if err != nil {
+		return "", fmt.Errorf("systemd: cannot resolve %q, which anonctl must bake into a generated unit as an absolute path: %w", name, err)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("systemd: resolve %q to an absolute path: %w", name, err)
+	}
+	return abs, nil
+}
+
+// ShimBinary resolves the shim binary the template unit's ExecStart runs. It tries,
+// in order: the SIBLING of the running anonctl executable, then $PATH, then
+// DefaultShimBinaryPath if that file actually exists. The sibling rule comes first
+// because install.sh installs BOTH binaries into $PREFIX, so the shim sits next to
+// the anonctl that is running right now -- which is what makes a non-default PREFIX
+// work without the operator hand-editing the unit. The old behaviour (hard-code
+// /usr/local/bin/anonctl-shim regardless of PREFIX) is the fallback of last resort,
+// and only when the file is really there.
+func (r Resolver) ShimBinary() (string, error) {
+	if self, err := r.executable(); err == nil && self != "" {
+		sibling := filepath.Join(filepath.Dir(self), ShimBinaryName)
+		if st, serr := os.Stat(sibling); serr == nil && !st.IsDir() {
+			return sibling, nil
+		}
+	}
+	if path, err := r.look(ShimBinaryName); err == nil {
+		if abs, aerr := filepath.Abs(path); aerr == nil {
+			return abs, nil
+		}
+	}
+	if st, err := os.Stat(DefaultShimBinaryPath); err == nil && !st.IsDir() {
+		return DefaultShimBinaryPath, nil
+	}
+	return "", fmt.Errorf("systemd: cannot find the %q binary (looked next to the running anonctl, on $PATH, and at %s); install it before forcing an account", ShimBinaryName, DefaultShimBinaryPath)
+}
+
+// PreflightUnitBinaries checks that every binary the generated units will name can
+// be resolved, WITHOUT producing or writing anything. `add` calls it before it
+// creates the UNIX account, so a host missing `nft`, `setpriv` or the shim is
+// refused while the box is still UNTOUCHED.
+//
+// This placement is load-bearing, not defensive tidiness. Discovering the problem
+// later -- after the account exists and the live rules are applied but before the
+// units are installed -- would leave an account that EXISTS with NO unit enabled, so
+// the next boot would load neither the baseline default-deny nor the forcing and the
+// anon UID would egress with the host's real IP. Refusing before anything is created
+// keeps the failure fail-closed in the only sense that matters: nothing was changed.
+func PreflightUnitBinaries(r Resolver) error {
+	_, _, err := ResolveUnitParams(r)
+	return err
+}
+
+// ResolveUnitParams builds the fully-resolved generation params for BOTH units in
+// one place, so `add` fails loudly and EARLY -- before it has written any unit -- if
+// any of the three binaries cannot be found.
+func ResolveUnitParams(r Resolver) (TemplateParams, LoaderParams, error) {
+	shim, err := r.ShimBinary()
+	if err != nil {
+		return TemplateParams{}, LoaderParams{}, err
+	}
+	setpriv, err := r.Binary(SetprivBinaryName)
+	if err != nil {
+		return TemplateParams{}, LoaderParams{}, err
+	}
+	nft, err := r.Binary(NftBinaryName)
+	if err != nil {
+		return TemplateParams{}, LoaderParams{}, err
+	}
+	return TemplateParams{ShimBinaryPath: shim, SetprivPath: setpriv}, LoaderParams{NftPath: nft}, nil
 }
 
 // Runner abstracts `systemctl` (and `systemd`-adjacent) shell-outs so the
@@ -253,50 +432,29 @@ func DaemonReload(ctx context.Context, r Runner) error {
 	return nil
 }
 
-// EnableLoader enables anonctl's OWN early-boot nftables loader
-// (`systemctl enable anonctl-nftables.service`) so the persisted baseline + forcing
-// rules load at boot INDEPENDENT of the host's nftables.service. It is anonctl's
-// own unit, so this mutates no host-owned service. It enables WITHOUT --now: the
-// live rules are already applied by `add` (via nft), so there is no need to run the
-// loader immediately; it only needs to be wired to fire at the NEXT boot. It is
-// idempotent (re-enabling an already-enabled unit is a clean no-op).
-func EnableLoader(ctx context.Context, r Runner) error {
-	if _, stderr, err := r.Run(ctx, "systemctl", "enable", LoaderUnitName); err != nil {
-		return fmt.Errorf("systemd: enable %s: %w: %s", LoaderUnitName, err, stderr)
-	}
-	return nil
-}
-
-// DisableLoader disables anonctl's early-boot loader
-// (`systemctl disable anonctl-nftables.service`), used on the LAST account's
-// teardown so a fully torn-down host leaves no anonctl unit enabled. A not-enabled
-// unit is tolerated by systemctl (a clean no-op), so this is idempotent.
-func DisableLoader(ctx context.Context, r Runner) error {
-	if _, stderr, err := r.Run(ctx, "systemctl", "disable", LoaderUnitName); err != nil {
-		return fmt.Errorf("systemd: disable %s: %w: %s", LoaderUnitName, err, stderr)
-	}
-	return nil
-}
-
-// EnableNow enables AND starts the account's shim instance
-// (`systemctl enable --now anonctl-shim@<account>.service`), so `add` brings the
-// shim up immediately and it comes back after a reboot.
-func EnableNow(ctx context.Context, r Runner, account string) error {
+// StartNow starts the account's shim instance
+// (`systemctl start anonctl-shim@<account>.service`), so `add` brings the shim up
+// immediately. It is the "--now" half of what used to be `enable --now`; the
+// "comes back after a reboot" half is now Store.EnableUnit's symlink, because
+// `systemctl enable` cannot write its symlink on a host whose /etc/systemd/system
+// is read-only. Starting is separated from enabling so the two halves fail
+// independently and legibly.
+func StartNow(ctx context.Context, r Runner, account string) error {
 	inst := InstanceName(account)
-	if _, stderr, err := r.Run(ctx, "systemctl", "enable", "--now", inst); err != nil {
-		return fmt.Errorf("systemd: enable --now %s: %w: %s", inst, err, stderr)
+	if _, stderr, err := r.Run(ctx, "systemctl", "start", inst); err != nil {
+		return fmt.Errorf("systemd: start %s: %w: %s", inst, err, stderr)
 	}
 	return nil
 }
 
-// DisableNow disables AND stops the account's shim instance
-// (`systemctl disable --now anonctl-shim@<account>.service`), so `rm` tears the
-// shim down and it does not come back after a reboot. A not-enabled instance is
-// tolerated by systemctl (a clean no-op), so this is idempotent.
-func DisableNow(ctx context.Context, r Runner, account string) error {
+// StopNow stops the account's shim instance
+// (`systemctl stop anonctl-shim@<account>.service`), the teardown counterpart of
+// StartNow. Boot-time de-enablement is Store.DisableUnit's symlink removal. Stopping
+// an already-stopped instance is a clean no-op, so this stays idempotent.
+func StopNow(ctx context.Context, r Runner, account string) error {
 	inst := InstanceName(account)
-	if _, stderr, err := r.Run(ctx, "systemctl", "disable", "--now", inst); err != nil {
-		return fmt.Errorf("systemd: disable --now %s: %w: %s", inst, err, stderr)
+	if _, stderr, err := r.Run(ctx, "systemctl", "stop", inst); err != nil {
+		return fmt.Errorf("systemd: stop %s: %w: %s", inst, err, stderr)
 	}
 	return nil
 }

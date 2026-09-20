@@ -19,12 +19,27 @@ func scratchStore(t *testing.T) systemd.Store {
 		UnitDir:  filepath.Join(root, "systemd"),
 		EnvDir:   filepath.Join(root, "shim"),
 		RulesDir: filepath.Join(root, "nftables"),
+		// The legacy sweep must never reach the host's real /etc/systemd/system from a
+		// unit test, so it too is pointed at scratch.
+		LegacyUnitDir: filepath.Join(root, "legacy-systemd"),
 	}
+}
+
+// scratchParams are fully-resolved generation params, so InstallCommon can write.
+// Generation refuses on an unresolved binary path by design.
+func scratchParams() (systemd.TemplateParams, systemd.LoaderParams) {
+	return systemd.TemplateParams{
+			ShimBinaryPath: "/fake/bin/anonctl-shim",
+			SetprivPath:    testSetprivPath,
+		}, systemd.LoaderParams{
+			NftPath: testNftPath,
+		}
 }
 
 func TestInstallTemplateWritesTheUnitAndLoader(t *testing.T) {
 	s := scratchStore(t)
-	if err := s.InstallCommon(systemd.TemplateParams{}, systemd.LoaderParams{}); err != nil {
+	tp, lp := scratchParams()
+	if err := s.InstallCommon(tp, lp); err != nil {
 		t.Fatalf("InstallCommon: %v", err)
 	}
 	// The @-template shim unit lands in the unit dir.
@@ -137,7 +152,8 @@ func TestHasForcedAccountsTracksRuleFiles(t *testing.T) {
 // remove a NON-empty dir (a survivor account's files stay put).
 func TestRemoveCommonRemovesSharedUnitsAndEmptyDirs(t *testing.T) {
 	s := scratchStore(t)
-	if err := s.InstallCommon(systemd.TemplateParams{}, systemd.LoaderParams{}); err != nil {
+	tp, lp := scratchParams()
+	if err := s.InstallCommon(tp, lp); err != nil {
 		t.Fatalf("InstallCommon: %v", err)
 	}
 	// Create the private dirs too (WriteAccount would; here we just want them empty).
