@@ -47,7 +47,22 @@ One mechanism runs on both distros, so every Debian test run exercises the NixOS
 - [x] `gofmt` / `go vet` / `go build` / `go test ./...` green, and `go test -tags integration ./internal/systemd/` green (real `systemd-analyze verify` parses the generated units).
 - [x] The baked path is the `$PATH` entry verbatim, never a resolved symlink target; verified against the pre-fix behaviour by swapping in `EvalSymlinks` and watching the test fail.
 - [x] The unit dir and the `.wants` dir are CREATED when missing, including parents (neither exists on a stock Debian or NixOS), and the unit dir is world-traversable.
-- [ ] **NOT DISCHARGED: a real NixOS host runs `add`, `rm`, `verify`, and the forcing survives an actual reboot.** See below.
+- [x] **DISCHARGED BY A REAL REBOOT on telemaque (NixOS), 2026-09-21:** the units installed to `/usr/local/lib/systemd/system`, were enabled ONLY by anonctl's own `.wants` symlinks, and FIRED AT BOOT (`anonctl-nftables.service` active since 13:29:42, plus two independent probe units on `multi-user.target` and on `sysinit.target` with `DefaultDependencies=no`/`Before=network-pre.target`). All reported `is-enabled: disabled` while demonstrably running, exactly as predicted.
+- [x] **The persisted rules were replayed EXACTLY:** a post-reboot `nft list table` matched the on-disk `/etc/anonctl/nftables/*.nft` byte for byte, and re-applying them live changed nothing.
+- [x] The baked `ExecStart` paths were the stable aliases (`/run/current-system/sw/bin/{nft,setpriv}`), with no `/nix/store` path and no shadowing unit in `/etc/systemd/system`.
+- [ ] **NOT DISCHARGED: `anonctl verify` passing end-to-end after a reboot.** The run that would have proven it was INVALID; see below.
+
+## Live acceptance: what the reboot proved, and what it invalidated
+
+**Proven.** Everything this task actually changed. The unit directory, the self-managed enablement, the resolved-and-verbatim binary paths and the boot replay of the rules all behaved as designed on a real NixOS host across a real reboot. Evidence in `work/notes/findings/systemd-enablement-target-and-nixos-fhs-gaps.md` §4c.
+
+**Invalidated, for a reason outside this task.** `anonctl verify` failed after the reboot with several "REACHED its target" leak assertions, but the run cannot be interpreted: telemaque sets `users.mutableUsers = false`, so NixOS activation DELETED both the anon and shim accounts at boot (one second before anonctl's loader restored their rules). The probes were measuring a host where the account no longer existed. Full evidence: `work/notes/findings/nixos-account-conventions-break-anonctl-provisioning.md`.
+
+That finding is more consequential than this task: it is a fail-open hazard (orphaned rules on freed UIDs, which get reallocated) and it cannot be fixed inside anonctl. It spawned `work/tasks/backlog/verify-must-detect-a-vanished-or-reassigned-account.md`.
+
+**Also blocked, independently:** `anonctl add` cannot complete on NixOS at all because of three FHS assumptions in the `anoncore` dependency (a `chown <acct>:<acct>` that assumes a user-private group, plus `/bin/bash` and `/usr/sbin/nologin` shells that do not exist there). The acceptance run only got past it via a deliberate, loudly-announced workaround. Same finding, §2 and §3.
+
+**Consequence for release: do NOT tag until those two are resolved.** The unit-install half is proven; "anonctl works on NixOS" is not yet a claim that can be made honestly.
 
 ## What is NOT discharged
 
@@ -63,6 +78,11 @@ preflight: cannot find the "anonctl-shim" binary (...); install it before forcin
 
 Both are the STABLE aliases, not store paths. The preflight refusal is correct behaviour: anonctl-shim is not installed on that host yet, and the refusal happens before any account would be created.
 
-The remaining blocker is privilege, not the host: the session still has `NoNewPrivs: 1`, so `sudo` cannot run and no install, no `add`/`rm`/`verify` and no reboot can be performed from here. The live gate must be run by a human with root.
+The privilege blocker was resolved by the operator running the gate manually (script kept at `~/anonctl-live-test.sh`, with `setup` / `check` / `diagnose` / `teardown` verbs, a hostname guard so it can never fire on the production Debian box, and a throwaway account).
+
+Two of the "failures" in that first run were bugs in the TEST, not the tool, and both are worth remembering because each is an instance of a trap this work is about:
+
+- The boot-mechanism probe exited `127` because its `ExecStart` used bare `mkdir`/`date`, and systemd's manager PATH on NixOS carries no coreutils. A `-` prefix then swallowed the failure, so a unit that HAD run looked like a unit that never ran. The probe testing the FHS assumption tripped over it.
+- A check grepped for the nft table as `anonctl_baseline_anon-livetest`, but nftables identifiers cannot contain `-`, so anonctl spells it `_`. That produced the scariest possible false alarm: "the resting deny is ABSENT" when it was present and correct.
 
 Remaining follow-up work is tracked in `work/tasks/ready/verify-boot-enablement-and-loader-health.md`.

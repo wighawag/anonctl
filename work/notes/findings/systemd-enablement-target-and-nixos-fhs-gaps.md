@@ -1,7 +1,7 @@
 ---
 title: systemd writes enablement symlinks to /etc/systemd/system regardless of where the unit lives, and NixOS ships almost no FHS binaries
 slug: systemd-enablement-target-and-nixos-fhs-gaps
-source: 'Direct measurement on telemaque (NixOS 26.05pre-git, systemd 260.2) 2026-09-20. Read-only proof: `ls -ld /etc/systemd/system`, `readlink -f`, and a `touch` that returned EROFS. Unit search path from `systemctl show --property=UnitPath`. Enablement-target behaviour proven by a live user-scope experiment (unit placed in ~/.local/share/systemd/user, `systemctl --user enable` observed creating the symlink under ~/.config/systemd/user/default.target.wants/), and a second experiment placing a hand-made .wants symlink ONLY in the non-config search dir, then reading `systemctl --user show default.target --property=Wants` and `is-enabled`. Corroborated against systemd.unit(5) as shipped on the box (UNIT FILE LOAD PATH table; the ".wants/" paragraph; the "After running systemctl enable, a symlink /etc/systemd/system/multi-user.target.wants/foo.service ... will be created" example). FHS gaps measured by direct existence tests on /usr/bin/setpriv, /usr/sbin/nft, /bin/sh, /bin/bash, /usr/local/bin.'
+source: 'CONFIRMED ON REAL HARDWARE ACROSS A REBOOT 2026-09-21 (see "Confirmed at boot" below): the central claim -- that a .wants symlink in a non-config unit dir is boot-effective -- was measured only in systemd USER scope when first written, and has since been proven at SYSTEM scope by rebooting telemaque and reading `systemctl status` on units that fired. Original: Direct measurement on telemaque (NixOS 26.05pre-git, systemd 260.2) 2026-09-20. Read-only proof: `ls -ld /etc/systemd/system`, `readlink -f`, and a `touch` that returned EROFS. Unit search path from `systemctl show --property=UnitPath`. Enablement-target behaviour proven by a live user-scope experiment (unit placed in ~/.local/share/systemd/user, `systemctl --user enable` observed creating the symlink under ~/.config/systemd/user/default.target.wants/), and a second experiment placing a hand-made .wants symlink ONLY in the non-config search dir, then reading `systemctl --user show default.target --property=Wants` and `is-enabled`. Corroborated against systemd.unit(5) as shipped on the box (UNIT FILE LOAD PATH table; the ".wants/" paragraph; the "After running systemctl enable, a symlink /etc/systemd/system/multi-user.target.wants/foo.service ... will be created" example). FHS gaps measured by direct existence tests on /usr/bin/setpriv, /usr/sbin/nft, /bin/sh, /bin/bash, /usr/local/bin.'
 ---
 
 Ground truth about **systemd's enablement mechanism** and **NixOS's filesystem layout**, gathered because anonctl could not install itself on NixOS. It corrects a downstream diagnosis which concluded the blocker was "purely WHERE the installer writes". It is not: there are three independent blockers, and the most dangerous one is fail-OPEN.
@@ -87,6 +87,36 @@ This breaks two generated units, and the second failure is the dangerous one:
 The second case is therefore **fail-OPEN at boot on NixOS**, and it is the precise failure mode ADR-0005 was written to close after the Debian `nftables.service` incident. It is also silent: the account exists, its config and marker are intact, and only the failed loader unit records anything.
 
 Note the Go code is NOT affected by this: `nft`, `systemctl` and `getent` are invoked by bare name through `$PATH`, and `use_exec.go` already resolves `setpriv` with `exec.LookPath`. The hard-coded absolute paths exist only in the **generated unit text**, where they are in fact required (a unit has no useful inherited `$PATH`, so `ExecStart` must be absolute). The fix is therefore to RESOLVE the path at install time and bake the resolved absolute path into the unit, not to drop to a bare name.
+
+## 4b. systemd's own manager PATH on NixOS contains NO coreutils
+
+Measured from `systemctl show-environment` on telemaque:
+
+```
+PATH=/nix/store/…-dosfstools-4.2/bin:/nix/store/…-mtools-4.0.49/bin:
+     /nix/store/…-e2fsprogs-1.47.4-bin/bin:/nix/store/…-util-linux-minimal-2.42.2-bin/bin:
+     /nix/store/…-openssh-10.5p1/bin:/nix/store/…-systemd-260.2/bin/
+```
+
+That is the PATH a unit inherits when it does not set its own. There is **no `coreutils`**, so a unit whose `ExecStart` names a bare `mkdir`, `date`, `cat` or `rm` exits **127 (command not found)**. This is not a variation on §4; it is the reason §4 has no workaround: "just use the bare name and let `$PATH` find it" does not work in a unit on this distro, so an absolute, RESOLVED path is the only correct answer.
+
+Proven the hard way: a throwaway probe unit written for the acceptance run used `ExecStart=-/bin/sh -c 'mkdir -p … && date -Is > …'` and exited 127 at boot, writing no evidence. Because it carried a `-` prefix, systemd recorded the unit as successfully `active (exited)` and the failure was silent. The probe intended to test systemd's behaviour tested the author's own FHS assumption instead. Shell BUILTINS are safe (`echo`, `[`), and `systemd`'s own `RuntimeDirectory=` is the right way to create a directory without spawning `mkdir`.
+
+This is also why anonctl's loader unit works on NixOS: its `ExecStart` is `/bin/sh -c 'for f in …; do [ -e "$f" ] && /run/current-system/sw/bin/nft -f "$f"; done'`, which needs no `$PATH` lookup at all (`[` is a builtin, `nft` is absolute).
+
+## 4c. Confirmed at boot: a `.wants` symlink outside the config dir IS boot-effective at system scope
+
+The original §2 measured this in systemd USER scope only, which was the largest outstanding assumption in the whole fix. Discharged on telemaque by an actual reboot on 2026-09-21. After the reboot, with the ONLY enablement being hand-made symlinks under `/usr/local/lib/systemd/system/<target>.wants/` and no `systemctl enable` ever called:
+
+```
+anonctl-nftables.service   Active: active (exited) since 13:29:42   Loaded: …; disabled; preset: ignored
+anonctl-probe-mu.service   Active: active (exited) since 13:29:44   (multi-user.target)
+anonctl-probe-si.service   Active: active (exited) since 13:29:44   (sysinit.target)
+```
+
+All three ran, including the `sysinit.target` case with `DefaultDependencies=no` / `Before=network-pre.target`, which is the early-boot shape the nftables loader needs. Note every one of them reports `disabled` while being demonstrably wired to boot, exactly as §2 predicted: `is-enabled` reads only the config dir and is therefore the WRONG question to ask about boot-persistence.
+
+The persisted nft rules were also replayed exactly: a post-reboot `nft list table` matched the on-disk `/etc/anonctl/nftables/*.nft` content byte for byte, and re-applying them live changed nothing.
 
 ## 5. Smaller FHS assumptions in the `use` session
 
