@@ -15,7 +15,7 @@ import (
 // UID: a TEST-NET-1 (RFC 5737) documentation address that is safe to name and
 // never a real host. The probe never depends on it replying: a dropped ping (the
 // PASS) and an unreachable-but-not-dropped host both yield no reply, so the probe
-// reads whether the anon UID could EMIT ICMP at all, which the policy DROP forbids.
+// reads whether the anon UID could EMIT ICMP at all, which the anon closure chain's terminal `drop` forbids.
 const icmpProbeTarget = "192.0.2.1"
 
 // probeExecBudget is the outer deadline probeAsAnon puts on the setpriv+shim exec.
@@ -32,7 +32,7 @@ var probeExecBudget = shim.ProbeTimeout + 1*time.Second
 // probe dials AS the anon UID: a public resolver IP on a raw high port (row 5's
 // hand-verified `socat UDP4:1.1.1.1:9999` shape) plus, separately, UDP/443 (QUIC).
 // SOCKS carries TCP only, so any UDP that is not the redirected 53 falls through to
-// the anon UID's policy DROP; the probe proves the drop.
+// the anon UID's terminal `drop`; the probe proves the drop.
 const (
 	udpProbeHost    = "1.1.1.1"
 	udpRawProbePort = 9999
@@ -142,7 +142,7 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 			// daddr in the clear. A loopback TCP dial can NOT prove this (the transparent
 			// relay always completes the handshake), so we read the escaped-leak counter
 			// for a raw non-53 UDP datagram to an off-box v4 host: nat redirects only
-			// tcp + udp/53, so raw UDP falls through to the policy DROP (recipe row 3's
+			// tcp + udp/53, so raw UDP falls through to the terminal `drop` (recipe row 3's
 			// `socat UDP4:1.1.1.1:9999` EPERM). If the v4 drop were broken the datagram
 			// would escape with the off-box daddr and move the counter (a real leak).
 			// A counter plant/read error fails LOUD (a probe that could not run is not a
@@ -189,7 +189,7 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 		}},
 		{Name: AssertICMPDrop, Run: func(ctx context.Context) Assertion {
 			// Tails leak-catalogue row 4: an ICMP echo from the anon UID to an off-box
-			// address must be DROPPED. It falls through to the policy DROP, so a ping
+			// address must be DROPPED. It falls through to the terminal `drop`, so a ping
 			// gets no reply => reached=false => PASS. The off-box target is a
 			// documentation/TEST-NET address; the probe never depends on it being up
 			// (a dropped ping and an unreachable host both read as reached=false, the
@@ -314,7 +314,7 @@ func exemptHost(exempt string) string {
 //
 // This is used only for the non-tcp-udp-drop assertion, which dials an OFF-BOX UDP
 // destination (nat redirects only udp/53, so any other UDP falls through to the
-// policy DROP and the EPERM is a truthful off-box drop signal, no counter needed).
+// terminal `drop` and the EPERM is a truthful off-box drop signal, no counter needed).
 func udpSendAsAnon(ctx context.Context, p LiveParams, addr string) (bool, error) {
 	return probeAsAnon(ctx, p, "udp4", addr)
 }

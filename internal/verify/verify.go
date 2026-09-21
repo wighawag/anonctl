@@ -22,10 +22,10 @@
 //     `<account>@` isolation username.
 //   - icmp-drop: an ICMP echo (`ping`) from the anon UID to an off-box address is
 //     DROPPED (it does not emit an ICMP packet carrying the real source IP). Tails
-//     leak-catalogue row 4; it falls through to the anon UID's policy DROP.
+//     leak-catalogue row 4; it falls through to the anon UID's terminal `drop`.
 //   - non-tcp-udp-drop: raw non-53 UDP from the anon UID, specifically including
 //     UDP/443 (QUIC / HTTP-3), is DROPPED. SOCKS carries TCP only, so UDP/443 is
-//     unrelayable; Tails leak-catalogue row 5, it falls through to the policy DROP.
+//     unrelayable; Tails leak-catalogue row 5, it falls through to the terminal `drop`.
 //   - split-tunnel-tight (with a LAN exemption active): the exempted host:port is
 //     reachable directly, but the rest of that /24, other loopback, and everything
 //     else stay redirected-or-dropped.
@@ -594,7 +594,7 @@ func BypassEndpointClosureAssertion(reached bool) Assertion {
 // ICMPDropAssertion is the Tails leak-catalogue row-4 decision: an ICMP echo
 // (`ping`) from the anon UID to an off-box address must be DROPPED, so no ICMP
 // packet carrying the real source IP ever leaves the box. It falls through to the
-// anon UID's policy DROP in the shipped ruleset (there is no ICMP accept for the
+// anon UID's terminal `drop` in the shipped ruleset (there is no ICMP accept for the
 // anon UID), so this assertion PROVES the drop rather than assuming it. reached is
 // whether the ping egressed / got a reply (true == a leak == fail); a dropped ping
 // (no ICMP left, no reply) is reached=false and PASSES. anonctl drops ICMP for the
@@ -607,7 +607,7 @@ func ICMPDropAssertion(reached bool) Assertion {
 // NonTCPUDPDropAssertion is the Tails leak-catalogue row-5 decision: raw non-53
 // UDP from the anon UID must be DROPPED, specifically INCLUDING UDP/443 (QUIC /
 // HTTP-3). SOCKS carries TCP only, so any UDP that is not the redirected 53 is
-// unrelayable and falls through to the anon UID's policy DROP; this assertion
+// unrelayable and falls through to the anon UID's terminal `drop`; this assertion
 // PROVES the drop. rawReached / quic443Reached are whether a raw non-53 UDP
 // datagram and, specifically, a UDP/443 datagram egressed from the anon UID (true
 // == a leak == fail); both must be dropped for a PASS. A real client is expected

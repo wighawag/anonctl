@@ -1,6 +1,6 @@
 # The loopback exemption: its port blocklist, and closure (a) now rests on that blocklist being complete
 
-Status: accepted
+Status: accepted (amended: closure (a)'s rules moved from the `filter_out` base chain into the `anon_filter` closure chain, and the `ip daddr 127.0.0.0/8 drop` they rest on is now followed by an unconditional terminal drop -- see "Where closure (a) now lives" below. The blocklist, the guardrail split, and the invariant itself are unchanged.)
 
 ## Context
 
@@ -25,12 +25,22 @@ Loopback is special: it is the anonymizer's OWN control surface. The shim's tran
   This two-layer split is the coherent home for each half: the static set is universal and belongs in the pure guardrail (unit-tested everywhere); the per-account set belongs in the generator's existing fail-loud validation (which already rejects a nonsensical `Params`). Both fire at config time, before any nft/systemd mutation, so a refusal leaves the box untouched. A LAN exemption is NEVER subject to the account-port check: a LAN host's `:19050` is a different socket than the loopback shim.
 
 - **The mechanism is a loopback branch in the generator emitting TWO rules per exempt port, mirroring the LAN branch.** For a loopback exempt port the generator emits, for the anon UID:
-  - a `nat_out` **`return`** for `ip daddr 127.0.0.1 tcp dport <port>`, placed BEFORE the catch-all `meta l4proto tcp redirect to :<relay>`, so the dial is NOT swallowed into the shim and reaches the same-host service directly; and
-  - a `filter_out` **`accept`** for the same match, placed BEFORE the `ip daddr 127.0.0.0/8 drop`, so the fail-closed default-DROP does not drop it.
+  - a **`return`** for `ip daddr 127.0.0.1 tcp dport <port>` on the nat side, placed BEFORE the catch-all `meta l4proto tcp redirect to :<relay>`, so the dial is NOT swallowed into the shim and reaches the same-host service directly; and
+  - an **`accept`** for the same match on the filter side, placed BEFORE the `ip daddr 127.0.0.0/8 drop`, so the fail-closed default-DROP does not drop it.
+
+  (Both rules now live in the per-UID closure chains `anon_nat` / `anon_filter` rather than directly in the `nat_out` / `filter_out` base chains; see the amendment below. Their content, their match, and their position relative to the redirect and the loopback drop are unchanged.)
 
   The emitted nft CLAUSE is byte-identical in shape to the LAN branch (`<family> daddr <dst> tcp dport <port>`), because a loopback `/32` renders as the bare `127.0.0.1`; the two classes diverge at the GUARDRAIL (which ports each may name), not in the emitted rule, so `exemptMatch` stays one shared helper. The LAN branch is unchanged.
 
 - **Closure (a) moves from "only the shim on loopback, full stop" to "the shim PLUS operator-named non-anonymizer loopback ports", so safety now rests on the blocklist being COMPLETE.** This is the one new load-bearing invariant. Before this feature, closure (a) was absolute: the anon UID could reach ONLY its own shim's loopback ports; every other `127.0.0.0/8` destination was dropped, no exceptions. Now the operator can punch a hole for a named loopback port, so closure (a) is "the shim ports, plus exactly the exempted non-anonymizer loopback ports, and nothing else". The `ip daddr 127.0.0.0/8 drop` STILL follows the exemption accepts, so every OTHER loopback port is still dropped (the exemption does not widen loopback), and closure (b)'s direct-endpoint DROP is untouched. But the SAFETY of "the anon UID cannot dial the anonymizer's control surface" now depends on the port blocklist above being complete: a missing port would be an exemptable hole into the control surface. Hence this blocklist is enumerated here with its rationale (mirroring ADR-0001's heuristic-with-rationale stance and ADR-0007's "reach exactly this service" granularity), and extended only with a recorded reason.
+
+## Where closure (a) now lives (amendment, 2026-09-21)
+
+ADR-0002's amendment moved every per-UID rule out of the `nat_out` / `filter_out` BASE chains and into regular chains (`anon_nat`, `anon_filter`, `shim_filter`) reached only by a positive `meta skuid` jump, because the base chains' negative-match pass-through was adjudicating packets the kernel could not attribute and killing every other uid's larger TCP transfers box-wide. Closure (a) is affected only in WHERE its rules sit, but two details matter to this ADR specifically:
+
+- **Closure (a)'s "every OTHER loopback port is still dropped" now has a second backstop.** The `meta skuid <anon> ip daddr 127.0.0.0/8 drop` that follows the exemption accepts is unchanged and still does the work. Behind it, `anon_filter` now ends in an unconditional terminal `drop`, so a loopback destination that somehow slipped past the `/8` match (a v6 loopback form, say) is dropped rather than falling through to a policy. Closure (a) got strictly tighter, not looser.
+- **The ORDERING constraint this ADR states has gained a third term, and it is the one a future edit is most likely to break.** The exemption accept must precede the broad `127.0.0.0/8 drop` (as before) AND must precede the terminal drop. A terminal drop emitted before the exemption accepts would kill every direct hole from inside the forcing table itself, which is the same class of break `work/notes/findings/split-tunnel-broken-by-exemption-blind-baseline.md` records, arrived at from a different direction. Pinned by `TestGenerateExemptionAcceptPrecedesTheTerminalDrop`, and the terminal-drop-is-last assertion runs against a params set WITH exemptions as well as without.
+- **The account-specific port blocklist in `Generate.validate` is untouched.** It runs before any text is emitted, so it is independent of chain shape.
 
 ## Consequences
 

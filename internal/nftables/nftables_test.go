@@ -39,6 +39,52 @@ func sampleParams() nftables.Params {
 	}
 }
 
+// paramsWithExemptions is sampleParams plus the given parsed exemptions, for the
+// tests that must hold with a direct hole open as well as without one.
+func paramsWithExemptions(t *testing.T, raw ...string) nftables.Params {
+	t.Helper()
+	p := sampleParams()
+	for _, r := range raw {
+		p.Exemptions = append(p.Exemptions, mustExempt(t, r))
+	}
+	return p
+}
+
+// chainBody returns the text BETWEEN `chain <name> {` and its closing brace. The
+// restructured ruleset puts every verdict in a per-UID closure chain, so the
+// security assertions are about WHICH CHAIN a rule is in and WHERE IN THAT CHAIN
+// it sits -- a whole-output strings.Contains cannot tell those apart, and that
+// imprecision is part of why the original bug read as correct in the unit tests.
+func chainBody(t *testing.T, out, name string) string {
+	t.Helper()
+	open := "chain " + name + " {"
+	i := strings.Index(out, open)
+	if i < 0 {
+		t.Fatalf("no chain %q in:\n%s", name, out)
+	}
+	rest := out[i+len(open):]
+	j := strings.Index(rest, "\n    }")
+	if j < 0 {
+		t.Fatalf("chain %q is not terminated in:\n%s", name, out)
+	}
+	return rest[:j]
+}
+
+// nonEmptyRules splits a chain body into its actual rules, dropping blank lines
+// and `#` comments, so "the LAST rule" means the last rule the kernel will
+// evaluate rather than the last line of text.
+func nonEmptyRules(body string) []string {
+	var rules []string
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		rules = append(rules, line)
+	}
+	return rules
+}
+
 func TestGenerateIsSingleInetTable(t *testing.T) {
 	out, err := nftables.Generate(sampleParams())
 	if err != nil {
@@ -67,9 +113,12 @@ func TestGenerateRedirectsAnonTCPAndDNS(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 	// The nat/output chain must run before the filter chain (dstnat priority) and
-	// only rewrite the anon UID.
+	// only rewrite the anon UID. It reaches the rewrites ONLY through a POSITIVE
+	// skuid jump: the negative form this replaces (`meta skuid != 30034 return`) let
+	// a packet with no attributable socket owner fall through into the catch-all
+	// redirect, which would push an UNINVOLVED uid's traffic into the anon shim.
 	mustContain(t, out, "type nat hook output priority dstnat")
-	mustContain(t, out, "meta skuid != 30034 return")
+	mustContain(t, out, "meta skuid 30034 jump anon_nat")
 	// Its own shim ports are left as-is (a REDIRECTed packet re-enters filter with
 	// the dst already rewritten to the shim port).
 	mustContain(t, out, "ip daddr 127.0.0.1 tcp dport { 19050, 19053 } return")
@@ -78,18 +127,148 @@ func TestGenerateRedirectsAnonTCPAndDNS(t *testing.T) {
 	mustContain(t, out, "udp dport 53 redirect to :19053")
 	mustContain(t, out, "tcp dport 53 redirect to :19053")
 	mustContain(t, out, "meta l4proto tcp redirect to :19050")
+
+	// The catch-all redirect must be REACHABLE ONLY from the anon UID's own chain.
+	// In the negative-match form it lived in the BASE chain, one fallthrough away
+	// from any packet the kernel could not attribute, and the failure mode there is
+	// worse than a drop: an uninvolved uid's traffic redirected INTO the anon shim.
+	natBase := chainBody(t, out, "nat_out")
+	for _, rule := range nonEmptyRules(natBase) {
+		if strings.HasPrefix(rule, "type ") {
+			continue
+		}
+		if !strings.HasPrefix(rule, "meta skuid ") || !strings.Contains(rule, " jump ") {
+			t.Errorf("the nat base chain must only JUMP on a positive uid match, never hold a rewrite\n"+
+				"of its own; got %q in:\n%s", rule, natBase)
+		}
+	}
+	if strings.Contains(natBase, "redirect") {
+		t.Errorf("a redirect in the nat BASE chain can swallow an unattributable packet:\n%s", natBase)
+	}
 }
 
-func TestGenerateFilterDefaultDrop(t *testing.T) {
+// TestGenerateFilterGovernsOnlyItsOwnUIDs pins the box-wide invariant: the filter
+// base chain must never adjudicate a packet anonctl cannot attribute to one of its
+// own UIDs. It is policy ACCEPT and contains NOTHING but positive-skuid jumps, so
+// an uninvolved uid's packet -- and, critically, a locally generated packet with no
+// attributable socket owner at all (bulk TCP data emitted from a deferred context,
+// pure ACKs, the FIN, RTO retransmissions) -- takes no jump and is accepted.
+//
+// The shape this replaces was `policy drop` plus a NEGATIVE pass-through
+// (`meta skuid != 30034 meta skuid != 995 accept`). An unattributable packet
+// matches neither `skuid == u` nor `skuid != u`, so it took no accept, fell
+// through, and was killed by the policy drop. Because a `drop` is terminal across
+// every base chain at a hook, that broke larger TCP transfers for EVERY uid on the
+// box, root included, in a chain whose own header claimed to touch no other uid.
+func TestGenerateFilterGovernsOnlyItsOwnUIDs(t *testing.T) {
 	out, err := nftables.Generate(sampleParams())
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
-	// The filter/output chain is DEFAULT-DROP (fail-closed) and governs only the
-	// anon + shim UIDs (every other UID is accepted so the table never touches the
-	// rest of the host).
-	mustContain(t, out, "type filter hook output priority filter; policy drop;")
-	mustContain(t, out, "meta skuid != 30034 meta skuid != 995 accept")
+	mustContain(t, out, "type filter hook output priority filter; policy accept;")
+	mustContain(t, out, "meta skuid 995 jump shim_filter")
+	mustContain(t, out, "meta skuid 30034 jump anon_filter")
+
+	// NO negative skuid match may survive anywhere in the ruleset: that is the exact
+	// construct that adjudicates unattributable packets.
+	if strings.Contains(out, "skuid !=") {
+		t.Errorf("a negative `meta skuid !=` match is back: it adjudicates packets that carry NO\n"+
+			"socket uid and so match neither form. Match the governed UIDs POSITIVELY instead:\n%s", out)
+	}
+
+	// The filter BASE chain must hold nothing but the two jumps: any verdict on a
+	// rule there would apply to traffic that has not been attributed to a governed
+	// UID. (The `type ... policy accept;` declaration is the chain header, not a
+	// rule, and is asserted separately above.)
+	base := chainBody(t, out, "filter_out")
+	for _, rule := range nonEmptyRules(base) {
+		if strings.HasPrefix(rule, "type ") {
+			continue
+		}
+		if !strings.Contains(rule, " jump ") {
+			t.Errorf("the filter base chain must only JUMP on a positive uid match; the rule %q\n"+
+				"carries a verdict of its own, which would adjudicate unattributable traffic:\n%s", rule, base)
+		}
+		if !strings.HasPrefix(rule, "meta skuid ") {
+			t.Errorf("every rule in the filter base chain must be gated on a POSITIVE skuid match;\n"+
+				"got %q in:\n%s", rule, base)
+		}
+	}
+}
+
+// TestAnonClosureChainEndsInAnUnconditionalTerminalDrop is the counterweight to the
+// test above, and it guards the exact mistake that turns this fix into a silent
+// un-jailing. The anon UID's real egress used to be dropped by the base chain's
+// POLICY, not by any rule. Flipping that policy to accept without an unconditional
+// terminal `drop` at the END of the anon closure chain does not degrade the jail,
+// it REMOVES it: the anon UID's ICMP and its non-53 UDP are never redirected, so
+// they arrive at this chain with their real off-box destination and are matched by
+// nothing above the terminal drop (these are precisely the `verify` assertions
+// icmp-drop and non-tcp-udp-drop). The standing baseline table would still drop
+// that traffic, so the regression presents as "everything still passes" while the
+// forcing table has silently stopped forcing.
+//
+// Measured, with the forcing table loaded ALONE in a namespace so the baseline
+// cannot mask it: with the terminal drop present, anon ICMP and anon UDP/4444 are
+// dropped; with ONLY that one line removed, both escape.
+func TestAnonClosureChainEndsInAnUnconditionalTerminalDrop(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		p    nftables.Params
+	}{
+		{"plain", sampleParams()},
+		{"with exemptions", paramsWithExemptions(t, "192.168.1.150:8080", "127.0.0.1:8188")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := nftables.Generate(tc.p)
+			if err != nil {
+				t.Fatalf("Generate: %v", err)
+			}
+			body := chainBody(t, out, "anon_filter")
+			rules := nonEmptyRules(body)
+			if len(rules) == 0 {
+				t.Fatalf("anon_filter chain is empty:\n%s", out)
+			}
+			last := rules[len(rules)-1]
+			if last != "drop" {
+				t.Fatalf("the anon closure chain MUST end in an unconditional, unqualified `drop`.\n"+
+					"Its last rule is %q. Without it the chain falls back to filter_out's policy ACCEPT\n"+
+					"and the anon UID's ICMP / non-53 UDP leave IN THE CLEAR (masked in a casual test by\n"+
+					"the standing baseline table dropping them instead). Chain:\n%s", last, body)
+			}
+			// Unconditional means unqualified: a `meta skuid <anon> drop` terminal would
+			// re-introduce the original bug inside the closure chain.
+			if strings.Contains(last, "skuid") {
+				t.Errorf("the terminal drop must be UNCONDITIONAL, not qualified by skuid; got %q", last)
+			}
+		})
+	}
+}
+
+// TestGenerateExemptionAcceptPrecedesTheTerminalDrop pins the split-tunnel ordering
+// against the NEW terminal rule. The exemption `accept` is what lets a deliberately
+// un-forced destination leave directly; if the terminal drop were ever emitted
+// before it, the direct hole would be killed inside the forcing table itself --
+// the same class of break that
+// work/notes/findings/split-tunnel-broken-by-exemption-blind-baseline.md records,
+// arrived at from a different direction.
+func TestGenerateExemptionAcceptPrecedesTheTerminalDrop(t *testing.T) {
+	out, err := nftables.Generate(paramsWithExemptions(t, "192.168.1.150:8080"))
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	body := chainBody(t, out, "anon_filter")
+	accept := "meta skuid 30034 ip daddr 192.168.1.150 tcp dport 8080 accept"
+	if !strings.Contains(body, accept) {
+		t.Fatalf("missing the exemption accept %q in:\n%s", accept, body)
+	}
+	rules := nonEmptyRules(body)
+	if rules[len(rules)-1] != "drop" {
+		t.Fatalf("expected the terminal drop last; got %q", rules[len(rules)-1])
+	}
+	if strings.Index(body, accept) > strings.LastIndex(body, "drop") {
+		t.Errorf("the exemption accept must precede the terminal drop, or split tunnelling re-breaks:\n%s", body)
+	}
 }
 
 func TestGenerateShimIsOnlyUIDToReachEndpoint(t *testing.T) {
@@ -155,7 +334,7 @@ func TestGenerateParameterises(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 	mustContain(t, out, "table inet anonctl_work {")
-	mustContain(t, out, "meta skuid != 41000 return")
+	mustContain(t, out, "meta skuid 41000 jump anon_nat")
 	mustContain(t, out, "meta l4proto tcp redirect to :29050")
 	mustContain(t, out, "udp dport 53 redirect to :29053")
 	mustContain(t, out, "meta skuid 990 ip daddr 127.0.0.1 tcp dport 1080 accept")
@@ -356,7 +535,7 @@ func TestGenerateExemptOrderingBeforeDrops(t *testing.T) {
 	}
 
 	// filter_out: the exempt ACCEPT must precede the anon-UID loopback drop and the
-	// policy drop (which lives at the chain default, after every rule).
+	// terminal drop (which is the anon closure chain's last rule).
 	exemptAccept := "meta skuid 30034 ip daddr 192.168.1.150 tcp dport 8080 accept"
 	anonLoopbackDrop := "meta skuid 30034 ip daddr 127.0.0.0/8 drop"
 	if i(exemptAccept) < 0 || i(exemptAccept) > i(anonLoopbackDrop) {

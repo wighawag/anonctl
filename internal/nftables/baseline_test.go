@@ -160,6 +160,69 @@ func TestGenerateBaselineParameterises(t *testing.T) {
 	}
 }
 
+// TestBaselineDropsMatchTheAnonUIDPositively pins the DIRECTION of the baseline's
+// skuid matches, and records why the residual that direction leaves open is
+// acceptable, so neither half is later "tidied" into the other.
+//
+// The baseline governs one UID from a base chain at the output hook, which every
+// packet the host sends passes through. It must therefore only ever drop a packet
+// it can POSITIVELY attribute to the account it governs. A negative match
+// (`meta skuid != <anon> ... accept/return`) would look like it closes the
+// unattributable-packet gap, and would instead re-create the box-wide bug the
+// forcing filter chain had: a locally generated packet with no socket owner
+// matches neither `skuid == u` nor `skuid != u`, so it would fall through into a
+// terminal verdict meant for somebody else's traffic.
+//
+// The accepted cost is that an UNATTRIBUTABLE anon-UID packet escapes the resting
+// drop. It is not reachable: unattributable packets only exist inside an
+// established TCP flow, a new flow's SYN always carries a socket UID and is
+// therefore always caught by these positive matches, and with forcing PRESENT the
+// flow's destination has already been rewritten to loopback (which this chain
+// returns by design). See the analysis in baseline.go's header for the measurements.
+func TestBaselineDropsMatchTheAnonUIDPositively(t *testing.T) {
+	out, err := nftables.GenerateBaseline("anon", 30034, nil)
+	if err != nil {
+		t.Fatalf("GenerateBaseline: %v", err)
+	}
+	// The resting drops are positive-match, and the chain stays policy ACCEPT so it
+	// never touches another UID.
+	mustContain(t, out, "type filter hook output priority filter; policy accept;")
+	mustContain(t, out, "meta skuid 30034 ip daddr != 127.0.0.0/8 drop")
+	mustContain(t, out, "meta skuid 30034 ip6 daddr != ::1 drop")
+
+	// No NEGATIVE skuid match anywhere: `ip daddr != ...` is fine (it narrows a
+	// destination for an already-attributed UID); `meta skuid != ...` is not.
+	if strings.Contains(out, "skuid !=") {
+		t.Errorf("the baseline must never match a uid NEGATIVELY: an unattributable packet matches\n"+
+			"neither form and would fall through into a verdict intended for another uid's traffic,\n"+
+			"which is the box-wide bug the forcing filter chain had. Got:\n%s", out)
+	}
+
+	// Every rule that carries a DROP must be gated on the governed UID.
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasSuffix(trimmed, " drop") {
+			continue
+		}
+		if !strings.HasPrefix(trimmed, "meta skuid 30034 ") {
+			t.Errorf("a baseline drop that is not gated on the governed uid would adjudicate traffic\n"+
+				"anonctl does not govern; got %q", trimmed)
+		}
+	}
+
+	// And it must NOT have grown a terminal unconditional drop: unlike the forcing
+	// table's anon closure chain (which is entered only after a positive uid match,
+	// so an unconditional drop there is scoped), this IS a base chain, and an
+	// unconditional drop in it would kill every packet on the box.
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == "drop" {
+			t.Fatalf("an UNCONDITIONAL drop in the baseline BASE chain would drop every packet the\n"+
+				"host sends. The unconditional terminal drop belongs in the forcing table's anon\n"+
+				"CLOSURE chain, which is only entered on a positive uid match. Got:\n%s", out)
+		}
+	}
+}
+
 func TestGenerateBaselineTableName(t *testing.T) {
 	// nft identifiers cannot contain '-', so a named account's '-' becomes '_'
 	// (mirrors TableName), and the baseline table name derives from the forcing one.

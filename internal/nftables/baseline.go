@@ -36,6 +36,46 @@ import (
 // baseline returns it, the forcing table governs it (shim path works). Forcing
 // ABSENT => no redirect, the anon UID's real egress stays non-loopback, the
 // baseline DROPS it. Un-forced = dropped, by construction, at any boot ordering.
+//
+// WHY THE RESTING DROPS MATCH THE UID POSITIVELY, AND WHAT THAT LEAVES OPEN.
+// `meta skuid <anon> ip daddr != 127.0.0.0/8 drop` is a POSITIVE skuid match, so a
+// locally generated packet carrying NO attributable socket owner (much of ordinary
+// bulk TCP output is such a packet: see the forcing generator's package doc)
+// ESCAPES this drop rather than being caught by it. That asymmetry is deliberate
+// and it is the SAFE direction for a base chain: the alternative, catching those
+// packets with a negative match, is exactly the construct that made the forcing
+// filter chain drop every other uid's traffic box-wide. A base chain at the output
+// hook must only ever adjudicate what it can attribute; the cost is this residual,
+// and the residual is not reachable:
+//
+//   - Forcing ABSENT: the anon UID cannot get a flow off the ground, because a
+//     new connection's SYN always carries a socket UID and is therefore always
+//     caught by the positive match above. The SYN RETRANSMISSION is the case to
+//     check here, not the established-flow case, and it is the one that was
+//     measured: a dropped SYN is never confirmed in conntrack, so it is
+//     retransmitted from TIMER context as a fresh connection, and if THAT were
+//     unattributable it would escape this drop and leave with the host's real
+//     address. It is not. Measured in a namespace with ONLY the baseline loaded,
+//     over a 20-second dial: 9 v4 SYNs and 9 v6 SYNs (each one original plus 8
+//     retransmissions), ALL attributable, ALL dropped, and zero packets escaping
+//     with an off-box destination. The same run with no tables loaded saw all 9
+//     escape, which is what makes the zero meaningful rather than accidental.
+//   - Forcing PRESENT: the anon UID's flows have already had their destination
+//     rewritten to a loopback shim port by the forcing nat chain, on the SYN, and
+//     conntrack applies that same rewrite to every later packet of the flow whether
+//     or not it is attributable. So an unattributable follow-on packet carries a
+//     LOOPBACK destination, which this chain returns by design. The one class that
+//     is deliberately not rewritten is a LAN/loopback exemption, and an
+//     unattributable packet of an exempted flow leaving directly is precisely what
+//     the exemption is for.
+//
+// For FOLLOW-ON packets the protection that carries the weight is therefore the
+// DESTINATION REWRITE, not the filter match; for the FIRST packet of a flow (and
+// every retransmission of it) the filter match carries it, because those are
+// always attributable. This residual is irreducible at the nftables layer
+// (identifying an unattributable packet as the anon UID's is impossible by
+// definition), so it is documented and pinned by a test rather than "fixed".
+// Pinned by TestBaselineDropsMatchTheAnonUIDPositively.
 
 // BaselineTableName is the baseline default-deny table for an account
 // (`anonctl_baseline_<account>`). It derives from the forcing TableName so the two
@@ -118,7 +158,11 @@ func GenerateBaseline(account string, anonUID int, exemptions []lanexempt.Exempt
 		w("        meta skuid %d %s return", anonUID, exemptMatch(e))
 	}
 	// The resting-state DROP: every NON-loopback destination for the anon UID (v4
-	// AND v6) is dropped. This is the whole point: un-forced = dropped.
+	// AND v6) is dropped. This is the whole point: un-forced = dropped. The match is
+	// POSITIVE on the anon UID (never `skuid != ...`), so this chain can only ever
+	// drop a packet it has positively attributed to the account it governs; see the
+	// residual analysis in this file's header for what that deliberately leaves open
+	// and why it is not reachable.
 	w("        meta skuid %d ip daddr != 127.0.0.0/8 drop", anonUID)
 	w("        meta skuid %d ip6 daddr != ::1 drop", anonUID)
 	w("    }")

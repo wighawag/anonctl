@@ -6,6 +6,7 @@ package systemd_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
@@ -151,13 +152,38 @@ func TestBootInvariantAnonUIDHasNoDirectEgressBeforeShim(t *testing.T) {
 		t.Errorf("BOOT INVARIANT VIOLATED: the anon UID reached 1.1.1.1:443 directly with the shim NOT running (a leak); at boot, before the shim is up, egress must be DROPPED")
 	}
 
-	// Also assert the persisted ruleset actually carries the fail-closed default-DROP
-	// and the closure drops (so the drop above is by policy, not by a missing route).
+	// Also assert the persisted ruleset actually carries the fail-closed drops (so the
+	// drop above is by an EXPLICIT RULE, not by a missing route).
+	//
+	// This used to assert `policy drop` on the base chain. It no longer can, and the
+	// reason matters to this test specifically: that drop policy was adjudicating
+	// packets the kernel could not attribute to ANY uid, which killed every other
+	// uid's larger TCP transfers box-wide. The base chain is now policy ACCEPT holding
+	// only positive-uid jumps, and fail-closed moved into the anon closure chain's
+	// unconditional TERMINAL DROP (docs/adr/0002). The boot invariant this test guards
+	// is unchanged -- un-forced still means dropped -- so the assertion FOLLOWS the
+	// rule that now enforces it rather than being deleted.
 	listed := listLoadedTable(t, r, table)
-	for _, want := range []string{"policy drop", "127.0.0.0/8", "::/0"} {
+	for _, want := range []string{
+		fmt.Sprintf("meta skuid %d jump anon_filter", anonUID),
+		"127.0.0.0/8",
+		"::/0",
+	} {
 		if !strings.Contains(listed, want) {
 			t.Errorf("persisted boot ruleset missing the fail-closed line %q:\n%s", want, listed)
 		}
+	}
+	if strings.Contains(listed, "skuid !=") {
+		t.Errorf("the persisted boot ruleset carries a NEGATIVE uid match: at boot this chain\n"+
+			"adjudicates every packet the host sends, so it must only ever match the uids it\n"+
+			"governs positively:\n%s", listed)
+	}
+	if last := lastAnonFilterRule(listed); last != "drop" {
+		t.Errorf("BOOT INVARIANT AT RISK: the anon closure chain must END in an unconditional\n"+
+			"`drop`; its last rule is %q. Without it the anon UID's non-redirected egress falls\n"+
+			"back to the base chain's policy ACCEPT. The probe above would still pass, because\n"+
+			"the standing baseline table drops that traffic too -- which is exactly how this\n"+
+			"regression hides:\n%s", last, listed)
 	}
 
 	// The sentinel (a stand-in for the host's own rules) is untouched: the boot rules
@@ -202,6 +228,30 @@ func tableLoaded(t *testing.T, r nftExec, table string) bool {
 		}
 	}
 	return false
+}
+
+// lastAnonFilterRule returns the final rule of the anon closure chain as the
+// KERNEL prints it, which is where fail-closed now lives. See docs/adr/0002.
+func lastAnonFilterRule(listed string) string {
+	inChain := false
+	last := ""
+	for _, line := range strings.Split(listed, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !inChain {
+			if trimmed == "chain anon_filter {" {
+				inChain = true
+			}
+			continue
+		}
+		if trimmed == "}" {
+			break
+		}
+		if trimmed == "" || strings.HasPrefix(trimmed, "type ") || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		last = trimmed
+	}
+	return last
 }
 
 func listLoadedTable(t *testing.T, r nftExec, table string) string {

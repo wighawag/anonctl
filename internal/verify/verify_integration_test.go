@@ -293,7 +293,7 @@ func TestLiveLeakAndClosuresAgainstRealRuleset(t *testing.T) {
 	// the box with an OFF-BOX v4 daddr in the clear. A loopback TCP handshake proves
 	// NOTHING here: the transparent SO_ORIGINAL_DST relay always completes it. We read
 	// the escaped-leak counter for a raw non-53 UDP datagram to an off-box v4 host (nat
-	// redirects only tcp + udp/53, so raw UDP falls through to the policy DROP, recipe
+	// redirects only tcp + udp/53, so raw UDP falls through to the terminal `drop`, recipe
 	// row 3's EPERM). The counter stays 0 (dropped) => reached=false => PASS.
 	const offBox = "192.0.2.1"
 	reachedV4 := offBoxLeakReachedTest(t, ctx, nr, anonUID, anonGID, offBox, "udp", 9999)
@@ -333,7 +333,7 @@ func TestLiveLeakAndClosuresAgainstRealRuleset(t *testing.T) {
 	}
 
 	// --- icmp-drop (Tails leak-catalogue row 4): an ICMP echo from the anon UID to
-	// an off-box address must be DROPPED (it falls through to the policy DROP). A
+	// an off-box address must be DROPPED (it falls through to the terminal `drop`). A
 	// dropped ping gets no reply => reached=false => PASS. We assert the DROP feeds
 	// ICMPDropAssertion; the probe reads whether the anon UID could EMIT ICMP.
 	reachedICMP := pingAsAnon(t, anonUID, anonGID, "192.0.2.1")
@@ -343,7 +343,7 @@ func TestLiveLeakAndClosuresAgainstRealRuleset(t *testing.T) {
 
 	// --- non-tcp-udp-drop (Tails leak-catalogue row 5): raw non-53 UDP AND
 	// specifically UDP/443 (QUIC) from the anon UID must be DROPPED (SOCKS carries
-	// TCP only; both fall through to the policy DROP). A dropped datagram surfaces as
+	// TCP only; both fall through to the terminal `drop`). A dropped datagram surfaces as
 	// an EPERM on the sendto (the recipe's `socat UDP4:...:9999` -> "Operation not
 	// permitted") => reached=false => PASS.
 	reachedRawUDP := udpSendAsAnon(t, anonUID, anonGID, "1.1.1.1:9999")

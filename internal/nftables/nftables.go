@@ -22,13 +22,62 @@
 //     TCP to the shim relay port; a REDIRECTed packet re-enters the filter hook
 //     with its dst already rewritten to the shim port, so the filter accepts match
 //     the SHIM ports, not the original destination.
-//   - a filter/output chain with policy DROP (fail-closed) that governs ONLY the
-//     anon + shim UIDs and enforces the two bypass closures:
+//   - a filter/output chain with policy ACCEPT whose base chain only ever JUMPS,
+//     on a POSITIVE `meta skuid` match, into a per-UID closure chain; the anon
+//     closure chain is fail-closed and ends in an unconditional terminal DROP. It
+//     governs ONLY the anon + shim UIDs and enforces the two bypass closures:
 //     (a) the anon UID reaches ONLY its own shim ports; all other loopback
 //     (127.0.0.0/8 and ::1) and all IPv6 is dropped (never leaked);
 //     (b) ONLY the shim UID may reach the upstream endpoint; the anon UID's dial of
 //     the endpoint is dropped so it can never skip the shim or its `<account>@`
 //     isolation username.
+//
+// WHY THE BASE CHAINS ONLY EVER MATCH A UID POSITIVELY (the box-wide invariant).
+// Both output base chains are evaluated for EVERY packet the host sends, so the
+// ONE thing they must never do is adjudicate a packet they cannot attribute. Not
+// every locally generated packet carries a socket UID: `meta skuid` reads
+// `sk->sk_socket->file`, and a large share of ordinary TCP output is emitted from
+// a deferred context where that is unavailable (measured on loopback, kernel
+// 6.18: bulk data super-packets, pure ACKs, the FIN, and data retransmissions on
+// an ESTABLISHED socket). Such a packet matches NEITHER `skuid == u` NOR
+// `skuid != u`.
+//
+// A SYN is NOT in that class, INCLUDING a retransmitted one, and that distinction
+// is what the whole design rests on so it was measured rather than assumed: a
+// dropped off-box dial retransmits its SYN from TIMER context, which is where
+// attribution is normally lost, yet all 9 SYNs of a 20-second dial (the original
+// plus 8 retransmissions) carried the socket UID, for v4 and v6 alike. A control
+// run with no tables loaded saw the same 9 escape, proving the probe really does
+// emit retransmissions and that they would leak if nothing matched them.
+//
+// An earlier shape opened this chain with `policy drop` plus a NEGATIVE
+// pass-through (`meta skuid != anon meta skuid != shim accept`). An unattributable
+// packet took no accept, fell through, and was killed by the policy drop, in a
+// chain whose own header promised it touched no other UID. Because a `drop` is
+// TERMINAL across every base chain at a hook, that silently broke larger TCP
+// transfers for EVERY uid on the box, root included. The shape below cannot have
+// that class of bug by construction: an unattributable packet takes no jump,
+// reaches the end of the base chain, and is accepted by policy, while the anon
+// UID's closures are unchanged in effect. Dropping is done ONLY inside a chain
+// that is entered by a positive UID match, so anonctl can only ever drop a packet
+// it has positively attributed to an account it governs.
+//
+// This does NOT weaken the fail-closed property, because the property rests on
+// the FIRST packet of a flow: a new connection's SYN always carries a socket UID
+// (every retransmission of it too, measured above), so it is always adjudicated by
+// these rules, and an unattributable follow-on packet necessarily belongs to a flow
+// whose SYN was already judged (and, for the anon UID, already REDIRECTED to the
+// shim loopback port by nat_out, which the conntrack entry then applies to every
+// later packet of that flow regardless of attributability). See docs/adr/0002 and
+// docs/adr/0005.
+//
+// The SYN-retransmission case is worth stating explicitly because it is the one
+// that would matter if it went the other way: a dropped SYN is not confirmed in
+// conntrack, so its retransmission arrives as a FRESH connection and re-traverses
+// nat_out. Were it unattributable it would take no jump, keep its real off-box
+// destination, and escape both tables. Measured end to end with the forcing and
+// baseline tables loaded together: zero packets left with an off-box destination
+// over a 20-second v4 and v6 dial.
 //
 // The table is named per-account (`anonctl_<account>`) so two accounts never
 // clobber each other's ruleset and Delete removes exactly one account's table,
@@ -97,6 +146,22 @@ func TableName(account string) string {
 	return "anonctl_" + strings.ReplaceAll(account, "-", "_")
 }
 
+// The per-UID CLOSURE chains. These are REGULAR (non-base) chains: they are
+// reachable ONLY by an explicit `jump` from a base chain that has already matched
+// the UID POSITIVELY, which is what guarantees anonctl never adjudicates a packet
+// it cannot attribute (see the package doc). They are named per-ROLE, not
+// per-account, because they already live inside the per-account table.
+const (
+	// anonNatChain holds the anon UID's destination rewrites (jumped to from nat_out).
+	anonNatChain = "anon_nat"
+	// anonFilterChain holds the anon UID's fail-closed closures and ENDS in the
+	// unconditional terminal drop (jumped to from filter_out).
+	anonFilterChain = "anon_filter"
+	// shimFilterChain holds the shim UID's endpoint + world accepts (jumped to from
+	// filter_out).
+	shimFilterChain = "shim_filter"
+)
+
 // Generate produces the fail-closed `inet` nftables ruleset text for one account,
 // ready to feed to `nft -f -`. It is pure (no root, no I/O) so it is unit-tested
 // everywhere. It validates its inputs and refuses a nonsensical Params (a zero
@@ -126,6 +191,11 @@ func Generate(p Params) (string, error) {
 	w("# anonctl per-UID forced anonymized egress for account %q - inet table (IPv4 + IPv6), fail-closed.", p.Account)
 	w("# Generated from the validated recipe (work/notes/findings/manual-per-uid-tor-recipe.md).")
 	w("# Governs ONLY uid %d (anon) and uid %d (shim); every other uid is untouched.", p.AnonUID, p.ShimUID)
+	w("# That claim is enforced STRUCTURALLY: both base chains are policy ACCEPT and hold")
+	w("# nothing but POSITIVE `meta skuid` jumps, so a packet belonging to another uid --")
+	w("# or to no attributable socket at all, which much of ordinary TCP output is --")
+	w("# takes no jump and is never adjudicated here. Every drop lives inside a chain")
+	w("# entered only by a positive UID match.")
 	// Create-if-absent then delete makes the -f load atomic and idempotent: a
 	// re-Apply cleanly REPLACES this account's table and never touches another.
 	w("table inet %s {}", table)
@@ -135,9 +205,28 @@ func Generate(p Params) (string, error) {
 	// nat/output (priority dstnat = -100, runs BEFORE filter): rewrite only the
 	// anon UID; leave its own shim ports as-is; DNS -> shim DNS port; all other TCP
 	// -> shim relay port.
+	//
+	// The base chain ONLY jumps, on a POSITIVE `meta skuid` match, into the anon
+	// UID's rewrite chain. The previous negative form (`meta skuid != anon return`)
+	// had the same unattributable-packet hole as the filter chain did, in the more
+	// dangerous direction: a packet with no socket owner matched neither form, took
+	// no `return`, and fell through to `meta l4proto tcp redirect to :<relay>`, so an
+	// UNINVOLVED uid's traffic could be redirected INTO the anon shim. In practice a
+	// nat base chain is only evaluated for the first packet of a conntrack flow and a
+	// new flow's SYN is always attributable, so the hole was masked (measured; see
+	// the task's evidence) -- but "masked by conntrack" is not a closure, and the
+	// positive form removes it outright.
 	w("    chain nat_out {")
 	w("        type nat hook output priority dstnat; policy accept;")
-	w("        meta skuid != %d return", p.AnonUID)
+	w("        meta skuid %d jump %s", p.AnonUID, anonNatChain)
+	w("    }")
+
+	// The anon UID's rewrite chain. Entered ONLY via the positive-skuid jump above,
+	// so every packet in it is positively attributed to the anon UID. A `return` here
+	// returns to nat_out, which has no rule after the jump, so its policy accept
+	// applies: the packet is NOT redirected. That is the same effect the `return`s had
+	// as base-chain rules, which is why the rule bodies are unchanged.
+	w("    chain %s {", anonNatChain)
 	w("        ip daddr 127.0.0.1 tcp dport { %d, %d } return", p.RelayPort, p.DNSPort)
 	w("        ip daddr 127.0.0.1 udp dport %d return", p.DNSPort)
 	// Direct exemptions (enabler half): RETURN the anon UID's traffic to an exempted
@@ -159,19 +248,56 @@ func Generate(p Params) (string, error) {
 	w("        meta l4proto tcp redirect to :%d", p.RelayPort)
 	w("    }")
 
-	// filter/output (policy DROP = fail-closed): governs only anon + shim UIDs.
+	// filter/output: the base chain is policy ACCEPT and contains NOTHING but two
+	// POSITIVE-skuid jumps, so a packet anonctl cannot attribute (and every packet
+	// belonging to an uninvolved uid) takes no jump, reaches the end, and is accepted
+	// by policy. Fail-closed lives in the anon closure chain below, which ends in an
+	// unconditional terminal DROP. See the package doc for why the negative-match
+	// form this replaces was a box-wide bug.
 	w("    chain filter_out {")
-	w("        type filter hook output priority filter; policy drop;")
-	w("        meta skuid != %d meta skuid != %d accept", p.AnonUID, p.ShimUID)
+	w("        type filter hook output priority filter; policy accept;")
+	w("        meta skuid %d jump %s", p.ShimUID, shimFilterChain)
+	w("        meta skuid %d jump %s", p.AnonUID, anonFilterChain)
+	w("    }")
 	w("")
-	// SHIM UID: the ONLY UID allowed to reach the endpoint, then the world.
+	// SHIM UID: the ONLY UID allowed to reach the endpoint, then the world. Entered
+	// only by the positive-skuid jump, so falling off its end would return to
+	// filter_out and be accepted by policy -- the same verdict its own catch-all
+	// `accept` gives, so the shim chain needs no terminal rule to be correct.
+	w("    chain %s {", shimFilterChain)
 	w("        meta skuid %d %s daddr %s tcp dport %d accept", p.ShimUID, endpointFamily, p.EndpointHost, p.EndpointPort)
 	w("        meta skuid %d oifname \"lo\" accept", p.ShimUID)
 	w("        meta skuid %d accept", p.ShimUID)
+	w("    }")
 	w("")
 	// ANON UID: closure (b) DROP first (so a 9050-style dial can never be
 	// accepted), then closure (a) accept-own-shim-ports, then drop all other
-	// loopback + all IPv6 (leak-free), then policy DROP catches the rest.
+	// loopback + all IPv6 (leak-free), then the TERMINAL DROP catches the rest.
+	//
+	// The rules keep their `meta skuid <anon>` qualifier even though the jump has
+	// already established the UID: it costs nothing, keeps each rule self-describing,
+	// and keeps the exemption `accept` SPELLED IDENTICALLY to the nat `return` and the
+	// baseline `return` (all three are built from the shared exemptMatch, and the
+	// split-tunnel finding is what happens when those three diverge).
+	//
+	// The final `drop` is the ONE rule that MUST stay unqualified, unconditional and
+	// LAST. It is what the base chain's old `policy drop` used to do for this UID, and
+	// it carries real weight: the anon UID's ICMP and its non-53 UDP are never
+	// redirected, so they arrive here with their real off-box destination and are
+	// caught by nothing above (the `verify` assertions icmp-drop and non-tcp-udp-drop
+	// are exactly these). Without it the chain would fall back to filter_out's policy
+	// ACCEPT and the anon UID's ordinary egress would leave IN THE CLEAR -- masked, in
+	// a casual test, by the standing baseline table dropping it instead. That is why
+	// TestAnonClosureChainEndsInAnUnconditionalTerminalDrop exists.
+	w("    chain %s {", anonFilterChain)
+	// Closure (b). NOTE for whoever next edits the nat chain's ordering: for TCP this
+	// rule is belt-and-braces, not the thing that closes (b). anon_nat's catch-all
+	// `meta l4proto tcp redirect` runs at dstnat (-100), so by the time this chain
+	// sees an anon dial of the endpoint its destination has ALREADY been rewritten to
+	// the shim relay port and this match cannot fire. The closure genuinely holds --
+	// the anon UID cannot reach the endpoint because its dial has been forced into the
+	// shim -- but it holds by the REDIRECT. This rule is what catches the dial if the
+	// nat chain is ever bypassed, reordered, or absent, which is exactly why it stays.
 	w("        meta skuid %d %s daddr %s tcp dport %d drop", p.AnonUID, endpointFamily, p.EndpointHost, p.EndpointPort)
 	// Direct exemptions (narrowing half): ACCEPT the anon UID's traffic to an
 	// exempted LAN or loopback destination, before the fail-closed drops, so it leaves
@@ -190,6 +316,8 @@ func Generate(p Params) (string, error) {
 	w("        meta skuid %d ip daddr 127.0.0.0/8 drop", p.AnonUID)
 	w("        meta skuid %d ip6 daddr ::1 drop", p.AnonUID)
 	w("        meta skuid %d ip6 daddr ::/0 drop", p.AnonUID)
+	// THE terminal drop. Unconditional and last: see the comment above this chain.
+	w("        drop")
 	w("    }")
 	w("}")
 

@@ -95,16 +95,35 @@ func TestRealApplyIsolatesAndLeavesHostUntouched(t *testing.T) {
 	if !tableExists(t, r, table) {
 		t.Fatalf("Apply did not load the account table %q", table)
 	}
-	// The load-bearing security lines are actually present in the loaded table.
+	// The load-bearing security lines are actually present in the loaded table, AS
+	// THE KERNEL PARSED THEM (not merely as the generator spelled them).
 	listed := listTable(t, r, table)
 	for _, want := range []string{
-		"policy drop",
-		"meta skuid 424242",
-		"meta skuid 424243",
+		// Fail-closed is reached by a POSITIVE uid jump, never by adjudicating a
+		// packet the kernel could not attribute.
+		"type filter hook output priority filter; policy accept;",
+		"meta skuid 424242 jump anon_filter",
+		"meta skuid 424243 jump shim_filter",
+		"meta skuid 424242 jump anon_nat",
 	} {
 		if !strings.Contains(listed, want) {
 			t.Errorf("loaded table missing %q:\n%s", want, listed)
 		}
+	}
+	// The kernel must not have a negative uid match anywhere: that is the construct
+	// that adjudicates unattributable packets and broke every uid's transfers.
+	if strings.Contains(listed, "skuid !=") {
+		t.Errorf("the loaded table carries a negative uid match:\n%s", listed)
+	}
+	// Fail-closed now rests on an unconditional terminal drop ENDING the anon closure
+	// chain, because the base chain no longer has a drop policy to fall back on. This
+	// assertion replaces the old `policy drop` one and is what actually keeps the anon
+	// UID jailed; see docs/adr/0002.
+	if last := lastRuleOfListedChain(listed, "anon_filter"); last != "drop" {
+		t.Errorf("the anon closure chain must END in an unconditional `drop` as loaded by the\n"+
+			"kernel; its last rule is %q. Without it the anon UID's non-redirected egress\n"+
+			"(ICMP, non-53 UDP) falls back to the base chain's policy ACCEPT and leaves in the\n"+
+			"clear:\n%s", last, listed)
 	}
 
 	// Re-Apply must be an idempotent atomic REPLACE (no error, no duplicate rules).
@@ -197,11 +216,10 @@ func TestRealApplyWithLANExemptionStaysTight(t *testing.T) {
 		t.Errorf("loaded table missing the exempt host:port accept:\n%s", listed)
 	}
 
-	// (2) The fail-closed shape survives around the hole: default-drop policy, the
-	// endpoint drop (closure b), and the broad loopback + IPv6 drops are all still
-	// present, so the exemption did not flip the policy or remove a tightness rule.
+	// (2) The fail-closed shape survives around the hole: the endpoint drop (closure
+	// b) and the broad loopback + IPv6 drops are all still present, so the exemption
+	// did not remove a tightness rule.
 	for _, want := range []string{
-		"policy drop",
 		"meta skuid 424244 ip daddr 127.0.0.1 tcp dport 9050 drop", // closure (b)
 		"127.0.0.0/8", // broad loopback drop still present
 		"::/0",        // IPv6 default-drop still present
@@ -209,6 +227,21 @@ func TestRealApplyWithLANExemptionStaysTight(t *testing.T) {
 		if !strings.Contains(listed, want) {
 			t.Errorf("exemption widened the ruleset: missing %q:\n%s", want, listed)
 		}
+	}
+	// The terminal drop still ENDS the chain with an exemption present. This is the
+	// ordering that matters most here: a terminal drop emitted BEFORE the exemption
+	// accept would kill the direct hole from inside the forcing table, and an
+	// exemption that displaced the terminal drop would un-jail the account. The
+	// generated text is pinned by TestGenerateExemptionAcceptPrecedesTheTerminalDrop;
+	// this asserts the kernel agrees.
+	if last := lastRuleOfListedChain(listed, "anon_filter"); last != "drop" {
+		t.Errorf("with an exemption loaded, the anon closure chain must still END in an\n"+
+			"unconditional `drop`; its last rule is %q:\n%s", last, listed)
+	}
+	exemptAccept := "meta skuid 424244 ip daddr 192.168.1.150 tcp dport 8080 accept"
+	if i, j := strings.Index(listed, exemptAccept), strings.LastIndex(listed, "drop"); i < 0 || i > j {
+		t.Errorf("the exemption accept must precede the terminal drop, or split tunnelling\n"+
+			"re-breaks (see work/notes/findings/split-tunnel-broken-by-exemption-blind-baseline.md):\n%s", listed)
 	}
 
 	// (3) The exemption is scoped to the EXACT host, not its /24: no sibling range.
@@ -253,6 +286,36 @@ func TestRealApplyWithLANExemptionStaysTight(t *testing.T) {
 	if !tableExists(t, r, sentinel) {
 		t.Errorf("Delete removed the sentinel table too (over-broad delete)")
 	}
+}
+
+// lastRuleOfListedChain returns the final RULE of a named chain as the KERNEL
+// prints it (`nft list table`). The kernel's own formatting (tabs, its own
+// spacing, its own rule normalisation) differs from the generator's, so the
+// generator-side helpers in nftables_test.go cannot parse it -- and that
+// difference is the point: this reads back what the kernel actually loaded, which
+// is the only thing that governs traffic. The chain header (`type ...`), blank
+// lines and comments are skipped so "the last rule" means the last rule the kernel
+// will evaluate.
+func lastRuleOfListedChain(listed, chain string) string {
+	inChain := false
+	last := ""
+	for _, line := range strings.Split(listed, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !inChain {
+			if trimmed == "chain "+chain+" {" {
+				inChain = true
+			}
+			continue
+		}
+		if trimmed == "}" {
+			break
+		}
+		if trimmed == "" || strings.HasPrefix(trimmed, "type ") || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		last = trimmed
+	}
+	return last
 }
 
 func mustNft(t *testing.T, r execRunner, ruleset string) {
