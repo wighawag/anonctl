@@ -568,7 +568,7 @@ func uidTransitionVectors(ctx context.Context, p LiveParams) []UIDTransitionVect
 // A missing `sudo` binary means the vector is closed for this account too
 // (reported as checked-and-not-escaped).
 func sudoVector(ctx context.Context, p LiveParams) UIDTransitionVector {
-	if _, err := exec.LookPath("sudo"); err != nil {
+	if _, err := lookPathBinary("sudo"); err != nil {
 		return UIDTransitionVector{Name: "sudo"} // no sudo binary: no sudo transition path here
 	}
 	cctx, cancel := context.WithTimeout(ctx, 6*time.Second)
@@ -648,6 +648,21 @@ func pkexecPolicyQueryCommand(uid int) []string {
 	}
 }
 
+// lookPathBinary is the INJECTABLE binary-resolution seam for the two UID-transition
+// vectors whose exec is ALREADY behind a seam (pkexecVector, sudoVector). Those
+// vectors guard their seamed exec with a LookPath, so without this the guard is the
+// one remaining host dependency in an otherwise hermetic decision: on a box with no
+// polkit the vector short-circuits before runPkcheck is ever consulted, and a test
+// that scripts runPkcheck silently exercises nothing. Injecting the lookup lets the
+// unit suite drive EVERY branch (present / absent) on ANY host, including the
+// absence branches, which are exactly the ones that decide Inconclusive and are
+// therefore worth proving rather than skipping.
+//
+// It is deliberately NOT used by the probe paths that really exec a tool
+// (runSetprivProbe, pingAsAnon, curlAsAnon): there a LookPath skip in the test is
+// honest, because faking the lookup would only move the failure to the exec.
+var lookPathBinary = exec.LookPath
+
 // runPkcheck is the INJECTABLE exec seam for the pkexec policy-query vector: it
 // execs argv under a short deadline and returns pkcheck's EXIT CODE (the verdict is
 // read from the exit code, per pkcheck(1)) and whether the query RAN (ran=false
@@ -690,12 +705,12 @@ var runPkcheck = func(ctx context.Context, argv []string) (exitCode int, ran boo
 // vector is likewise not conclusively checked.
 func pkexecVector(ctx context.Context, p LiveParams) UIDTransitionVector {
 	v := UIDTransitionVector{Name: "setuid:pkexec"}
-	if _, err := exec.LookPath("setpriv"); err != nil {
+	if _, err := lookPathBinary("setpriv"); err != nil {
 		v.Inconclusive = true
 		v.Detail = "cannot pose the anon-owned polkit query: setpriv not on PATH"
 		return v
 	}
-	if _, err := exec.LookPath("pkcheck"); err != nil {
+	if _, err := lookPathBinary("pkcheck"); err != nil {
 		v.Inconclusive = true
 		v.Detail = "pkcheck not on PATH: the pkexec exec-action policy was not conclusively queried (no fallback to running pkexec, which would prompt)"
 		return v

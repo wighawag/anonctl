@@ -70,9 +70,7 @@ func TestSetuidWrapperCommand_NonPkexecWrapperUnchanged(t *testing.T) {
 // authorized) and exit 3 (dismissed) are likewise not an unattended escape. No real
 // pkcheck runs; the exec seam is scripted.
 func TestPkexecVector_AuthRequiredIsNotEscaped(t *testing.T) {
-	if _, err := exec.LookPath("setpriv"); err != nil {
-		t.Skip("setpriv not on PATH: the pkexec vector short-circuits before the query")
-	}
+	fakeBinariesPresent(t, "setpriv", "pkcheck")
 	orig := runPkcheck
 	defer func() { runPkcheck = orig }()
 	for _, exit := range []int{2, 1, 3} {
@@ -102,9 +100,7 @@ func TestPkexecVector_AuthRequiredIsNotEscaped(t *testing.T) {
 // forcing bypass, so the vector is STILL caught as a real escape (Escaped=true).
 // Scripted via the exec seam, no real pkcheck.
 func TestPkexecVector_UnattendedAuthorizationIsEscaped(t *testing.T) {
-	if _, err := exec.LookPath("setpriv"); err != nil {
-		t.Skip("setpriv not on PATH: the pkexec vector short-circuits before the query")
-	}
+	fakeBinariesPresent(t, "setpriv", "pkcheck")
 	orig := runPkcheck
 	defer func() { runPkcheck = orig }()
 	runPkcheck = func(_ context.Context, _ []string) (int, bool) {
@@ -126,13 +122,11 @@ func TestPkexecVector_UnattendedAuthorizationIsEscaped(t *testing.T) {
 // framing), and it NEVER falls back to RUNNING pkexec. Scripted via the exec seam
 // (ran=false); no real pkcheck/pkexec, no prompt.
 func TestPkexecVector_PkcheckMissingIsInconclusive(t *testing.T) {
-	if _, err := exec.LookPath("setpriv"); err != nil {
-		t.Skip("setpriv not on PATH: the pkexec vector short-circuits before the query")
-	}
+	fakeBinariesPresent(t, "setpriv", "pkcheck")
 	orig := runPkcheck
 	defer func() { runPkcheck = orig }()
 	runPkcheck = func(_ context.Context, _ []string) (int, bool) {
-		return 0, false // pkcheck missing / un-runnable
+		return 0, false // pkcheck resolvable but un-runnable
 	}
 
 	v := pkexecVector(context.Background(), LiveParams{AnonUID: 30001, ShimUID: 995})
@@ -141,6 +135,41 @@ func TestPkexecVector_PkcheckMissingIsInconclusive(t *testing.T) {
 	}
 	if !v.Inconclusive {
 		t.Fatalf("a missing/un-runnable pkcheck must be honestly NOT-conclusive; got %+v", v)
+	}
+}
+
+// TestPkexecVector_AbsentToolingIsInconclusiveWithoutRunningAnything proves the two
+// SHORT-CIRCUIT branches, which are the ones that actually fire on a stock NixOS
+// box (no polkit at all) and which were previously untestable: with setpriv or
+// pkcheck unresolvable the vector must report Inconclusive, must NOT read as a
+// false escape, and must NOT consult the exec seam at all. The last clause is the
+// load-bearing one: it is what guarantees no pkexec ever runs and no dialog ever
+// appears on a host that cannot pose the query.
+func TestPkexecVector_AbsentToolingIsInconclusiveWithoutRunningAnything(t *testing.T) {
+	for _, missing := range []string{"setpriv", "pkcheck"} {
+		fakeBinariesPresentExcept(t, missing, "setpriv", "pkcheck")
+		orig := runPkcheck
+		queried := false
+		runPkcheck = func(_ context.Context, _ []string) (int, bool) {
+			queried = true
+			return 0, true // would read as an ESCAPE if the guard let it through
+		}
+
+		v := pkexecVector(context.Background(), LiveParams{AnonUID: 30001, ShimUID: 995})
+		runPkcheck = orig
+
+		if queried {
+			t.Fatalf("with %s unresolvable the vector must short-circuit and never exec the query", missing)
+		}
+		if v.Escaped {
+			t.Fatalf("a vector that could not be posed (%s missing) must NOT read as an escape; got %+v", missing, v)
+		}
+		if !v.Inconclusive {
+			t.Fatalf("a vector that could not be posed (%s missing) must be honestly NOT-conclusive, never a conclusive no-escape; got %+v", missing, v)
+		}
+		if !strings.Contains(v.Detail, missing) {
+			t.Fatalf("the detail must NAME the tool that was missing so the operator can fix it; got %q", v.Detail)
+		}
 	}
 }
 
@@ -193,9 +222,7 @@ func TestRunSudoList_ExecsTheNonInteractiveArgv(t *testing.T) {
 // a false Escaped (a false alarm) nor a false conclusive not-escaped (which would
 // hide a real grant). Scripted via the exec seam; no real sudo, no prompt.
 func TestSudoVector_AuthBlockedIsInconclusive(t *testing.T) {
-	if _, err := exec.LookPath("sudo"); err != nil {
-		t.Skip("sudo not on PATH: sudoVector short-circuits before the probe")
-	}
+	fakeBinariesPresent(t, "sudo")
 	orig := runSudoListCmd
 	defer func() { runSudoListCmd = orig }()
 	runSudoListCmd = func(_ context.Context, _ []string) (string, string) {
@@ -209,6 +236,69 @@ func TestSudoVector_AuthBlockedIsInconclusive(t *testing.T) {
 	if !v.Inconclusive {
 		t.Fatalf("an auth-blocked (-n) sudo probe must be honestly NOT-conclusive; got %+v", v)
 	}
+}
+
+// TestSudoVector_NoSudoBinaryIsAConclusiveNoEscape pins the DELIBERATE asymmetry
+// with the pkexec vector: no `sudo` binary means there is definitively no sudo
+// transition path, so the vector is checked-and-not-escaped rather than
+// Inconclusive. (The pkexec vector cannot say the same from a missing `pkcheck`,
+// because pkcheck's absence does not establish pkexec's, which is why it reports
+// Inconclusive instead. See
+// work/notes/observations/pkexec-vector-inconclusive-when-pkexec-absent.md.)
+func TestSudoVector_NoSudoBinaryIsAConclusiveNoEscape(t *testing.T) {
+	fakeBinariesPresentExcept(t, "sudo", "sudo")
+	orig := runSudoListCmd
+	defer func() { runSudoListCmd = orig }()
+	probed := false
+	runSudoListCmd = func(_ context.Context, _ []string) (string, string) {
+		probed = true
+		return "", ""
+	}
+
+	v := sudoVector(context.Background(), LiveParams{Account: "anon", AnonUID: 30001, ShimUID: 995})
+	if probed {
+		t.Fatal("with no sudo binary the vector must short-circuit and never exec the list probe")
+	}
+	if v.Escaped || v.Inconclusive {
+		t.Fatalf("no sudo binary is a CONCLUSIVE no-escape (the path does not exist), not an escape and not inconclusive; got %+v", v)
+	}
+}
+
+// fakeBinariesPresent makes exactly the named binaries resolvable through the
+// lookPathBinary seam and every other name unresolvable, so a vector's guard takes
+// the present branch on ANY host. The two vectors it serves already exec behind
+// their own seam, so faking the lookup runs nothing: it just stops a stock box
+// without polkit (or without sudo) from short-circuiting the decision under test.
+// Restored via t.Cleanup.
+func fakeBinariesPresent(t *testing.T, names ...string) {
+	t.Helper()
+	present := make(map[string]bool, len(names))
+	for _, n := range names {
+		present[n] = true
+	}
+	orig := lookPathBinary
+	t.Cleanup(func() { lookPathBinary = orig })
+	lookPathBinary = func(file string) (string, error) {
+		if present[file] {
+			return "/usr/bin/" + file, nil
+		}
+		return "", exec.ErrNotFound
+	}
+}
+
+// fakeBinariesPresentExcept is fakeBinariesPresent with one of the names removed,
+// so a test can drive the ABSENCE branch for a specific tool while the others stay
+// resolvable. That is what makes the short-circuit branches testable on a host that
+// happens to have every tool installed, and testable at all on one that has none.
+func fakeBinariesPresentExcept(t *testing.T, missing string, names ...string) {
+	t.Helper()
+	keep := make([]string, 0, len(names))
+	for _, n := range names {
+		if n != missing {
+			keep = append(keep, n)
+		}
+	}
+	fakeBinariesPresent(t, keep...)
 }
 
 func contains(ss []string, want string) bool {
