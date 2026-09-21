@@ -898,3 +898,140 @@ func TestAccountIdentityAssertion_MissingAccountOutranksUIDDrift(t *testing.T) {
 		t.Fatalf("deletion must outrank uid drift in the verdict; got %q", a.Detail)
 	}
 }
+
+// TestAccountIdentityState_ClassifiesEachShapeDistinctly: State is the DECISION
+// both surfaces render (verify's precondition assertion and `anonctl status`'s
+// identity line), so every shape must map to its own code. A shape that collapsed
+// into another is precisely the ambiguity this classification exists to remove: an
+// operator whose account was deleted must not read the same word as one whose
+// account was merely never added.
+func TestAccountIdentityState_ClassifiesEachShapeDistinctly(t *testing.T) {
+	missing := fullIdentity()
+	missing.Exists, missing.UID = false, 0
+	noShim := fullIdentity()
+	noShim.ShimExists, noShim.ShimUID = false, 0
+	drifted := fullIdentity()
+	drifted.UID = 1007
+	shimDrifted := fullIdentity()
+	shimDrifted.ShimUID = 993
+	unrecorded := fullIdentity()
+	unrecorded.HaveRecord, unrecorded.RecordedUID, unrecorded.RecordedShimUID = false, 0, 0
+	unreadable := fullIdentity()
+	unreadable.HaveRecord, unreadable.RecordedUID, unreadable.RecordedShimUID = false, 0, 0
+	unreadable.RecordErr = errors.New("permission denied")
+
+	cases := []struct {
+		name   string
+		id     AccountIdentity
+		want   IdentityState
+		wantOk bool
+	}{
+		{"healthy", fullIdentity(), IdentityOK, true},
+		{"deleted account", missing, IdentityAccountMissing, false},
+		{"missing shim", noShim, IdentityShimMissing, false},
+		{"drifted uid", drifted, IdentityUIDMismatch, false},
+		{"drifted shim uid", shimDrifted, IdentityShimUIDMismatch, false},
+		{"no record", unrecorded, IdentityUnrecorded, true},
+		{"unreadable record", unreadable, IdentityRecordUnreadable, false},
+	}
+	seen := map[IdentityState]string{}
+	for _, c := range cases {
+		got := c.id.State()
+		if got != c.want {
+			t.Errorf("%s: State() = %q, want %q", c.name, got, c.want)
+		}
+		if got.Ok() != c.wantOk {
+			t.Errorf("%s: State().Ok() = %v, want %v", c.name, got.Ok(), c.wantOk)
+		}
+		if prev, dup := seen[got]; dup {
+			t.Errorf("%s and %s classify identically (%q); each shape needs its own code", c.name, prev, got)
+		}
+		seen[got] = c.name
+		// The assertion is a pure RENDERING of the state: the two can never disagree
+		// about pass/fail, or `status` and `verify` would say different things.
+		if a := AccountIdentityAssertion(c.id); a.Ok != got.Ok() {
+			t.Errorf("%s: assertion Ok=%v but State().Ok()=%v; the assertion must render the state, not re-decide it", c.name, a.Ok, got.Ok())
+		}
+	}
+}
+
+// TestAccountIdentityDetail_NamesARecoveryThatIsNotRefused: the detail for a
+// drifted uid must not tell the operator to run a bare `anonctl add`. `add` refuses
+// an account anonctl already has a record for, and a stale record is exactly what
+// this state is, so that advice dead-ends. The working recovery is `rm` (which
+// leaves the accounts and homes intact) then `add`, which re-adopts the accounts as
+// they are now.
+func TestAccountIdentityDetail_NamesARecoveryThatIsNotRefused(t *testing.T) {
+	id := fullIdentity()
+	id.UID = 1007
+	detail := AccountIdentityAssertion(id).Detail
+	if !strings.Contains(detail, "anonctl rm anon-a") {
+		t.Fatalf("the recovery must start with a bare rm (it tears the stale forcing down without deleting the accounts); got %q", detail)
+	}
+	if !strings.Contains(detail, "anonctl add anon-a") {
+		t.Fatalf("the recovery must then re-add to re-install the forcing against the current uid; got %q", detail)
+	}
+	if strings.Contains(detail, "Re-run `anonctl add") {
+		t.Fatalf("a bare re-add is REFUSED while the stale record exists; got %q", detail)
+	}
+}
+
+// An UNREADABLE record must never be classified as "no record". The two look
+// identical to a naive read (both yield no recorded uid) and they mean opposite
+// things: "there is nothing to compare" is a clean pass, while "I could not tell
+// what the rules govern" is not knowledge at all. The dangerous case is an
+// unreadable record over a DRIFTED uid, where treating it as unrecorded reports a
+// green identity line for an account that is completely unforced.
+func TestAccountIdentity_UnreadableRecordIsNotTheSameAsNoRecord(t *testing.T) {
+	unreadable := fullIdentity()
+	unreadable.HaveRecord, unreadable.RecordedUID, unreadable.RecordedShimUID = false, 0, 0
+	unreadable.RecordErr = errors.New("permission denied")
+	unreadable.UID = 1007 // and the uid has drifted, though nothing here can know that
+
+	if state := unreadable.State(); state != IdentityRecordUnreadable {
+		t.Fatalf("State() = %q, want %q", state, IdentityRecordUnreadable)
+	}
+	a := AccountIdentityAssertion(unreadable)
+	if a.Ok {
+		t.Fatalf("an unreadable record must FAIL the precondition, not pass it as 'nothing to compare'; got %+v", a)
+	}
+	if a.Err == nil {
+		t.Errorf("the underlying read error must be surfaced on the assertion; got %+v", a)
+	}
+	if !strings.Contains(a.Detail, "root") {
+		t.Errorf("the detail should name the usual cause (a root-only record read without privilege); got %q", a.Detail)
+	}
+}
+
+// The shim-missing advice must name a command the gate will actually accept. With a
+// record present, `add` refuses (anonctl manages the account), so the recovery has
+// to go through `rm` first; with no record, a plain `add` is right. Naming a refused
+// command is how this branch used to dead-end.
+func TestAccountIdentityDetail_ShimMissingRecoveryRespectsTheAddGate(t *testing.T) {
+	id := fullIdentity()
+	id.ShimExists, id.ShimUID = false, 0
+
+	managed := AccountIdentityAssertion(id).Detail
+	if !strings.Contains(managed, "anonctl rm anon-a") {
+		t.Errorf("with a record, the recovery must go through `rm` first (`add` refuses a managed account); got %q", managed)
+	}
+
+	id.HaveRecord, id.RecordedUID, id.RecordedShimUID = false, 0, 0
+	unmanaged := AccountIdentityAssertion(id).Detail
+	if !strings.Contains(unmanaged, "anonctl add anon-a") {
+		t.Errorf("with no record, a plain `add` completes the pair; got %q", unmanaged)
+	}
+	if strings.Contains(unmanaged, "anonctl rm anon-a`") {
+		t.Errorf("with no record there is nothing for `rm` to clear; got %q", unmanaged)
+	}
+
+	// An UNREADABLE record must take the rm-first branch too: `add` refuses on a record
+	// it cannot read just as firmly as on one it can, so the "no record" wording would
+	// send the operator straight into that refusal. `rm` deletes by account name and
+	// never parses the record, so it clears a corrupt one cleanly.
+	id.RecordErr = errors.New("invalid account config JSON")
+	corrupt := AccountIdentityAssertion(id).Detail
+	if !strings.Contains(corrupt, "anonctl rm anon-a") {
+		t.Errorf("with an UNREADABLE record the recovery must go through `rm` (a bare `add` is refused on it); got %q", corrupt)
+	}
+}

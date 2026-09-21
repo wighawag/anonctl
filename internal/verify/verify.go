@@ -564,6 +564,92 @@ type AccountIdentity struct {
 	// HaveRecord is whether an account config was found at all. An account that was
 	// never forced has none, which is a clean "nothing to compare", not a failure.
 	HaveRecord bool
+	// RecordErr is set when the record could NOT BE READ and its absence could not be
+	// established either (a corrupt file, or an unprivileged read of a root-only
+	// store). It is held apart from HaveRecord=false deliberately: "there is no
+	// record" is a clean state, while "I could not tell" must never be reported as
+	// one, because the uids the installed rules govern are then simply unknown and a
+	// drifted uid would be rendered as a reassuring "nothing to compare".
+	RecordErr error
+}
+
+// IdentityState is the machine-readable classification of an AccountIdentity: the
+// DISTINCT shapes "does the box still agree with anonctl's record?" can land in.
+//
+// It is a named type rather than an inline comparison because TWO surfaces report
+// identity and they must never disagree about it: `verify`'s precondition
+// assertion (which gates every other check) and `status`'s account line (the
+// read-only view an operator reaches for first). One classification, two
+// renderings; a hand-rolled second comparison in the CLI would be free to drift
+// out of agreement with the assertion that actually gates the run.
+type IdentityState string
+
+const (
+	// IdentityOK: both accounts exist and still own the uids anonctl recorded, so the
+	// uids the installed rules govern are this account's.
+	IdentityOK IdentityState = "ok"
+	// IdentityUnrecorded: both accounts exist but anonctl has NO record for them, so
+	// there is no recorded uid to compare against and existence is all that was
+	// checked. This is a clean, non-failing state: an account that was never forced,
+	// or one the host declared that `add` has not adopted yet.
+	IdentityUnrecorded IdentityState = "unrecorded"
+	// IdentityAccountMissing: the login account is GONE from the passwd table. Any
+	// rules still loaded for it govern a uid that is now free, so they protect nobody
+	// and may jail whoever is handed that uid next.
+	IdentityAccountMissing IdentityState = "account-missing"
+	// IdentityShimMissing: the login account exists but its shim service account does
+	// not (the half-provisioned state). The account is fail-CLOSED (the baseline
+	// default-deny still drops it) but cannot reach the endpoint.
+	IdentityShimMissing IdentityState = "shim-missing"
+	// IdentityUIDMismatch: the login account exists but owns a DIFFERENT uid than the
+	// one anonctl recorded. The account is completely UNFORCED while /etc/anonctl
+	// still records it as jailed: the exact "still looks anonymised" failure anonctl
+	// exists to prevent.
+	IdentityUIDMismatch IdentityState = "uid-mismatch"
+	// IdentityShimUIDMismatch: the shim account exists but owns a different uid than
+	// the one the installed rules exempt, so the endpoint-reachability hole names a
+	// uid the relay no longer runs as.
+	IdentityShimUIDMismatch IdentityState = "shim-uid-mismatch"
+	// IdentityRecordUnreadable: anonctl's record could not be read AND could not be
+	// shown to be absent, so the uids the installed rules govern are unknown and NO
+	// comparison happened. It is a FAILING state, not a quiet "unrecorded": the
+	// commonest cause is reading a root-only store without privilege, and reporting
+	// that as "nothing to compare" would hand an operator a green identity line for an
+	// account whose uid may have drifted out from under the forcing.
+	IdentityRecordUnreadable IdentityState = "record-unreadable"
+)
+
+// Ok reports whether the state is one anonctl can proceed from: the uids the rules
+// govern are this account's (IdentityOK), or there is no record to contradict them
+// (IdentityUnrecorded). Every other state is a disagreement between the box and
+// anonctl's record and is a FAILING precondition.
+func (s IdentityState) Ok() bool { return s == IdentityOK || s == IdentityUnrecorded }
+
+// State classifies the identity. The order of the cases is the order an operator
+// must act in: a missing account makes every uid comparison below it meaningless,
+// so it is decided first.
+//
+// A recorded uid of 0 is "not recorded", never uid 0 (anonctl never forces root),
+// so it is excluded from the comparison rather than read as a mismatch.
+func (id AccountIdentity) State() IdentityState {
+	switch {
+	case !id.Exists:
+		return IdentityAccountMissing
+	case !id.ShimExists:
+		return IdentityShimMissing
+	case id.RecordErr != nil:
+		// Ranked below the two existence checks (those are decidable without the record
+		// and outrank it) but ABOVE every uid comparison, because with an unreadable
+		// record there is nothing to compare against and silence here would read as a pass.
+		return IdentityRecordUnreadable
+	case id.HaveRecord && id.RecordedUID != 0 && id.UID != id.RecordedUID:
+		return IdentityUIDMismatch
+	case id.HaveRecord && id.RecordedShimUID != 0 && id.ShimUID != id.RecordedShimUID:
+		return IdentityShimUIDMismatch
+	case id.HaveRecord:
+		return IdentityOK
+	}
+	return IdentityUnrecorded
 }
 
 // AccountIdentityAssertion is the PURE precondition decision every other verify
@@ -593,41 +679,78 @@ type AccountIdentity struct {
 // With no persisted record there is nothing to compare uids against, so existence
 // alone is the verdict and the detail says so rather than implying a uid was
 // checked.
+//
+// The DECISION is AccountIdentity.State(); this function only renders it, so
+// `status` can report the identical finding without a second comparison that could
+// drift from this one.
 func AccountIdentityAssertion(id AccountIdentity) Assertion {
-	a := Assertion{Name: AssertAccountIdentity}
-	switch {
-	case !id.Exists:
-		a.Detail = "the account " + id.Account + " DOES NOT EXIST on this host: it was deleted out from under anonctl. " +
+	state := id.State()
+	a := Assertion{Name: AssertAccountIdentity, Ok: state.Ok(), Detail: identityDetail(id, state)}
+	if state == IdentityRecordUnreadable {
+		// Surface the underlying read error itself (the JSON contract carries it), so the
+		// operator sees "permission denied" or the parse error rather than only anonctl's
+		// summary of it.
+		a.Err = id.RecordErr
+	}
+	return a
+}
+
+// identityDetail is the evidence line for a classified identity: what was observed,
+// why it matters, and the command that actually FIXES it.
+//
+// The recovery named for a drifted uid is `rm` then `add`, NOT a bare re-`add`:
+// `add` refuses an account anonctl already has a record for (that record is exactly
+// what is stale here), while a bare `rm` tears the stale forcing + record down
+// WITHOUT deleting the accounts or their homes, after which `add` adopts the
+// accounts as they are now and installs the forcing against their current uids. On
+// a host that declares its accounts, that sequence never touches the declaration.
+func identityDetail(id AccountIdentity, state IdentityState) string {
+	switch state {
+	case IdentityAccountMissing:
+		return "the account " + id.Account + " DOES NOT EXIST on this host: it was deleted out from under anonctl. " +
 			recordedGovernsDetail(id.RecordedUID, id.HaveRecord) +
 			" Nothing below this line could be proved about " + id.Account + ", because there is no such account to probe. " +
 			"On NixOS this is what `users.mutableUsers = false` does to an undeclared account at every activation and every boot (see docs/nixos.md); " +
 			"run `anonctl rm --purge-account " + id.Account + "` to tear the orphaned rules down, or declare the account to stop it recurring"
-		return a
-	case !id.ShimExists:
-		a.Detail = "the login account " + id.Account + " exists (uid " + itoa(id.UID) + ") but its shim account " + id.Shim + " DOES NOT EXIST: " +
+	case IdentityShimMissing:
+		// The recovery DIFFERS by whether anonctl has a record, because `add` refuses an
+		// account it already manages: with a record the operator must `rm` first (which
+		// leaves the accounts and homes intact), without one a plain `add` works. Naming a
+		// command the gate would refuse is how this advice used to dead-end.
+		//
+		// An UNREADABLE record takes the rm-first branch too: `add` refuses on a record it
+		// cannot read just as firmly as on one it can, while `rm` deletes by account NAME
+		// and never parses the record, so it clears a corrupt one cleanly.
+		recover := "create " + id.Shim + " (declare it, on a host that declares its accounts) and run `anonctl add " + id.Account + "`"
+		if id.HaveRecord || id.RecordErr != nil {
+			recover = "create " + id.Shim + " (declare it, on a host that declares its accounts), then run `anonctl rm " + id.Account +
+				"` (a bare rm leaves the accounts and homes intact) and `anonctl add " + id.Account + "` to re-install the forcing against both uids"
+		}
+		return "the login account " + id.Account + " exists (uid " + itoa(id.UID) + ") but its shim account " + id.Shim + " DOES NOT EXIST: " +
 			"the relay has no uid to run as, so the account is fail-CLOSED (the baseline default-deny still drops it) but cannot reach the endpoint. " +
-			"This is the half-provisioned state; re-run `anonctl add` to complete it"
-		return a
-	case id.HaveRecord && id.RecordedUID != 0 && id.UID != id.RecordedUID:
-		a.Detail = "the account " + id.Account + " now owns uid " + itoa(id.UID) + " but anonctl's rules and records govern uid " + itoa(id.RecordedUID) + ": " +
+			"This is the half-provisioned state; " + recover + ", or run `anonctl rm --purge-account " + id.Account + "` to clear the half and start clean"
+	case IdentityRecordUnreadable:
+		return "anonctl's record for " + id.Account + " could NOT be read, and its absence could not be established either: " +
+			"the uids the installed rules govern are therefore UNKNOWN and nothing was compared. " +
+			"The account exists (uid " + itoa(id.UID) + ", shim uid " + itoa(id.ShimUID) + "), but whether those are the uids being forced cannot be said from here. " +
+			"The record lives under /etc/anonctl/accounts and is root-only, so the usual cause is running without privilege: re-run as root. " +
+			"If it is unreadable AS root, the record is corrupt: `anonctl rm " + id.Account + "` then `anonctl add " + id.Account + "` rebuilds it"
+	case IdentityUIDMismatch:
+		return "the account " + id.Account + " now owns uid " + itoa(id.UID) + " but anonctl's rules and records govern uid " + itoa(id.RecordedUID) + ": " +
 			"the account was deleted and recreated under a different uid. It is therefore COMPLETELY UNFORCED while /etc/anonctl still records it as jailed, " +
 			"and uid " + itoa(id.RecordedUID) + " may now belong to an unrelated account that silently inherited the forcing. " +
-			"Re-run `anonctl add " + id.Account + "` to re-point the rules, and see docs/nixos.md if this host deletes undeclared accounts"
-		return a
-	case id.HaveRecord && id.RecordedShimUID != 0 && id.ShimUID != id.RecordedShimUID:
-		a.Detail = "the shim account " + id.Shim + " now owns uid " + itoa(id.ShimUID) + " but the installed rules govern uid " + itoa(id.RecordedShimUID) + ": " +
-			"the endpoint-reachability exemption names a uid the shim no longer runs as. Re-run `anonctl add " + id.Account + "` to re-point the rules"
-		return a
-	}
-	a.Ok = true
-	if id.HaveRecord {
-		a.Detail = id.Account + " exists and still owns uid " + itoa(id.UID) + ", and " + id.Shim + " still owns uid " + itoa(id.ShimUID) +
+			"Run `anonctl rm " + id.Account + "` (a bare rm leaves the accounts and homes intact) then `anonctl add " + id.Account + "` to re-install the forcing against uid " + itoa(id.UID) + ", " +
+			"and see docs/nixos.md if this host deletes undeclared accounts"
+	case IdentityShimUIDMismatch:
+		return "the shim account " + id.Shim + " now owns uid " + itoa(id.ShimUID) + " but the installed rules govern uid " + itoa(id.RecordedShimUID) + ": " +
+			"the endpoint-reachability exemption names a uid the shim no longer runs as. " +
+			"Run `anonctl rm " + id.Account + "` then `anonctl add " + id.Account + "` to re-install the forcing against uid " + itoa(id.ShimUID)
+	case IdentityOK:
+		return id.Account + " exists and still owns uid " + itoa(id.UID) + ", and " + id.Shim + " still owns uid " + itoa(id.ShimUID) +
 			": the uids the installed rules govern are this account's"
-		return a
 	}
-	a.Detail = id.Account + " (uid " + itoa(id.UID) + ") and " + id.Shim + " (uid " + itoa(id.ShimUID) + ") both exist. " +
+	return id.Account + " (uid " + itoa(id.UID) + ") and " + id.Shim + " (uid " + itoa(id.ShimUID) + ") both exist. " +
 		"No account config is persisted for " + id.Account + ", so there is no recorded uid to compare against: existence is all that was checked here"
-	return a
 }
 
 // recordedGovernsDetail names the uid the orphaned rules are left governing when

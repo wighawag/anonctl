@@ -16,6 +16,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -127,22 +128,64 @@ func run(args []string) int {
 // root (useradd/nft/systemctl); a non-root run surfaces the underlying command's
 // own permission error.
 //
-// `add` is CREATE-ONLY: it refuses an account that already exists, up front, before
-// any mutation, so a second `add` never silently re-applies a (possibly different)
-// endpoint/config. Changing an existing account's endpoint or exemptions is
-// `update`'s job (which re-applies fail-closed with no leak window); recreating is
-// `rm` then `add`. This keeps one clear command per intent.
+// `add` is ADD-ONCE, not create-from-nothing: it refuses an account anonctl ALREADY
+// MANAGES, up front, before any mutation, so a second `add` never silently
+// re-applies a (possibly different) endpoint/config. Changing a managed account's
+// endpoint or exemptions is `update`'s job (which re-applies fail-closed with no
+// leak window); re-pointing it is `rm` then `add`. This keeps one clear command per
+// intent.
+//
+// "Already manages" is read from anonctl's OWN LEDGER
+// (`/etc/anonctl/accounts/<account>.json`), NOT from the passwd table. An account
+// whose passwd entries already exist but that anonctl has no record of is ADOPTED:
+// no account is created, the uids are discovered from the box, and the forcing is
+// installed against those uids. That is the only way anonctl can run on a host that
+// declares its users (NixOS with `users.mutableUsers = false` deletes every
+// undeclared account at every activation, so declaring both accounts with pinned
+// uids is the supported path there, and it closes the UID-reuse hazard as a bonus).
+// See docs/nixos.md.
 func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
-	// Refuse an existing account BEFORE provisioning or resolving the endpoint, so a
-	// rejected re-add mutates nothing (a pure read) and never re-applies config. Point
-	// the operator at the verb that DOES change a live account (update) or at rm+add.
-	if st, serr := provision.Status(ctx, r, cmd.Account); serr != nil {
+	// Refuse an account anonctl ALREADY MANAGES, before provisioning or resolving the
+	// endpoint, so a rejected re-add mutates nothing (a pure read) and never re-applies
+	// config. Point the operator at the verb that DOES change a live account (update)
+	// or at rm+add.
+	//
+	// The gate reads the LEDGER, because that is what the guard was always about: the
+	// thing that must not be silently re-applied is anonctl's own endpoint/exemption
+	// record, and a passwd entry says nothing about whether such a record exists. A
+	// passwd-entry gate refuses exactly the declarative hosts that need adoption, and
+	// refuses them in the worst state available: both accounts exist, nothing jails
+	// them, and no anonctl verb will install the forcing (`update` cannot: it targets
+	// an account anonctl already manages).
+	if _, cerr := configStore.Read(cmd.Account); cerr == nil {
+		errorf("add: %s already exists and is managed by anonctl (%s); `add` will not modify it. To change its endpoint or LAN exemptions run `%s`; to re-install its forcing (e.g. after its uid changed) run `%s` first, which leaves the accounts and their homes intact",
+			cmd.Account, ledgerPath(cmd.Account), updateHint(cmd.Account), rmHint(cmd.Account))
+		return 1
+	} else if !errors.Is(cerr, accountconfig.ErrNotFound) {
+		// A record that EXISTS but cannot be read (corrupt, unreadable) must never be
+		// treated as "absent": that would re-add over an account anonctl already manages,
+		// re-applying a config on top of one it could not read. Fail loud instead.
+		errorf("add: reading anonctl's record for %s: %v", cmd.Account, cerr)
+		return 1
+	}
+
+	// ADOPTION vs CREATION, decided from the box. The accounts may already exist
+	// without anonctl having any record of them (the declarative host above, or an
+	// operator who created them by hand). Then `add` adopts them: provision.Add is a
+	// no-op per account that already exists, so nothing is created, the home is left
+	// exactly as whoever declared it left it, and the forcing is installed against the
+	// uids read from the box further down (buildConfig re-reads them; they are never
+	// assumed, because the whole point is that the declaring system chose them).
+	st, serr := checkAddPair(ctx, r, cmd.Account)
+	if serr != nil {
 		errorf("add: %v", serr)
 		return 1
-	} else if st.Exists {
-		errorf("add: %s already exists; `add` will not modify it. To change its endpoint or LAN exemptions run `%s`; to recreate it run `anonctl rm %s` first",
-			cmd.Account, updateHint(cmd.Account), accountArg(cmd.Account))
-		return 1
+	}
+	adopting := st.Exists && st.ShimExists
+	if adopting {
+		if code := vetAdoption(ctx, r, st, "already exist"); code != 0 {
+			return code
+		}
 	}
 
 	// CREATE-LAST ORDERING: everything that can fail, be refused, or need an ANSWER
@@ -203,19 +246,62 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		return 1
 	}
 
+	// RE-ASSERT THE PAIR RULE AGAINST THE STATE THAT EXISTS AT MUTATION TIME, and DECIDE
+	// FROM THIS READ, not the one above. The earlier read happened before the endpoint
+	// prompt, which an operator can sit on for minutes, and on the very host adoption
+	// exists for (a declarative one) a concurrent activation creates and deletes
+	// accounts. Re-reading shrinks the window in which the pair could change from "the
+	// length of the prompt" to the gap before provision.Add's own existence checks; using
+	// the re-read's ANSWER is what stops a pair that appeared during the prompt from
+	// being adopted with none of the adoption guards ever having run. It is not atomic
+	// (nothing here can be), so the post-condition after provisioning reports the
+	// residual race rather than pretending it cannot happen.
+	st, serr = checkAddPair(ctx, r, cmd.Account)
+	if serr != nil {
+		errorf("add: %v", serr)
+		return 1
+	}
+	if !adopting && st.Exists && st.ShimExists {
+		// The pair APPEARED while this run was waiting. That turns a creation into an
+		// adoption, so it must clear the same bar an adoption cleared above (a shared uid is
+		// no less dangerous for having been created a minute ago) and must be disclosed, or
+		// the run would silently force accounts the operator never saw anonctl consider.
+		// Nothing has been mutated yet, so a refusal here is still free.
+		if code := vetAdoption(ctx, r, st, "appeared while this run was waiting for an endpoint, so this is now an adoption"); code != 0 {
+			return code
+		}
+		adopting = true
+	}
+
 	// All questions answered and all guards passed: NOW create the account + its
-	// dedicated shim UID.
+	// dedicated shim UID. When adopting, this is a pure no-op (both accounts exist),
+	// which is precisely why adoption needs no separate provisioning path: res.Created
+	// / res.ShimCreated report which happened, and everything that is scoped to a FRESH
+	// account (the home seeding below, and the login-env write inside provision.Add)
+	// stays scoped to it. An adopted account's home belongs to whoever declared it.
 	res, err := provision.Add(ctx, r, cmd.Account)
 	if err != nil {
 		errorf("add: %v", err)
 		return 1
 	}
+	if adopting && (res.Created || res.ShimCreated) {
+		// The accounts were there when we looked and one of them was not there when we
+		// provisioned: the box changed underneath this run (on a declarative host, that is
+		// an activation deleting an undeclared account mid-add). anonctl has just CREATED
+		// what it meant to adopt, so it says so loudly rather than reporting an adoption
+		// that did not happen. It continues: the forcing below is built from the uids read
+		// after this point, so it is correct for the accounts that exist NOW, and stopping
+		// here would leave those accounts with no forcing at all.
+		fmt.Printf("%s %s and/or %s disappeared between this run's checks and creation, so anonctl CREATED the missing account(s) instead of adopting them. On a host that deletes undeclared accounts they will be deleted again at the next activation: declare them (see docs/nixos.md), then run `%s` and `anonctl add %s` again\n",
+			outStyle.Red("WARNING:"), cmd.Account, res.Shim, rmHint(cmd.Account), accountArg(cmd.Account))
+	}
 
 	// On FRESH creation only, seed the home from the directory-exists default
-	// /etc/anonctl/default-home/ when present (never overwriting: add is create-only,
-	// so it uses force=false). A re-add (Created=false) never re-seeds, mirroring the
-	// login-env write. Seeding failure is a real add failure (the account did not land
-	// as configured), surfaced non-zero.
+	// /etc/anonctl/default-home/ when present (never overwriting: `add` has no --force,
+	// so it seeds with force=false). An ADOPTED account (Created=false) is never
+	// seeded, mirroring the login-env write: its home is whoever declared it's, and
+	// anonctl is not entitled to drop files into it. Seeding failure is a real add
+	// failure (the account did not land as configured), surfaced non-zero.
 	if res.Created {
 		if n, serr := seedDefaultHome(ctx, r, cmd.Account); serr != nil {
 			errorf("add: seeding home: %v", serr)
@@ -232,14 +318,23 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		errorf("add: %v", err)
 		return 1
 	}
-	if err := forcing.Install(ctx, forcingDeps(), cfg, exemptions); err != nil {
+	if err := addForcingInstall(ctx, forcingDeps(), cfg, exemptions); err != nil {
 		errorf("add: installing forcing: %v", err)
 		return 1
 	}
 
-	// The account is always freshly created here: runAdd refuses an existing account
-	// up front, so this path is only ever reached for a genuinely new account.
-	fmt.Printf("%s %s (shim %s, endpoint %s)\n", outStyle.Green("provisioned + forced"), outStyle.Bold(res.Account), res.Shim, cfg.Endpoint().URL())
+	// Report which of the two paths actually ran, read from what provisioning DID (not
+	// from the earlier prediction), so the line never claims to have created an account
+	// it adopted.
+	did := "provisioned + forced"
+	if !res.Created {
+		did = "adopted + forced"
+	}
+	fmt.Printf("%s %s (shim %s, endpoint %s)\n", outStyle.Green(did), outStyle.Bold(res.Account), res.Shim, cfg.Endpoint().URL())
+	if !res.Created {
+		fmt.Printf("%s anonctl did NOT create %s (uid %d) or %s (uid %d); whoever declared them owns their lifecycle. The installed rules match those uids, so if either uid ever changes the rules will govern the OLD one: `%s` reports that as its account-identity check, and `anonctl status` shows it too\n",
+			outStyle.Yellow("note:"), res.Account, cfg.AnonUID, res.Shim, cfg.ShimUID, verifyHint(cmd.Account))
+	}
 	fmt.Printf("%s anonctl does NOT manage the endpoint's own service; enable your endpoint (e.g. `systemctl enable --now tor.service`) so it is up at boot\n", outStyle.Yellow("note:"))
 
 	// Prove it INLINE: run the SAME verify gate `verify`/`use` run (assertions +
@@ -262,11 +357,189 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	return 0
 }
 
+// checkAddPair reads the account pair's state from the box and enforces the rule
+// that `add` deals in PAIRS: the login account and its shim must both exist (adopt
+// them) or both be absent (create them). Half a pair is refused with an error that
+// names BOTH accounts.
+//
+// Half a pair is provision.go:145's half-provisioned state, and adopting it would
+// install forcing naming a uid that does not exist: with no shim account the
+// endpoint-reachability exemption names nobody, so the account is fail-CLOSED but
+// permanently unusable while anonctl reports it as set up. Creating the missing half
+// instead is worse on the host that needs adoption: an account anonctl creates there
+// is undeclared, so the next activation deletes it and the half-state returns at
+// every boot. So it refuses and lets the operator fix it where the accounts are
+// actually defined.
+//
+// It is called TWICE: once early (before the endpoint prompt, so a refusal costs the
+// operator nothing) and once immediately before provisioning (so the rule is applied
+// to the state that exists at mutation time, not to a reading from before the
+// prompt).
+func checkAddPair(ctx context.Context, r provision.Runner, account string) (provision.AccountStatus, error) {
+	st, err := provision.Status(ctx, r, account)
+	if err != nil {
+		return st, err
+	}
+	if st.Exists == st.ShimExists {
+		return st, nil
+	}
+	present, absent := account, st.Shim
+	if !st.Exists {
+		present, absent = st.Shim, account
+	}
+	return st, fmt.Errorf("%s already exists but %s does not, and anonctl has no record of %s: it will not adopt half a pair. The forcing it installs names BOTH uids (the account's, and the shim's as the only uid allowed to reach the endpoint), so adopting %s alone would name a uid that does not exist. Both %s and %s must exist, or neither: on a host that declares its accounts, declare both with pinned uids (see docs/nixos.md) and re-run this; otherwise run `%s` to clear the leftover half and let `add` create both",
+		present, absent, account, present, account, st.Shim, purgeHint(account))
+}
+
+// vetAdoption runs the checks an ADOPTION must clear and discloses it, returning an
+// exit code (0 = proceed). Both places that can decide "this is an adoption" go
+// through it: the read before the endpoint prompt, and the re-read at mutation time
+// for a pair that appeared in between. Keeping it in one function is what stops the
+// second path from silently skipping the guard the first path applies. what names
+// how the accounts came to be here, so the disclosure is truthful in both cases.
+func vetAdoption(ctx context.Context, r provision.Runner, st provision.AccountStatus, what string) int {
+	// The adopted uids must be THIS pair's and nobody else's. anonctl did not allocate
+	// them, so the uniqueness `useradd` would have enforced is not guaranteed here: a
+	// pair created with `useradd -o -u <uid>`, or a host without uid-uniqueness
+	// enforcement, can share a uid with an unrelated account. The rules match `meta
+	// skuid`, which knows nothing about names, so forcing such a uid would silently jail
+	// that other account too - the UID-reuse hazard, arrived at by adoption instead of
+	// by deletion.
+	if err := refuseSharedUID(ctx, r, st); err != nil {
+		errorf("add: %v", err)
+		return 1
+	}
+	// Disclose it as early as the decision is made (before the endpoint prompt on the
+	// ordinary path), so the operator can abort if adopting these particular accounts is
+	// not what they meant.
+	fmt.Printf("%s %s (uid %s) and %s (uid %s) %s and anonctl has no record of them: adopting them as they are (no account is created, no home is touched)\n",
+		outStyle.Bold("adopting:"), st.Account, st.UID, st.Shim, st.ShimUID, what)
+	return 0
+}
+
+// refuseSharedUID refuses adopting a pair whose uid (or shim uid) is ALSO owned by
+// another account in the passwd table.
+//
+// This guard exists only on the adoption path, because only there does anonctl force
+// a uid it did not allocate: `useradd` refuses a duplicate uid unless explicitly
+// told otherwise, so an account anonctl created is unique by construction, while an
+// account it adopts is only as unique as whoever made it. The nft rules match `meta
+// skuid <uid>` and know nothing about names, so forcing a shared uid would redirect
+// and default-deny the OTHER account's egress too, silently: the UID-reuse hazard
+// docs/nixos.md describes, reached by adoption rather than by deletion.
+//
+// It asks TWO questions, because neither alone covers the hosts anonctl runs on:
+//
+//   - a REVERSE lookup (`getent passwd <uid>`) resolves through NSS, so it still
+//     answers on a directory backend (LDAP/SSSD/AD, nss-systemd) that does not allow
+//     enumeration. It returns only the FIRST match, so it catches the dangerous
+//     shape - another account OUTRANKING ours for that uid - but cannot see a
+//     duplicate that sorts after us.
+//   - an ENUMERATION (`getent passwd`) sees every LOCAL duplicate, including one
+//     that sorts after the anon account, which the reverse lookup would miss.
+//
+// Neither can prove a NEGATIVE on a non-enumerable backend: enumeration there
+// returns the local files only, non-empty and incomplete, so "no collision found" is
+// not "no collision". That is stated in a note rather than treated as a refusal:
+// refusing every directory-backed host for a hazard with no evidence would make
+// anonctl unusable on them, and the reverse lookup has already asked the one
+// question those backends can answer.
+func refuseSharedUID(ctx context.Context, r provision.Runner, st provision.AccountStatus) error {
+	lines := provision.ReadPasswd(ctx, r)
+	for _, target := range []struct{ account, uid string }{{st.Account, st.UID}, {st.Shim, st.ShimUID}} {
+		owners := passwdNamesForUID(lines, target.uid)
+		if owner, ok := passwdNameOfUID(ctx, r, target.uid); ok {
+			owners = append(owners, owner)
+		}
+		for _, other := range owners {
+			if other == target.account {
+				continue
+			}
+			return fmt.Errorf("%s owns uid %s, but so does %q: anonctl will not adopt an account whose uid is shared. Its rules match `meta skuid %s`, which names a uid and not an account, so forcing it would silently redirect and default-deny %q's egress as well. Give %s a uid of its own (a PINNED, unshared one on a host that declares its accounts) and re-run this",
+				target.account, target.uid, other, target.uid, other, target.account)
+		}
+	}
+	if len(lines) == 0 {
+		// getent produced NOTHING at all: not even the local files were read, so only the
+		// reverse lookups above were answered. Say which question went unanswered rather
+		// than implying the uids were cleared.
+		fmt.Fprintf(os.Stderr, "%s could not enumerate the passwd table, so anonctl could not check uid %s and uid %s against every account on this host (only against the one each uid resolves to); adopting anyway - re-check with `getent passwd | awk -F: '$3==%s || $3==%s'`\n",
+			errStyle.Yellow("note:"), st.UID, st.ShimUID, st.UID, st.ShimUID)
+	}
+	return nil
+}
+
+// passwdNameOfUID resolves a uid back to the account NAME the box's NSS stack
+// answers with (`getent passwd <uid>`), reporting false when it resolves to nothing.
+// It is the half of the sharing check that survives a backend which refuses
+// enumeration, since a direct lookup is answered where a table dump is not. It reads
+// only the FIRST match by construction (that is all getent returns), which is why
+// the enumeration above is still consulted.
+func passwdNameOfUID(ctx context.Context, r provision.Runner, uid string) (string, bool) {
+	if strings.TrimSpace(uid) == "" {
+		return "", false
+	}
+	stdout, _, err := r.Run(ctx, "getent", "passwd", strings.TrimSpace(uid))
+	if err != nil && strings.TrimSpace(stdout) == "" {
+		return "", false
+	}
+	line := strings.TrimSpace(strings.SplitN(stdout, "\n", 2)[0])
+	fields := strings.Split(line, ":")
+	if len(fields) < 3 || fields[0] == "" {
+		return "", false
+	}
+	// Guard against a backend answering with a DIFFERENT uid than asked for (a fuzzy or
+	// misconfigured resolver): only a line that really carries this uid is evidence.
+	if strings.TrimSpace(fields[2]) != strings.TrimSpace(uid) {
+		return "", false
+	}
+	return fields[0], true
+}
+
+// passwdNamesForUID returns every account NAME in the passwd lines that owns uid.
+// Lines it cannot parse are skipped: a malformed entry is not evidence of sharing,
+// and this is a guard, not a passwd validator.
+func passwdNamesForUID(lines []string, uid string) []string {
+	if strings.TrimSpace(uid) == "" {
+		return nil
+	}
+	var names []string
+	for _, line := range lines {
+		fields := strings.Split(line, ":")
+		if len(fields) < 3 {
+			continue
+		}
+		if strings.TrimSpace(fields[2]) == strings.TrimSpace(uid) {
+			names = append(names, fields[0])
+		}
+	}
+	return names
+}
+
 // addVerifyReport runs the shared verify gate for `add`'s inline proof. It is a
 // package var mirroring useVerifyReport/execVerifyReport so a unit test can drive
 // runAdd's tail (the inline verify + its green/red messaging) without a real probe
 // run; production wires the real verifyAndMark (assertions + marker-on-green).
 var addVerifyReport = verifyAndMark
+
+// addForcingInstall installs the forcing for an account `add` has just provisioned
+// or adopted (rules + persisted state + units + the shim). It is a package var
+// mirroring rmForcingRemove so a unit test can drive runAdd end-to-end (the
+// adoption path in particular: no account created, the home untouched, the rules
+// built from the uids read off the box) without a real nft/systemd host.
+var addForcingInstall = forcing.Install
+
+// ledgerPath renders the path of an account's anonctl record for an error message,
+// falling back to the account name when the store cannot name it (an invalid
+// account name, which the CLI's own parse already rejects). It exists so the
+// "already managed" refusal points at the FILE the operator can look at and delete,
+// rather than asserting management with no evidence.
+func ledgerPath(account string) string {
+	if p, err := configStore.Path(account); err == nil {
+		return p
+	}
+	return account
+}
 
 // The seed-home seams: package vars so the unit tests drive the add/seed-home
 // wiring without a real home or a real /etc read. Production wires the real
@@ -379,13 +652,14 @@ var (
 	rmForcingRemove = forcing.Remove
 	// rmProvisionRm userdels the login + shim accounts (only under --purge-account).
 	rmProvisionRm = provision.Rm
-	// rmMarkerStore is the marker Store runRm removes the stale claim through. It is
-	// a package var (like the seams above) so the unit tests point it at a scratch
-	// t.TempDir() instead of the real `/etc/anonctl` (the shared-write isolation
-	// discipline the marker's own tests use via Store.BaseDir). Production wires the
-	// real DefaultStore (`/etc/anonctl`).
-	rmMarkerStore = marker.DefaultStore()
 )
+
+// markerStore is the marker Store every verb reads/writes the double-anonymization
+// CLAIM through: `verify` writes it on green, `status` reads it, `rm` removes it. It
+// is a package var so the unit tests point it at a scratch t.TempDir() instead of
+// the real `/etc/anonctl` (the shared-write isolation discipline the marker's own
+// tests use via Store.BaseDir). Production wires the real DefaultStore.
+var markerStore = marker.DefaultStore()
 
 // runRm tears an account's forcing down and, only under --purge-account, deletes
 // the account + its shim. A bare rm leaves the home intact. It ALSO removes the
@@ -426,7 +700,7 @@ func runRm(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	}
 	// 3. Remove the marker (idempotent: a missing marker is a clean no-op), so a
 	// torn-down account never leaves a stale "already forced" claim behind.
-	if err := rmMarkerStore.Remove(cmd.Account); err != nil {
+	if err := markerStore.Remove(cmd.Account); err != nil {
 		fail("removing marker", err)
 	}
 
@@ -468,8 +742,50 @@ func runList(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	return 0
 }
 
-// runStatus reports one account's state, read from the box. --json emits the
-// machine-readable contract; the human form is a short summary. Read-only.
+// statusReport is the `status --json` document: the account state read from the box
+// (EMBEDDED, so every existing field name in the contract is unchanged) plus the
+// IDENTITY view, which is the one thing the box alone cannot say - whether what is
+// on the box still agrees with what anonctl RECORDED. A consumer that gates on the
+// old fields is unaffected; one that cares reads `identity.state`.
+type statusReport struct {
+	provision.AccountStatus
+	Identity statusIdentity `json:"identity"`
+}
+
+// statusIdentity is the machine-readable identity verdict: the same classification
+// `verify`'s account-identity precondition gates on (verify.AccountIdentity.State),
+// plus the uids anonctl RECORDED so a consumer can see both sides of the
+// comparison. State is the field to switch on; Detail is the human evidence line
+// and is not a contract.
+type statusIdentity struct {
+	State           string `json:"state"`
+	Ok              bool   `json:"ok"`
+	Detail          string `json:"detail"`
+	HaveRecord      bool   `json:"haveRecord"`
+	RecordedUID     int    `json:"recordedUid,omitempty"`
+	RecordedShimUID int    `json:"recordedShimUid,omitempty"`
+	// RecordError is the underlying read error when the record could not be read and
+	// its absence could not be established (state record-unreadable), so a consumer
+	// sees "permission denied" or the parse error rather than only the summary.
+	RecordError string `json:"recordError,omitempty"`
+}
+
+// runStatus reports one account's state, read from the box AND compared against
+// anonctl's own record. --json emits the machine-readable contract; the human form
+// is a short summary. Read-only.
+//
+// The comparison is why this verb is not just a passwd dump. An account can be
+// GONE, or can exist owning a uid that is no longer the one the installed rules
+// govern, and both of those are silent: the rules stay loaded, the marker stays
+// written, and `/etc/anonctl` goes on recording the account as jailed. `status`
+// names that condition as itself (the SAME decision `verify`'s precondition gates
+// on, via verify.AccountIdentity.State, so the two can never disagree) instead of
+// reporting a reassuring "provisioned" line about a uid that belongs to nobody.
+//
+// It stays EXIT-CODE NEUTRAL: `status` reports, `verify` adjudicates (it is the
+// non-zero CI gate, and the identity precondition fails there). A drifted account
+// is loud in the output, not in the exit status, so existing scripts that only
+// check whether `status` ran are not silently broken by this.
 func runStatus(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	st, err := provision.Status(ctx, r, cmd.Account)
 	if err != nil {
@@ -478,16 +794,64 @@ func runStatus(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	}
 	// Read the marker (the same dependency-free truth a sibling tool reads). A
 	// missing marker is a clean "not forced", not an error.
-	st, err = st.WithMarker(marker.DefaultStore())
+	st, err = st.WithMarker(markerStore)
 	if err != nil {
 		errorf("status: reading marker: %v", err)
 		return 1
 	}
+	// The identity comparison: the live uids (above) against the uids anonctl recorded
+	// when it installed the forcing (the ledger). accountIdentity holds the two apart;
+	// State classifies the disagreement.
+	id := accountIdentity(configStore, cmd.Account, st)
+	state := id.State()
+	detail := verify.AccountIdentityAssertion(id).Detail
+
 	if cmd.JSON {
-		return emitJSON(st)
+		return emitJSON(statusReport{
+			AccountStatus: st,
+			Identity: statusIdentity{
+				State:           string(state),
+				Ok:              state.Ok(),
+				Detail:          detail,
+				HaveRecord:      id.HaveRecord,
+				RecordedUID:     id.RecordedUID,
+				RecordedShimUID: id.RecordedShimUID,
+				RecordError:     errText(id.RecordErr),
+			},
+		})
 	}
 	if !st.Exists {
+		// THREE different conditions share "no passwd entry", and conflating them is what
+		// made this unreadable on a host that deletes undeclared accounts. With no anonctl
+		// record it is simply an account that was never added. WITH one, the account was
+		// deleted out from under a forcing that is still installed and still governing a
+		// uid that is now free: say that, and say which uid. And when the record could not
+		// be READ, anonctl cannot tell those two apart, which must not be reported as the
+		// harmless one: an unprivileged `status` in exactly the scenario this check exists
+		// for (activation deleted the pair) would otherwise print a calm "not provisioned"
+		// while rules may still be governing a freed uid.
+		switch {
+		case id.RecordErr != nil:
+			fmt.Printf("%s: %s (no passwd entry, and anonctl's record could not be read, so whether forcing is still installed for it - and which uid that forcing governs - cannot be said from here)\n",
+				outStyle.Bold(st.Account), outStyle.Red("UNKNOWN"))
+			fmt.Printf("  identity: %s (%s)\n", outStyle.Red("UNKNOWN"), errText(id.RecordErr))
+			fmt.Printf("    the record lives under /etc/anonctl/accounts and is root-only, so the usual cause is running without privilege: re-run as root\n")
+			return 0
+		case id.HaveRecord:
+			fmt.Printf("%s: %s (anonctl records it as forced, governing uid %d; there is no passwd entry for it)\n",
+				outStyle.Bold(st.Account), outStyle.Red("ACCOUNT MISSING"), id.RecordedUID)
+			fmt.Printf("  %s\n", detail)
+			return 0
+		}
 		fmt.Printf("%s: %s\n", outStyle.Bold(st.Account), outStyle.Yellow("not provisioned"))
+		if st.ShimExists {
+			// A stray shim with no login account is half a pair, which `add` REFUSES. Say so
+			// here: `status` is the cheap diagnostic an operator runs first, and it should
+			// name what the mutating verb is going to object to rather than report a bare
+			// "not provisioned" and let them discover it from a refusal.
+			fmt.Printf("  shim %s: %s (uid %s) - half a pair: `anonctl add` refuses this until both accounts exist or neither (`%s` clears it)\n",
+				st.Shim, outStyle.Red("PRESENT WITHOUT ITS ACCOUNT"), st.ShimUID, purgeHint(st.Account))
+		}
 		return 0
 	}
 	fmt.Printf("%s: %s (uid %s)\n", outStyle.Bold(st.Account), outStyle.Green("provisioned"), st.UID)
@@ -496,6 +860,7 @@ func runStatus(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	} else {
 		fmt.Printf("  shim %s: %s\n", st.Shim, outStyle.Red("MISSING"))
 	}
+	printStatusIdentity(state, st, id, detail)
 	// Positively surface the sudo-absence invariant (a UID-transition escape closed
 	// at add-time): no sudo is the hardened, expected state; sudo present is a WARN
 	// because a sudo'd socket carries a different uid and escapes the forcing. When
@@ -517,6 +882,47 @@ func runStatus(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		fmt.Printf("  forced: %s (no marker)\n", outStyle.Yellow("no"))
 	}
 	return 0
+}
+
+// printStatusIdentity renders the identity line for an account that EXISTS: does
+// the box still agree with anonctl's record? Each state gets its own unambiguous
+// wording, because the operator's next action differs for each, and the two that
+// are dangerous (a uid that drifted out from under the forcing) carry the full
+// evidence line rather than a summary - that drift is the failure that leaves an
+// account UNFORCED while everything else still says it is jailed.
+//
+// The "not recorded" state is deliberately printed too, and is not a failure: it is
+// what a declared-but-not-yet-added account looks like, and saying so is how the
+// operator learns `anonctl add` still has to run.
+func printStatusIdentity(state verify.IdentityState, st provision.AccountStatus, id verify.AccountIdentity, detail string) {
+	switch state {
+	case verify.IdentityOK:
+		fmt.Printf("  identity: %s (uid %s and shim uid %s are the uids anonctl's rules and record govern)\n",
+			outStyle.Green("ok"), st.UID, st.ShimUID)
+	case verify.IdentityUnrecorded:
+		fmt.Printf("  identity: %s (anonctl has no record for %s, so there is no recorded uid to compare against; `anonctl add %s` would adopt these accounts as they are)\n",
+			outStyle.Yellow("not recorded"), st.Account, accountArg(st.Account))
+	case verify.IdentityUIDMismatch:
+		fmt.Printf("  identity: %s (%s now owns uid %s, but anonctl's rules and record govern uid %d)\n",
+			outStyle.Red("UID MISMATCH"), st.Account, st.UID, id.RecordedUID)
+		fmt.Printf("    %s\n", detail)
+	case verify.IdentityShimUIDMismatch:
+		fmt.Printf("  identity: %s (%s now owns uid %s, but the installed rules govern uid %d)\n",
+			outStyle.Red("SHIM UID MISMATCH"), st.Shim, st.ShimUID, id.RecordedShimUID)
+		fmt.Printf("    %s\n", detail)
+	case verify.IdentityShimMissing:
+		// The shim line above already reported the absence; this states its CONSEQUENCE,
+		// which is what the operator actually needs (fail-closed, but unusable).
+		fmt.Printf("  identity: %s (the shim account does not exist, so the account is fail-CLOSED but cannot reach the endpoint)\n",
+			outStyle.Red("INCOMPLETE"))
+	case verify.IdentityRecordUnreadable:
+		// NOT reported as "ok" and not silently omitted: nothing was compared, so the uids
+		// the rules govern are unknown. Carrying the full detail matters here because it
+		// names the likely cause (an unprivileged read of a root-only record).
+		fmt.Printf("  identity: %s (anonctl's record for %s could not be read, so nothing was compared)\n",
+			outStyle.Red("UNKNOWN"), st.Account)
+		fmt.Printf("    %s\n", detail)
+	}
 }
 
 // runVerify is the trust anchor (story 15-18, 25): it PROVES the account is
@@ -649,7 +1055,10 @@ func verifyAndMark(ctx context.Context, r provision.Runner, cmd *cli.Command, pr
 			Assertions: []verify.Assertion{{Name: "account-readable", Ok: false, Err: err}},
 		}
 	}
-	store := accountconfig.DefaultStore()
+	// The SAME ledger seam `add` gates on and `status` compares against, so all three
+	// verbs read one set of records (and a test that points it at a scratch dir
+	// redirects every one of them).
+	store := configStore
 	p := verifyParams(store, cmd.Account, st)
 	p.SkipTorExitCheck = cmd.SkipTorExitCheck
 
@@ -683,7 +1092,7 @@ func verifyAndMark(ctx context.Context, r provision.Runner, cmd *cli.Command, pr
 	// nothing and leaves any prior claim to be cleared by `rm`.
 	if rep.Ok() {
 		m := marker.New(cmd.Account, st.UID, p.Class, resolveVersion(), time.Now())
-		if werr := marker.DefaultStore().WriteVerified(m, true); werr != nil {
+		if werr := markerStore.WriteVerified(m, true); werr != nil {
 			errorf("verify: writing marker: %v", werr)
 		}
 	}
@@ -699,6 +1108,15 @@ func verifyAndMark(ctx context.Context, r provision.Runner, cmd *cli.Command, pr
 //
 // A missing config is a clean "no record" (an account that was never forced), not
 // an error: the precondition then checks existence only and says so.
+//
+// An UNREADABLE config is emphatically NOT the same thing and must never collapse
+// into it. The record is root-only (`/etc/anonctl/accounts`, 0700/0600), so the
+// commonest unreadable case is an unprivileged `anonctl status` - a read-only verb
+// the docs tell operators needs no privilege. Swallowing that error would hand them
+// "no record, nothing to compare" (a PASSING identity line) for an account whose uid
+// may have drifted out from under the forcing, i.e. a reassuring green for exactly
+// the condition this check exists to surface. It is carried through as RecordErr and
+// classified as its own failing state.
 func accountIdentity(store accountconfig.Store, account string, st provision.AccountStatus) verify.AccountIdentity {
 	id := verify.AccountIdentity{
 		Account:    account,
@@ -708,12 +1126,26 @@ func accountIdentity(store accountconfig.Store, account string, st provision.Acc
 		UID:        atoiOr(st.UID, 0),
 		ShimUID:    atoiOr(st.ShimUID, 0),
 	}
-	if cfg, err := store.Read(account); err == nil {
+	cfg, err := store.Read(account)
+	switch {
+	case err == nil:
 		id.HaveRecord = true
 		id.RecordedUID = cfg.AnonUID
 		id.RecordedShimUID = cfg.ShimUID
+	case !errors.Is(err, accountconfig.ErrNotFound):
+		id.RecordErr = err
 	}
 	return id
+}
+
+// errText renders an error for a JSON field, or "" when there is none (the field is
+// then omitted). It exists so a report carries the error TEXT rather than a Go error
+// value, which does not marshal.
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // verifyParams assembles the LIVE verify params for an account: the endpoint +
@@ -726,6 +1158,11 @@ func verifyParams(store accountconfig.Store, account string, st provision.Accoun
 	ep := endpoint.Default()
 	relay, dns := accountconfig.DefaultRelayPort, accountconfig.DefaultDNSPort
 	var exempt string
+	// A read error falls back to the defaults, which is safe ONLY because the
+	// account-identity precondition classifies an unreadable record as its own FAILING
+	// state (verify.IdentityRecordUnreadable) and short-circuits the run before any of
+	// these params are probed. Without that, a corrupt or unprivileged read would
+	// quietly probe the DEFAULT endpoint and ports and report on the wrong thing.
 	if cfg, err := store.Read(account); err == nil {
 		ep = cfg.Endpoint()
 		relay, dns = cfg.RelayPort, cfg.DNSPort
@@ -902,8 +1339,18 @@ func runUpdate(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	// Read the persisted config FIRST (the account must already be provisioned +
 	// forced), so a bare `update` on a non-existent account fails with that, not a
 	// confusing endpoint prompt.
-	cfg, err := accountconfig.DefaultStore().Read(cmd.Account)
+	// Through the SAME ledger seam add/status/verify read, so all four verbs agree on
+	// one set of records (and a test that redirects it redirects every one of them).
+	cfg, err := configStore.Read(cmd.Account)
 	if err != nil {
+		// An UNREADABLE record is not an absent one, here either: telling the operator to
+		// run `add` would send them at a gate that refuses on exactly this error. `rm`
+		// deletes by account name without parsing the record, so it is the way out.
+		if !errors.Is(err, accountconfig.ErrNotFound) {
+			errorf("%s: reading anonctl's record for %s: %v; it exists but could not be read, so %s cannot re-apply it (the record is root-only: re-run as root, or if it is corrupt run `%s` then `anonctl add %s` to rebuild it)",
+				cmd.Verb, cmd.Account, err, cmd.Verb, rmHint(cmd.Account), accountArg(cmd.Account))
+			return 1
+		}
 		errorf("%s: %s is not provisioned/forced (run `anonctl add %s` first): %v", cmd.Verb, cmd.Account, accountArg(cmd.Account), err)
 		return 1
 	}
@@ -960,10 +1407,16 @@ func runUpdate(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	return 0
 }
 
-// configListStore is the store `claimEndpoint` reads the on-disk claim set from
-// (every account's persisted endpoint). It is a package var so a unit test points
-// its BaseDir at a scratch dir and never touches the real /etc/anonctl/accounts.
-var configListStore = accountconfig.DefaultStore()
+// configStore is anonctl's LEDGER of the accounts it manages
+// (`/etc/anonctl/accounts/<account>.json`, one record per forced account). It is
+// the single reader/writer seam for that set: `add` gates on whether a record
+// exists (is this account ALREADY MANAGED?), `claimEndpoint` and the port
+// allocator read the whole set as the claim/reservation ledger, `status` reads one
+// record to compare the recorded uids against the box, and forcing.Install/Remove
+// write and delete through it (see forcingDeps). It is a package var so a unit
+// test points its BaseDir at a scratch dir and never touches the real
+// /etc/anonctl/accounts.
+var configStore = accountconfig.DefaultStore()
 
 // claimEndpoint enforces the cross-identification guard for pointing `account` at
 // `ep`: it builds the endpoint Registry from every OTHER account's persisted
@@ -974,7 +1427,7 @@ var configListStore = accountconfig.DefaultStore()
 // isolation). A failure to READ the claim set is a loud error (a corrupt sibling
 // config must not silently disable the guard), NOT a silent pass.
 func claimEndpoint(account string, ep endpoint.Endpoint) error {
-	configs, err := configListStore.List()
+	configs, err := configStore.List()
 	if err != nil {
 		return fmt.Errorf("checking endpoint sharing: %w", err)
 	}
@@ -1018,7 +1471,7 @@ func defaultStdinIsTTY() bool {
 // endpoint. A tor-shared config contributes nothing (share-safe). A read failure is
 // surfaced so the annotation never silently misses a claim.
 func peruserOwners() (map[string]string, error) {
-	configs, err := configListStore.List()
+	configs, err := configStore.List()
 	if err != nil {
 		return nil, fmt.Errorf("reading endpoint claims: %w", err)
 	}
@@ -1143,16 +1596,19 @@ func forcingDeps() forcing.Deps {
 	return forcing.Deps{
 		NftRunner:     nftables.ExecRunner{},
 		SystemdRunner: systemd.ExecRunner{},
-		ConfigStore:   accountconfig.DefaultStore(),
+		ConfigStore:   configStore,
 		SystemdStore:  systemd.DefaultStore(),
 	}
 }
 
-// buildConfig assembles an account's at-rest config from its just-provisioned UIDs
-// (read from the box) and the chosen endpoint (the raw --endpoint value, or the
-// default Tor SocksPort when empty). It fails loud if the account's UIDs cannot be
-// read (a provisioning that did not land) rather than emit a config that would
-// mis-force.
+// buildConfig assembles an account's at-rest config from its UIDs, ALWAYS READ FROM
+// THE BOX, and the chosen endpoint (the raw --endpoint value, or the default Tor
+// SocksPort when empty). Reading rather than assuming is what makes `add` work
+// identically for an account it just created and one it ADOPTED: on a host that
+// declares its users, the uids are the ones that configuration pinned, and anonctl
+// has no other way to learn them. It fails loud if the UIDs cannot be read (a
+// provisioning that did not land) rather than emit a config that would mis-force.
+
 // exemptionsForUpdate resolves which exemptions an update should apply: the ones
 // the operator named on THIS invocation when any were given, else the account's
 // already-persisted exemptions (re-parsed from their raw form). This keeps a plain
@@ -1226,13 +1682,13 @@ func buildConfig(ctx context.Context, r provision.Runner, account, rawEndpoint s
 	}, nil
 }
 
-// allocatePortsFor reads the on-disk config set (via the same configListStore seam
+// allocatePortsFor reads the on-disk config set (via the same configStore seam
 // claimEndpoint uses) and allocates a free relay/DNS pair for account, excluding
 // account's own record so a re-derivation never collides with itself. A failure to
 // READ the ledger is loud (a corrupt sibling config must not silently disable the
 // collision guard, exactly as claimEndpoint treats a read error).
 func allocatePortsFor(account string) (portPair, error) {
-	configs, err := configListStore.List()
+	configs, err := configStore.List()
 	if err != nil {
 		return portPair{}, fmt.Errorf("allocating shim ports: reading account configs: %w", err)
 	}
@@ -1275,11 +1731,27 @@ func accountArg(account string) string {
 // empty): `anonctl verify` for the default, `anonctl verify <name>` for a named one.
 // It exists so the follow-up hint never prints a stray `verify ` (the e2e finding,
 // BUG 5); callers wrap it in backticks in the message.
-func verifyHint(account string) string {
+func verifyHint(account string) string { return appendAccountArg("anonctl verify", account) }
+
+// rmHint / purgeHint render the two `rm` forms an error message points at, in the
+// shortest form the operator would type: a bare `rm` (tears the forcing, the record
+// and the marker down, leaving the accounts and homes intact) and the
+// `--purge-account` form (also deletes both accounts). They mirror verifyHint /
+// accountArg so the default account never prints a stray trailing space.
+func rmHint(account string) string { return appendAccountArg("anonctl rm", account) }
+
+func purgeHint(account string) string {
+	return appendAccountArg("anonctl rm --purge-account", account)
+}
+
+// appendAccountArg appends the account's CLI argument to a command, or nothing at
+// all for the default account (whose argument is empty), so no hint ever ends in a
+// dangling space (the e2e finding, BUG 5).
+func appendAccountArg(cmd, account string) string {
 	if arg := accountArg(account); arg != "" {
-		return "anonctl verify " + arg
+		return cmd + " " + arg
 	}
-	return "anonctl verify"
+	return cmd
 }
 
 // updateHint renders the `update` command that changes an existing account's
@@ -1320,8 +1792,14 @@ const usage = `usage:
   anonctl add    [--endpoint <socks5h://host:port>] [--allow <IP|CIDR:port>]... [<name>]
                                      provision the account + shim UID, install fail-closed forcing that
                                      survives reboot (default endpoint: the local Tor SocksPort) (root).
-                                     CREATE-ONLY: refuses an existing account (use update to change its
-                                     endpoint/exemptions, or rm then add to recreate).
+                                     ADD-ONCE: refuses an account anonctl already MANAGES, i.e. one with a
+                                     record in /etc/anonctl/accounts (use update to change its endpoint/
+                                     exemptions; rm then add to re-install its forcing).
+                                     ADOPTS accounts that already exist but anonctl has no record of (a
+                                     host that declares its users, see docs/nixos.md): it creates nothing,
+                                     leaves the home untouched, and forces the uids it reads off the box.
+                                     Both <account> and <account>-shim must exist, or neither: half a pair
+                                     is refused, never completed.
                                      --allow punches a narrow direct hole (repeatable; an exact :port is
                                      REQUIRED, never :53): an RFC1918/link-local LAN host, OR a same-host
                                      loopback service 127.0.0.1:<port> (the anonymizer control/SOCKS/DNS

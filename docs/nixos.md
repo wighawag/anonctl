@@ -52,7 +52,9 @@ You have two ways out, and they are not equivalent. [Declare the accounts](#2-th
 
 ## 2. The supported path: declare both accounts, then let `add` adopt them
 
-Declare **both** the login account and its `-shim` service account in your NixOS configuration, with **pinned uids**, rebuild, and only then run `anonctl add`. Provisioning an account that already exists is a no-op (`anoncore/provision/provision.go:136`), so `anonctl add` **adopts** the accounts NixOS created rather than trying to create them, and goes on to install the forcing, the shim unit and the nft tables as usual.
+Declare **both** the login account and its `-shim` service account in your NixOS configuration, with **pinned uids**, rebuild, and only then run `anonctl add`.
+
+`anonctl add` **adopts** accounts that already exist: it gates on whether anonctl already has a RECORD for the account (`/etc/anonctl/accounts/<account>.json`), not on whether a passwd entry exists, so accounts NixOS created are not mistaken for an account anonctl already set up. On the adoption path it creates nothing, leaves the home exactly as your configuration made it, writes no login environment into it, reads both uids off the box (never assumes them: your configuration chose them) and installs the forcing, the shim unit and the nft tables against those uids. A SECOND `anonctl add` on the same account is then refused, because by that point anonctl does have a record for it; change its endpoint with `anonctl update`, or run `anonctl rm <account>` (a bare `rm` leaves the accounts and homes intact) and `add` again to re-install the forcing.
 
 The order is load-bearing, for a reason that is easy to get wrong: NixOS **will not change the uid of an account that already exists**. If `anonctl add` creates the account first and you declare a different uid afterwards, activation keeps the existing uid and prints only `warning: not applying UID change of user 'anon-a' (1002 -> 1500)`, which scrolls past in a rebuild log. So:
 
@@ -116,13 +118,22 @@ If the accounts already exist because you ran `anonctl add` before declaring the
 }
 ```
 
-`users.enforceIdUniqueness` is on by default, so a uid you pick that collides with another declared account fails the **build**, not the boot.
+`users.enforceIdUniqueness` is on by default, so a uid you pick that collides with another declared account fails the **build**, not the boot. `anonctl add` checks the same thing from its side before adopting (it resolves each uid back through NSS and scans the passwd table, and refuses naming the other account), because a shared uid would put that account behind anonctl's forcing too: `meta skuid` matches a uid, not a name. One residual worth knowing on a **directory-joined** host (LDAP/SSSD/AD, or `nss-systemd`): a backend configured with `enumerate = false` answers `getent passwd` with the local files only, so anonctl's reverse lookup is the only half of that check that reaches the directory, and it sees only the first match for a uid. If your uids come from a directory, pin anon uids in a range the directory does not allocate from.
 
 The gids are deliberately left unpinned: nftables matches on `meta skuid` only, so the uid is the thing that must not move. Pin them too if you want fully reproducible group ownership of the home directory.
 
 ### Declare BOTH accounts, not just the login account
 
-Declaring only `anon-a` looks like it works and does not. `anonctl add` will see the login account present and the shim absent, and create the shim itself with `useradd --system`. That shim account is then undeclared, so the next activation deletes it, and every boot leaves you with exactly the half-provisioned residue `provision.go:145` describes: a login account that exists, no shim, and forcing that names a uid nothing runs as. The account is fail-CLOSED in that state (the baseline default-deny still drops it, so it does not leak) but it is unusable, and it is unusable again after every single rebuild.
+Declaring only `anon-a` does not work, and `anonctl add` will tell you so rather than paper over it: it refuses a half-declared pair, naming both accounts, and touches nothing.
+
+```
+anonctl: add: anon-a already exists but anon-a-shim does not, and anonctl has no record of anon-a: it will not
+adopt half a pair ...
+```
+
+The refusal is deliberate, and it is the one place anonctl declines to be helpful. Creating the missing shim itself (with `useradd --system`, which is what it does on a host where out-of-band creation is fine) would produce an **undeclared** account on this distro, so the next activation deletes it, and every boot leaves you with exactly the half-provisioned residue `provision.go:145` describes: a login account that exists, no shim, and forcing that names a uid nothing runs as. The account is fail-CLOSED in that state (the baseline default-deny still drops it, so it does not leak) but it is unusable, and it is unusable again after every single rebuild. A missing half on this host means your configuration is wrong, so that is where it has to be fixed.
+
+If you hit the refusal with a leftover half that is NOT declared (an interrupted `anonctl add` from before, say), clear it with `sudo anonctl rm --purge-account anon-a` and start from the declarations.
 
 ### Pinning the uids is what closes the UID-reuse hazard
 
@@ -253,8 +264,11 @@ Substitute your own account name for `anon-a` throughout.
 ### 6.1 The account still exists and still owns its pinned uid
 
 ```sh
+sudo anonctl status anon-a
 sudo anonctl verify anon-a
 ```
+
+`status` makes the same comparison and prints it as its `identity:` line, so it is the cheap check you can run without waiting for the probes. **Run it with `sudo`**: the record it compares against lives under `/etc/anonctl/accounts` and is root-only, so an unprivileged run cannot read it. It says so rather than guessing (`identity: UNKNOWN ...`, `"state":"record-unreadable"`, `"ok":false`), because reporting an unreadable record as "nothing to compare" would print a reassuring line for an account whose uid may have drifted. The rest of `status` still works without root. It distinguishes the shapes that matter: `ACCOUNT MISSING` (anonctl records the account as forced and there is no passwd entry: the activation deleted it), `UID MISMATCH` (it exists under a uid that is not the one the loaded rules govern, so it is UNFORCED while `/etc/anonctl` still records it as jailed), `not recorded` (the accounts exist but `anonctl add` has not adopted them yet), and `ok`. Under `--json` the same verdict is `identity.state`, so a host-check script can gate on it.
 
 `verify`'s first assertion is `account-identity`, and it is a precondition: it checks that both accounts exist and still own the uids anonctl recorded, and when that fails it reports **that assertion alone** and stops. So on a host where NixOS deleted the accounts you get one unambiguous line naming the deletion and the orphaned uid, not a scatter of leak assertions about a uid that is nobody's. The same assertion catches the recreated-under-a-different-uid case, which is the one that leaves the account completely unforced while `/etc/anonctl` still records it as jailed.
 
@@ -312,6 +326,7 @@ This is the only test that exercises what section 1 is about, because the deleti
 
 ## Related reading
 
+- [`docs/adr/0010-add-gates-on-the-ledger-and-adopts-existing-accounts.md`](adr/0010-add-gates-on-the-ledger-and-adopts-existing-accounts.md): why `add` gates on anonctl's own record rather than the passwd table, what adoption does and does not touch, and why half a pair is refused rather than completed.
 - [`docs/adr/0003-verify-assertion-names-and-json-contract.md`](adr/0003-verify-assertion-names-and-json-contract.md): the `account-identity` precondition and the `--json` contract.
 - [`docs/adr/0005-reboot-persistence-and-boot-invariant.md`](adr/0005-reboot-persistence-and-boot-invariant.md): the boot invariant and why a store path in `ExecStart` is fail-open.
 - `work/notes/findings/nixos-account-conventions-break-anonctl-provisioning.md`, `work/notes/findings/systemd-enablement-target-and-nixos-fhs-gaps.md` and `work/notes/observations/resolved-unit-binaries-can-bake-a-nix-store-path-from-path.md`: the raw measurements this guide is built from.

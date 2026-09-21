@@ -139,12 +139,12 @@ func TestAllocateIgnoresZeroPorts(t *testing.T) {
 }
 
 // TestAllocatePortsForReadsLedgerAndAvoidsSibling proves the store-wiring
-// (allocatePortsFor) reads the on-disk config set through the configListStore seam
+// (allocatePortsFor) reads the on-disk config set through the configStore seam
 // and hands the allocator the SIBLINGS, so a second account never re-derives the
 // first's ports. It uses the same scratch-store swap the claim tests use, so it
 // never touches the real /etc/anonctl/accounts.
 func TestAllocatePortsForReadsLedgerAndAvoidsSibling(t *testing.T) {
-	s := swapConfigListStore(t)
+	s := swapConfigStore(t)
 	// Seed the first account; Store.Write fills its ports with the defaults (slot 0).
 	writeConfig(t, s, "anon", 9050, endpoint.ClassTorShared)
 	got, err := allocatePortsFor("anon-cultivator")
@@ -163,7 +163,7 @@ func TestAllocatePortsForReadsLedgerAndAvoidsSibling(t *testing.T) {
 // ALREADY has a record excludes its own reservation, so it does not spuriously
 // treat its own ports as taken and skip past its slot.
 func TestAllocatePortsForExcludesOwnRecord(t *testing.T) {
-	s := swapConfigListStore(t)
+	s := swapConfigStore(t)
 	writeConfig(t, s, "anon", 9050, endpoint.ClassTorShared) // slot 0
 	got, err := allocatePortsFor("anon")
 	if err != nil {

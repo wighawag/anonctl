@@ -10,15 +10,15 @@ import (
 	"github.com/wighawag/anoncore/endpoint"
 )
 
-// swapConfigListStore points the claim-set store at a scratch dir (never the real
+// swapConfigStore points the claim-set store at a scratch dir (never the real
 // /etc/anonctl/accounts) and restores it on cleanup. Returns the store so a test
 // can seed sibling configs.
-func swapConfigListStore(t *testing.T) accountconfig.Store {
+func swapConfigStore(t *testing.T) accountconfig.Store {
 	t.Helper()
-	orig := configListStore
+	orig := configStore
 	s := accountconfig.Store{BaseDir: t.TempDir()}
-	configListStore = s
-	t.Cleanup(func() { configListStore = orig })
+	configStore = s
+	t.Cleanup(func() { configStore = orig })
 	return s
 }
 
@@ -40,7 +40,7 @@ func writeConfig(t *testing.T, s accountconfig.Store, account string, port int, 
 // claimEndpoint refuses pointing a NEW account at a socks-peruser endpoint an
 // existing DIFFERENT account already owns (the cross-identification guard).
 func TestClaimEndpointRefusesSecondPeruser(t *testing.T) {
-	s := swapConfigListStore(t)
+	s := swapConfigStore(t)
 	writeConfig(t, s, "anon-a", 1080, endpoint.ClassSocksPeruser)
 
 	ep, err := endpoint.Parse("socks5h://127.0.0.1:1080", endpoint.ClassSocksPeruser)
@@ -56,7 +56,7 @@ func TestClaimEndpointRefusesSecondPeruser(t *testing.T) {
 // A shared tor-shared endpoint is never refused: many accounts share one Tor via
 // the per-account `<account>@` isolation.
 func TestClaimEndpointAllowsSharedTor(t *testing.T) {
-	s := swapConfigListStore(t)
+	s := swapConfigStore(t)
 	writeConfig(t, s, "anon-a", 9050, endpoint.ClassTorShared)
 
 	ep := endpoint.Default() // tor-shared 9050
@@ -69,7 +69,7 @@ func TestClaimEndpointAllowsSharedTor(t *testing.T) {
 // `update` re-point must not trip on its own persisted claim), because it is
 // excluded from the built registry.
 func TestClaimEndpointSelfRepointIdempotent(t *testing.T) {
-	s := swapConfigListStore(t)
+	s := swapConfigStore(t)
 	writeConfig(t, s, "anon-a", 1080, endpoint.ClassSocksPeruser)
 
 	ep, err := endpoint.Parse("socks5h://127.0.0.1:1080", endpoint.ClassSocksPeruser)
@@ -85,7 +85,7 @@ func TestClaimEndpointSelfRepointIdempotent(t *testing.T) {
 // endpoint is already claimed: the guard is per-endpoint, not a global one-peruser
 // cap.
 func TestClaimEndpointDistinctPeruserAllowed(t *testing.T) {
-	s := swapConfigListStore(t)
+	s := swapConfigStore(t)
 	writeConfig(t, s, "anon-a", 1080, endpoint.ClassSocksPeruser)
 
 	ep, err := endpoint.Parse("socks5h://127.0.0.1:1081", endpoint.ClassSocksPeruser)
@@ -100,7 +100,7 @@ func TestClaimEndpointDistinctPeruserAllowed(t *testing.T) {
 // A corrupt sibling config makes claimEndpoint fail LOUD (the guard must not be
 // silently disabled by an unreadable claim set).
 func TestClaimEndpointFailsLoudOnCorruptClaimSet(t *testing.T) {
-	s := swapConfigListStore(t)
+	s := swapConfigStore(t)
 	// A corrupt .json in the config dir: List (and thus claimEndpoint) must error.
 	if err := os.WriteFile(filepath.Join(s.BaseDir, "anon-bad.json"), []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)

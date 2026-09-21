@@ -32,6 +32,23 @@ func TestVerifyHintHasNoTrailingSpaceForDefaultAccount(t *testing.T) {
 	}
 }
 
+// The same rule holds for the two `rm` hints `add`'s refusals point at: a bare `rm`
+// (the recovery that leaves the accounts intact) and the purge form. They are
+// commands the operator copies, so a dangling space for the default account is the
+// same BUG 5 defect as it was for verify.
+func TestRmHintsHaveNoTrailingSpaceForDefaultAccount(t *testing.T) {
+	for _, c := range []struct{ got, want string }{
+		{rmHint(cli.DefaultAccount), "anonctl rm"},
+		{rmHint("anon-work"), "anonctl rm work"},
+		{purgeHint(cli.DefaultAccount), "anonctl rm --purge-account"},
+		{purgeHint("anon-work"), "anonctl rm --purge-account work"},
+	} {
+		if c.got != c.want {
+			t.Errorf("hint = %q, want %q", c.got, c.want)
+		}
+	}
+}
+
 // The version fast-path exits 0 before any parse (no verb, no root needed).
 func TestVersionArg(t *testing.T) {
 	for _, args := range [][]string{{"--version"}, {"version"}} {
@@ -339,7 +356,7 @@ func TestExecRequiresRoot(t *testing.T) {
 func swapRmSeams(t *testing.T, forceErr, rmErr error) *[]string {
 	t.Helper()
 	var events []string
-	origForce, origRm, origMarker := rmForcingRemove, rmProvisionRm, rmMarkerStore
+	origForce, origRm, origMarker := rmForcingRemove, rmProvisionRm, markerStore
 	rmForcingRemove = func(ctx context.Context, d forcing.Deps, account string) error {
 		events = append(events, "disable-shim:"+account)
 		return forceErr
@@ -351,8 +368,8 @@ func swapRmSeams(t *testing.T, forceErr, rmErr error) *[]string {
 	// Isolate the marker removal (runRm step 3) to a scratch dir so the test never
 	// touches the real `/etc/anonctl` (a shared-write violation that fails off-root
 	// with "permission denied"), mirroring the marker package's own BaseDir isolation.
-	rmMarkerStore = marker.Store{BaseDir: t.TempDir()}
-	t.Cleanup(func() { rmForcingRemove, rmProvisionRm, rmMarkerStore = origForce, origRm, origMarker })
+	markerStore = marker.Store{BaseDir: t.TempDir()}
+	t.Cleanup(func() { rmForcingRemove, rmProvisionRm, markerStore = origForce, origRm, origMarker })
 	return &events
 }
 
@@ -374,15 +391,15 @@ func indexOfEvent(events []string, prefix string) int {
 // runRm seam.
 //
 // It also proves the shared-write isolation: runRm's step-3 marker removal is
-// routed through rmMarkerStore (pointed at a scratch dir by swapRmSeams), so this
+// routed through markerStore (pointed at a scratch dir by swapRmSeams), so this
 // test passes off-root (exit 0) WITHOUT touching the real `/etc/anonctl` (the
 // pre-existing RED: the real path removal failed "permission denied" as non-root).
 func TestRmDisablesShimBeforeUserdel(t *testing.T) {
 	events := swapRmSeams(t, nil, nil)
 	// The real marker path must be left untouched: nothing here may write/delete
 	// under `/etc/anonctl`. Assert the store runRm will use is NOT the real one.
-	if rmMarkerStore.BaseDir == "" || rmMarkerStore.BaseDir == marker.DefaultBaseDir {
-		t.Fatalf("rmMarkerStore.BaseDir = %q, want an isolated scratch dir (never the real %q)", rmMarkerStore.BaseDir, marker.DefaultBaseDir)
+	if markerStore.BaseDir == "" || markerStore.BaseDir == marker.DefaultBaseDir {
+		t.Fatalf("markerStore.BaseDir = %q, want an isolated scratch dir (never the real %q)", markerStore.BaseDir, marker.DefaultBaseDir)
 	}
 	if code := run([]string{"rm", "--purge-account"}); code != 0 {
 		t.Errorf("run(rm --purge-account) = %d, want 0", code)

@@ -2,23 +2,28 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/wighawag/anoncore/endpoint"
-	"github.com/wighawag/anoncore/provision"
 )
 
-// `add` is create-only: an account that already EXISTS is refused up front, before
+// `add` is add-ONCE: an account anonctl ALREADY MANAGES is refused up front, before
 // any provisioning or forcing, so a second `add` never silently re-applies a
 // (possibly different) endpoint/config. The refusal exits non-zero and its message
 // points at `update` (to change a live account) so the operator knows the right verb.
 //
-// The refusal happens via provision.Status (the Runner seam) BEFORE forcing.Install,
-// so this unit test reaches it without a real nft/systemd host: the fake runner
-// reports the account present, and runAdd must bail with no provisioning attempted.
-func TestAddRefusesExistingAccount(t *testing.T) {
+// "Already manages" is the LEDGER record, not the passwd entry (see
+// TestAddAdoptsDeclaredAccounts for why the distinction is load-bearing), so the
+// fixture is a scratch store carrying a record for the account. The refusal is a
+// pure read BEFORE forcing.Install, so this unit test reaches it without a real
+// nft/systemd host, and runAdd must bail with no provisioning attempted.
+func TestAddRefusesManagedAccount(t *testing.T) {
 	disableColorForTest(t) // assert the plain message text regardless of the test host's tty
+	s := swapConfigStore(t)
+	writeConfig(t, s, "anon-work", 9050, endpoint.ClassTorShared) // anonctl already manages it
 	r := &seedFakeRunner{present: map[string]string{"anon-work": "/home/anon-work"}}
 	var code int
 	msg := captureStderrDuring(t, func() {
@@ -51,7 +56,7 @@ func TestAddRefusesExistingAccount(t *testing.T) {
 func TestAddDoesNotCreateAccountWhenEndpointRefused(t *testing.T) {
 	disableColorForTest(t)
 	swapSeedSeams(t, t.TempDir())                                 // defaultsStore -> scratch (no real /etc read)
-	s := swapConfigListStore(t)                                   // claim set -> scratch
+	s := swapConfigStore(t)                                       // claim set -> scratch
 	writeConfig(t, s, "anon-a", 1080, endpoint.ClassSocksPeruser) // 1080 owned by anon-a
 
 	r := &seedFakeRunner{present: map[string]string{}} // the new account is absent
@@ -73,19 +78,81 @@ func TestAddDoesNotCreateAccountWhenEndpointRefused(t *testing.T) {
 	}
 }
 
-// The refusal is scoped to an EXISTING account: the gate reads provision.Status and
-// only fires when st.Exists. We assert the gate's INPUT for an absent account is
-// not-exists (so runAdd would fall through to real provisioning), using the SAME
-// Runner seam runAdd uses. Running the full runAdd for an absent account is not a
-// unit test (it would reach forcing.Install / a real host), so we check the gate
-// condition directly rather than drive the whole verb.
-func TestAddGateDoesNotFireForAbsentAccount(t *testing.T) {
-	r := &seedFakeRunner{present: map[string]string{}} // account absent
-	st, err := provision.Status(context.Background(), r, "anon-work")
+// A record that EXISTS but cannot be READ must never be treated as absent. Reading
+// it as "no record" would let `add` re-apply a fresh endpoint/config on top of an
+// account anonctl already manages, using a record it could not even read, so the
+// gate fails LOUD instead. This is the fail-closed half of the new gate, and it is
+// driven through the real runAdd: a corrupt record must stop it before any install.
+func TestAddRefusesUnreadableRecord(t *testing.T) {
+	disableColorForTest(t)
+	swapSeedSeams(t, t.TempDir())
+	store := swapConfigStore(t)
+	install := swapAddSeams(t, store)
+	swapProvisionSeams(t)
+	fakeUnitBinariesOnPath(t)
+
+	path, err := store.Path("anon-01")
 	if err != nil {
-		t.Fatalf("Status: %v", err)
+		t.Fatalf("store.Path: %v", err)
 	}
-	if st.Exists {
-		t.Errorf("gate would wrongly refuse an ABSENT account: Status.Exists = true")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &declaredFakeRunner{uids: map[string]int{"anon-01": 8801, "anon-01-shim": 412}}
+	var code int
+	msg := captureStderrDuring(t, func() {
+		captureStdout(t, func() {
+			code = runAdd(context.Background(), r,
+				mustParse(t, []string{"add", "--endpoint", "socks5h://127.0.0.1:9050", "01"}))
+		})
+	})
+	if code == 0 {
+		t.Errorf("add with an unreadable record = 0, want non-zero (it must not be read as 'no record')")
+	}
+	if !strings.Contains(msg, "anon-01") {
+		t.Errorf("the refusal must name the account; got %q", msg)
+	}
+	if len(install.calls) != 0 {
+		t.Errorf("add installed forcing over a record it could not read: %v", install.calls)
+	}
+	if muts := r.mutatingCalls(); len(muts) != 0 {
+		t.Errorf("add mutated the box despite the refusal: %v", muts)
+	}
+}
+
+// The post-activation shape: anonctl's record survives while the accounts do not.
+// `add` must still refuse (the record is what it gates on) and point at `rm`, which
+// is the command that clears the orphaned forcing and lets a later `add` re-adopt.
+// Silently re-adding here would install a second set of rules while the first set
+// still governs a freed uid.
+func TestAddRefusesWhenRecordOutlivesTheAccounts(t *testing.T) {
+	disableColorForTest(t)
+	swapSeedSeams(t, t.TempDir())
+	store := swapConfigStore(t)
+	install := swapAddSeams(t, store)
+	swapProvisionSeams(t)
+	fakeUnitBinariesOnPath(t)
+	writeConfig(t, store, "anon-01", 9050, endpoint.ClassTorShared)
+
+	r := &declaredFakeRunner{uids: map[string]int{}} // activation deleted both accounts
+	var code int
+	msg := captureStderrDuring(t, func() {
+		captureStdout(t, func() {
+			code = runAdd(context.Background(), r,
+				mustParse(t, []string{"add", "--endpoint", "socks5h://127.0.0.1:9050", "01"}))
+		})
+	})
+	if code == 0 {
+		t.Errorf("add over a surviving record = 0, want non-zero")
+	}
+	if !strings.Contains(msg, "anonctl rm") {
+		t.Errorf("the refusal must name `anonctl rm`, the command that clears the stale record; got %q", msg)
+	}
+	if len(install.calls) != 0 {
+		t.Errorf("add installed forcing for accounts that do not exist: %v", install.calls)
 	}
 }
