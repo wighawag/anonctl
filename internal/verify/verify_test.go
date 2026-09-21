@@ -775,3 +775,126 @@ func TestAnonymizedExit_AgainstFixture(t *testing.T) {
 		t.Fatalf("fixture exit differs from host baseline: must PASS; got %+v", a)
 	}
 }
+
+// --- the account-identity precondition ---
+
+// fullIdentity is a healthy, consistent AccountIdentity the tests mutate one field
+// at a time, so each case states exactly which disagreement it is about.
+func fullIdentity() AccountIdentity {
+	return AccountIdentity{
+		Account: "anon-a", Shim: "anon-a-shim",
+		Exists: true, ShimExists: true,
+		UID: 1002, ShimUID: 992,
+		RecordedUID: 1002, RecordedShimUID: 992,
+		HaveRecord: true,
+	}
+}
+
+// TestAccountIdentityAssertion_PassesWhenAccountStillOwnsItsRecordedUID: the
+// ordinary healthy host. Both accounts exist and both still own the uids the
+// installed rules govern, so the precondition passes and verify goes on to probe.
+func TestAccountIdentityAssertion_PassesWhenAccountStillOwnsItsRecordedUID(t *testing.T) {
+	a := AccountIdentityAssertion(fullIdentity())
+	if !a.Ok {
+		t.Fatalf("a consistent account must PASS the precondition; got %+v", a)
+	}
+	if a.Name != AssertAccountIdentity {
+		t.Fatalf("assertion name is the stable contract %q; got %q", AssertAccountIdentity, a.Name)
+	}
+}
+
+// TestAccountIdentityAssertion_FailsAndSaysTheAccountIsGone is the load-bearing
+// case: on a host that deletes undeclared accounts (NixOS with
+// users.mutableUsers = false) the account vanishes while its nft tables stay
+// loaded. The precondition must report THAT, naming the orphaned uid, rather than
+// leaving the operator to infer it from a scatter of leak assertions about a uid
+// that is no longer anybody's.
+func TestAccountIdentityAssertion_FailsAndSaysTheAccountIsGone(t *testing.T) {
+	id := fullIdentity()
+	id.Exists, id.UID = false, 0
+	a := AccountIdentityAssertion(id)
+	if a.Ok {
+		t.Fatalf("a deleted account must FAIL the precondition; got %+v", a)
+	}
+	if !strings.Contains(a.Detail, "DOES NOT EXIST") {
+		t.Fatalf("the detail must say plainly that the account is gone; got %q", a.Detail)
+	}
+	if !strings.Contains(a.Detail, "1002") {
+		t.Fatalf("the detail must NAME the uid the orphaned rules still govern (1002), so the operator can go and look at it; got %q", a.Detail)
+	}
+}
+
+// TestAccountIdentityAssertion_FailsWhenRecreatedUnderADifferentUID: the account
+// exists again but with a new uid, so the rules govern a uid that is no longer
+// its own. The account is UNFORCED while /etc/anonctl still records it as jailed,
+// which must not read as a pass, and must not read as "account missing" either.
+func TestAccountIdentityAssertion_FailsWhenRecreatedUnderADifferentUID(t *testing.T) {
+	id := fullIdentity()
+	id.UID = 1007
+	a := AccountIdentityAssertion(id)
+	if a.Ok {
+		t.Fatalf("a uid that no longer matches the recorded one must FAIL; got %+v", a)
+	}
+	if !strings.Contains(a.Detail, "1007") || !strings.Contains(a.Detail, "1002") {
+		t.Fatalf("the detail must name BOTH the live uid and the governed uid; got %q", a.Detail)
+	}
+	if !strings.Contains(a.Detail, "UNFORCED") {
+		t.Fatalf("the detail must state the consequence (the account is unforced), not just the mismatch; got %q", a.Detail)
+	}
+}
+
+// TestAccountIdentityAssertion_FailsWhenShimAccountIsMissing: the half-provisioned
+// state. It is fail-CLOSED, not a leak, so the detail must say so rather than
+// alarming the operator with leak language, while still failing the run.
+func TestAccountIdentityAssertion_FailsWhenShimAccountIsMissing(t *testing.T) {
+	id := fullIdentity()
+	id.ShimExists, id.ShimUID = false, 0
+	a := AccountIdentityAssertion(id)
+	if a.Ok {
+		t.Fatalf("a missing shim account must FAIL the precondition; got %+v", a)
+	}
+	if !strings.Contains(a.Detail, "anon-a-shim") {
+		t.Fatalf("the detail must name the missing shim account; got %q", a.Detail)
+	}
+	if !strings.Contains(a.Detail, "fail-CLOSED") {
+		t.Fatalf("the detail must state that this state is fail-closed, not a leak; got %q", a.Detail)
+	}
+}
+
+// TestAccountIdentityAssertion_ShimUIDDriftFails: the shim's uid is what the
+// endpoint-reachability rule names, so drift there is a real breakage even when
+// the login uid is intact.
+func TestAccountIdentityAssertion_ShimUIDDriftFails(t *testing.T) {
+	id := fullIdentity()
+	id.ShimUID = 993
+	if a := AccountIdentityAssertion(id); a.Ok {
+		t.Fatalf("a drifted shim uid must FAIL; got %+v", a)
+	}
+}
+
+// TestAccountIdentityAssertion_NoRecordChecksExistenceOnly: an account that was
+// never forced has no persisted config, so there is no recorded uid to compare
+// against. That must pass on existence alone AND say so, rather than implying a
+// uid was checked when none was.
+func TestAccountIdentityAssertion_NoRecordChecksExistenceOnly(t *testing.T) {
+	id := fullIdentity()
+	id.HaveRecord, id.RecordedUID, id.RecordedShimUID = false, 0, 0
+	a := AccountIdentityAssertion(id)
+	if !a.Ok {
+		t.Fatalf("existing accounts with no persisted record must PASS; got %+v", a)
+	}
+	if !strings.Contains(a.Detail, "no recorded uid") {
+		t.Fatalf("the detail must admit that no uid comparison happened; got %q", a.Detail)
+	}
+}
+
+// TestAccountIdentityAssertion_MissingAccountOutranksUIDDrift: when the account is
+// gone, the uid comparison is meaningless (the live uid is absent, not 0-the-uid).
+// The report must name the deletion, the one true finding, not a uid mismatch.
+func TestAccountIdentityAssertion_MissingAccountOutranksUIDDrift(t *testing.T) {
+	id := fullIdentity()
+	id.Exists, id.UID = false, 0
+	if a := AccountIdentityAssertion(id); !strings.Contains(a.Detail, "DOES NOT EXIST") {
+		t.Fatalf("deletion must outrank uid drift in the verdict; got %q", a.Detail)
+	}
+}

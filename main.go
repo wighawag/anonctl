@@ -631,6 +631,14 @@ func colorizeReport(s string) string {
 // prog is the per-check progress hook (built by verifyProgress); it is observation
 // only and never changes the verdict or the assertion set. Passing it HERE (the
 // shared gate) is what gives `use` the same progress `verify` shows.
+//
+// The account-identity PRECONDITION runs FIRST and SHORT-CIRCUITS the run when it
+// fails. Every live probe keys on `meta skuid <uid>` and dials AS that uid, so if
+// the account was deleted (or recreated under a different uid) the probes still
+// run happily and simply answer a question about somebody else's uid: the
+// operator would read a scatter of leak assertions whose actual cause, "your
+// account is gone", appears in none of them. Reporting the precondition alone is
+// what makes that condition unambiguous. See docs/nixos.md.
 func verifyAndMark(ctx context.Context, r provision.Runner, cmd *cli.Command, prog verify.Progress) verify.Report {
 	st, err := provision.Status(ctx, r, cmd.Account)
 	if err != nil {
@@ -641,9 +649,33 @@ func verifyAndMark(ctx context.Context, r provision.Runner, cmd *cli.Command, pr
 			Assertions: []verify.Assertion{{Name: "account-readable", Ok: false, Err: err}},
 		}
 	}
-	p := verifyParams(accountconfig.DefaultStore(), cmd.Account, st)
+	store := accountconfig.DefaultStore()
+	p := verifyParams(store, cmd.Account, st)
 	p.SkipTorExitCheck = cmd.SkipTorExitCheck
+
+	// The precondition goes through the SAME progress hook as every other check, so a
+	// short-circuited run is still visibly a run (and `use`'s gating verify still
+	// streams activity) rather than a silent one-line verdict.
+	if prog.Start != nil {
+		prog.Start(verify.AssertAccountIdentity)
+	}
+	ident := verify.AccountIdentityAssertion(accountIdentity(store, cmd.Account, st))
+	if prog.Done != nil {
+		prog.Done(ident)
+	}
+	if !ident.Ok {
+		return verify.Report{
+			Account:    cmd.Account,
+			Endpoint:   p.Endpoint,
+			Assertions: []verify.Assertion{ident},
+		}
+	}
+
 	rep := verify.RunVerifyWith(ctx, p, prog)
+	// The precondition is reported as a named assertion on the green path too: a
+	// consumer gating on the JSON contract sees that it was actually checked, rather
+	// than having to infer it from the absence of a failure.
+	rep.Assertions = append([]verify.Assertion{ident}, rep.Assertions...)
 
 	// WRITE-AFTER-VERIFY: the marker is a coordination CLAIM written strictly AFTER
 	// verify proves the account forced. On a passing report we write it (via the
@@ -656,6 +688,32 @@ func verifyAndMark(ctx context.Context, r provision.Runner, cmd *cli.Command, pr
 		}
 	}
 	return rep
+}
+
+// accountIdentity assembles the account-identity precondition's inputs: what the
+// BOX says now (provision.Status, the same read-only truth `status` renders) and
+// what anonctl RECORDED when it installed the forcing (the uids in the account
+// config, which are the uids the loaded nft tables and the shim unit actually
+// govern). Holding the two apart is the whole point: verify's job here is to
+// notice they disagree.
+//
+// A missing config is a clean "no record" (an account that was never forced), not
+// an error: the precondition then checks existence only and says so.
+func accountIdentity(store accountconfig.Store, account string, st provision.AccountStatus) verify.AccountIdentity {
+	id := verify.AccountIdentity{
+		Account:    account,
+		Shim:       st.Shim,
+		Exists:     st.Exists,
+		ShimExists: st.ShimExists,
+		UID:        atoiOr(st.UID, 0),
+		ShimUID:    atoiOr(st.ShimUID, 0),
+	}
+	if cfg, err := store.Read(account); err == nil {
+		id.HaveRecord = true
+		id.RecordedUID = cfg.AnonUID
+		id.RecordedShimUID = cfg.ShimUID
+	}
+	return id
 }
 
 // verifyParams assembles the LIVE verify params for an account: the endpoint +

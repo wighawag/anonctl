@@ -526,3 +526,53 @@ func captureStdout(t *testing.T, fn func()) string {
 	os.Stdout = orig
 	return <-done
 }
+
+// accountIdentity is the seam that feeds verify's account-identity precondition:
+// it must hold the LIVE uids (from the box) and the RECORDED uids (from the
+// persisted account config, i.e. the uids the loaded nft tables actually govern)
+// apart, because the precondition's entire job is to notice they disagree. A
+// version that re-read one from the other could never detect the NixOS deletion +
+// recreation case at all.
+func TestAccountIdentityHoldsLiveAndRecordedUIDsApart(t *testing.T) {
+	store := accountconfig.Store{BaseDir: t.TempDir()}
+	if err := store.Write(accountconfig.Config{
+		Account: "anon", AnonUID: 1002, ShimUID: 992,
+		EndpointHost: "127.0.0.1", EndpointPort: 9050, EndpointClass: endpoint.ClassTorShared,
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// The account was deleted and recreated, so the box says 1007 while the rules
+	// still govern the recorded 1002.
+	st := provision.AccountStatus{Account: "anon", Shim: "anon-shim", Exists: true, ShimExists: true, UID: "1007", ShimUID: "992"}
+	id := accountIdentity(store, "anon", st)
+	if id.UID != 1007 || id.RecordedUID != 1002 {
+		t.Fatalf("live uid and recorded uid must come from DIFFERENT sources; got live=%d recorded=%d", id.UID, id.RecordedUID)
+	}
+	if a := verify.AccountIdentityAssertion(id); a.Ok {
+		t.Fatalf("a recreated account under a new uid must FAIL the precondition; got %+v", a)
+	}
+
+	// A deleted account: no passwd entry at all, so the live uid is ABSENT (0), never
+	// silently uid 0 (root). The precondition must fail on existence.
+	st = provision.AccountStatus{Account: "anon", Shim: "anon-shim"}
+	id = accountIdentity(store, "anon", st)
+	if id.Exists || id.UID != 0 {
+		t.Fatalf("a deleted account must read as absent with no live uid; got %+v", id)
+	}
+	if a := verify.AccountIdentityAssertion(id); a.Ok {
+		t.Fatalf("a deleted account must FAIL the precondition; got %+v", a)
+	}
+
+	// An account with NO persisted config (never forced) is a clean "no record",
+	// not an error and not a fabricated recorded uid of 0-the-uid.
+	id = accountIdentity(store, "anon-absent", provision.AccountStatus{
+		Account: "anon-absent", Shim: "anon-absent-shim", Exists: true, ShimExists: true, UID: "1500", ShimUID: "980",
+	})
+	if id.HaveRecord {
+		t.Fatalf("an unconfigured account must yield HaveRecord=false; got %+v", id)
+	}
+	if a := verify.AccountIdentityAssertion(id); !a.Ok {
+		t.Fatalf("an existing account with no record must PASS on existence alone; got %+v", a)
+	}
+}

@@ -52,6 +52,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -109,6 +110,15 @@ const (
 	// explicitly NOT exhaustive: verify cannot enumerate every daemon on every host,
 	// so it proves only that the CHECKED vectors do not escape, never total absence.
 	AssertNoUIDTransitionEgress = "no-uid-transition-egress"
+	// AssertAccountIdentity: the account (and its shim) STILL EXISTS and still owns
+	// the UID anonctl's rules and records govern. It is the PRECONDITION every other
+	// assertion rests on, because every live probe keys on `meta skuid <uid>`: if the
+	// account was deleted, or was recreated with a different uid, the probes answer a
+	// question about a uid that is no longer the account's and the report becomes a
+	// scatter of misleading leak lines instead of the one true finding. See
+	// work/notes/findings/nixos-account-conventions-break-anonctl-provisioning.md and
+	// docs/nixos.md.
+	AssertAccountIdentity = "account-identity"
 )
 
 // Assertion is one named verify result. Ok is the pass/fail; Detail is the
@@ -527,6 +537,111 @@ func DNSRemoteAssertion(probeName string, proxyResolved []string, hostResolverSa
 	a.Detail = probeName + " was NOT resolved proxy-side: DNS did not go through the anonymizer"
 	return a
 }
+
+// AccountIdentity is what the account-identity precondition is decided from: what
+// the BOX says right now (Exists/ShimExists + the live UIDs, read from the passwd
+// table) versus what anonctl RECORDED when it installed the forcing (the UIDs in
+// `/etc/anonctl/accounts/<account>.json`). The two can disagree, and the whole
+// point of this assertion is that the disagreement is reported as itself.
+//
+// A zero UID means "absent/unknown", never uid 0: anonctl never forces root, and
+// treating an unreadable uid as 0 would silently point every probe at root.
+type AccountIdentity struct {
+	// Account / Shim are the login account and its `-shim` service account.
+	Account string
+	Shim    string
+	// Exists / ShimExists are whether each account is in the passwd table NOW.
+	Exists     bool
+	ShimExists bool
+	// UID / ShimUID are the LIVE uids from the passwd table (0 when absent).
+	UID     int
+	ShimUID int
+	// RecordedUID / RecordedShimUID are the uids anonctl persisted at add/update
+	// time, i.e. the uids the installed nft tables and the shim unit actually
+	// govern. Both are 0 when HaveRecord is false.
+	RecordedUID     int
+	RecordedShimUID int
+	// HaveRecord is whether an account config was found at all. An account that was
+	// never forced has none, which is a clean "nothing to compare", not a failure.
+	HaveRecord bool
+}
+
+// AccountIdentityAssertion is the PURE precondition decision every other verify
+// assertion rests on: the account still EXISTS and still OWNS the uid anonctl's
+// rules govern.
+//
+// It exists because the live probes key on `meta skuid <uid>` and dial AS that
+// uid. When the account is gone, or was recreated under a different uid, those
+// probes are still perfectly capable of running: they just answer a question about
+// somebody else's uid, and the operator gets a scatter of leak assertions whose
+// real cause ("your account no longer exists") appears nowhere. That is the
+// measured failure mode on a NixOS host with `users.mutableUsers = false`, where
+// activation deletes every undeclared account at each boot and anonctl's accounts
+// are undeclared by construction. See docs/nixos.md.
+//
+// The three failing shapes are reported DISTINCTLY, because the operator's next
+// action differs for each:
+//
+//   - the login account is GONE: the nft tables now govern a free uid, so the
+//     forcing protects nobody and may jail whoever is handed that uid next;
+//   - the shim account is GONE: the relay's dedicated uid no longer exists, so the
+//     account is fail-CLOSED (baseline default-deny) but unusable;
+//   - the account EXISTS with a DIFFERENT uid than the one recorded: the account is
+//     completely UNFORCED while `/etc/anonctl` still records it as jailed, which is
+//     the exact "still looks anonymised" failure anonctl exists to prevent.
+//
+// With no persisted record there is nothing to compare uids against, so existence
+// alone is the verdict and the detail says so rather than implying a uid was
+// checked.
+func AccountIdentityAssertion(id AccountIdentity) Assertion {
+	a := Assertion{Name: AssertAccountIdentity}
+	switch {
+	case !id.Exists:
+		a.Detail = "the account " + id.Account + " DOES NOT EXIST on this host: it was deleted out from under anonctl. " +
+			recordedGovernsDetail(id.RecordedUID, id.HaveRecord) +
+			" Nothing below this line could be proved about " + id.Account + ", because there is no such account to probe. " +
+			"On NixOS this is what `users.mutableUsers = false` does to an undeclared account at every activation and every boot (see docs/nixos.md); " +
+			"run `anonctl rm --purge-account " + id.Account + "` to tear the orphaned rules down, or declare the account to stop it recurring"
+		return a
+	case !id.ShimExists:
+		a.Detail = "the login account " + id.Account + " exists (uid " + itoa(id.UID) + ") but its shim account " + id.Shim + " DOES NOT EXIST: " +
+			"the relay has no uid to run as, so the account is fail-CLOSED (the baseline default-deny still drops it) but cannot reach the endpoint. " +
+			"This is the half-provisioned state; re-run `anonctl add` to complete it"
+		return a
+	case id.HaveRecord && id.RecordedUID != 0 && id.UID != id.RecordedUID:
+		a.Detail = "the account " + id.Account + " now owns uid " + itoa(id.UID) + " but anonctl's rules and records govern uid " + itoa(id.RecordedUID) + ": " +
+			"the account was deleted and recreated under a different uid. It is therefore COMPLETELY UNFORCED while /etc/anonctl still records it as jailed, " +
+			"and uid " + itoa(id.RecordedUID) + " may now belong to an unrelated account that silently inherited the forcing. " +
+			"Re-run `anonctl add " + id.Account + "` to re-point the rules, and see docs/nixos.md if this host deletes undeclared accounts"
+		return a
+	case id.HaveRecord && id.RecordedShimUID != 0 && id.ShimUID != id.RecordedShimUID:
+		a.Detail = "the shim account " + id.Shim + " now owns uid " + itoa(id.ShimUID) + " but the installed rules govern uid " + itoa(id.RecordedShimUID) + ": " +
+			"the endpoint-reachability exemption names a uid the shim no longer runs as. Re-run `anonctl add " + id.Account + "` to re-point the rules"
+		return a
+	}
+	a.Ok = true
+	if id.HaveRecord {
+		a.Detail = id.Account + " exists and still owns uid " + itoa(id.UID) + ", and " + id.Shim + " still owns uid " + itoa(id.ShimUID) +
+			": the uids the installed rules govern are this account's"
+		return a
+	}
+	a.Detail = id.Account + " (uid " + itoa(id.UID) + ") and " + id.Shim + " (uid " + itoa(id.ShimUID) + ") both exist. " +
+		"No account config is persisted for " + id.Account + ", so there is no recorded uid to compare against: existence is all that was checked here"
+	return a
+}
+
+// recordedGovernsDetail names the uid the orphaned rules are left governing when
+// the account is gone, so the operator can go and look at it. Without a persisted
+// record anonctl cannot name it, and says that instead of guessing.
+func recordedGovernsDetail(recordedUID int, haveRecord bool) string {
+	if haveRecord && recordedUID != 0 {
+		return "Its nft tables are still loaded and still govern uid " + itoa(recordedUID) + ", which is now unallocated and free to be handed to an unrelated account that would silently inherit the forcing."
+	}
+	return "Any nft tables left loaded for it now govern a uid that is unallocated and free to be handed to an unrelated account that would silently inherit the forcing."
+}
+
+// itoa keeps the assertion details free of a strconv import at every call site.
+func itoa(n int) string { return strconv.Itoa(n) }
 
 // dropAssertion is the shared PURE decision for the fail-closed / bypass-closure
 // family (leak-drop-v4/v6, the two bypass closures): every one of them PASSES iff
