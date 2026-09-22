@@ -441,40 +441,13 @@ func TestOnionooBodyConfirmsExit(t *testing.T) {
 	}
 }
 
-// --- dns-remote assertion (pure decision over the fixture's proxy-side view) ---
-
-// TestDNSRemoteAssertion_PassesWhenResolvedProxySide: the fixture RECORDS the
-// hostnames it was asked to resolve proxy-side. The assertion passes when the
-// probed name appears there (resolved remotely) and the host resolver never saw it.
-func TestDNSRemoteAssertion_PassesWhenResolvedProxySide(t *testing.T) {
-	a := DNSRemoteAssertion("probe.example", []string{"probe.example"}, false)
-	if !a.Ok {
-		t.Fatalf("a name resolved proxy-side must PASS; got %+v", a)
-	}
-	if a.Name != "dns-remote" {
-		t.Fatalf("assertion name = %q, want dns-remote", a.Name)
-	}
-}
-
-// TestDNSRemoteAssertion_FailsWhenNotResolvedProxySide: if the proxy never saw the
-// name, it was resolved somewhere else (a plaintext/local leak) and the assertion
-// must FAIL.
-func TestDNSRemoteAssertion_FailsWhenNotResolvedProxySide(t *testing.T) {
-	a := DNSRemoteAssertion("probe.example", []string{"other.example"}, false)
-	if a.Ok {
-		t.Fatalf("a name NOT resolved proxy-side must FAIL (leak); got %+v", a)
-	}
-}
-
-// TestDNSRemoteAssertion_FailsWhenHostResolverSawTheName: even if the proxy also
-// saw it, a host-resolver observation of the SAME name is a plaintext leak and
-// must FAIL.
-func TestDNSRemoteAssertion_FailsWhenHostResolverSawTheName(t *testing.T) {
-	a := DNSRemoteAssertion("probe.example", []string{"probe.example"}, true)
-	if a.Ok {
-		t.Fatalf("a name the HOST resolver also saw must FAIL (plaintext leak); got %+v", a)
-	}
-}
+// The dns-remote tests moved to dns_test.go when the assertion stopped inferring
+// its evidence and started measuring it. The three tests that stood here proved
+// the DECISION over a proxy-side view the live probe never actually took: the
+// live evidence was a successful fetch plus a hardcoded "the host resolver did not
+// see it", so the decision was green-tested while the measurement was fiction.
+// dns_test.go proves the decisions over the MEASURED evidence instead, including
+// the two real-host failure shapes this suite could not express.
 
 // --- fail-closed / bypass-closure family (pure drop decision) ---
 
@@ -1033,5 +1006,63 @@ func TestAccountIdentityDetail_ShimMissingRecoveryRespectsTheAddGate(t *testing.
 	corrupt := AccountIdentityAssertion(id).Detail
 	if !strings.Contains(corrupt, "anonctl rm anon-a") {
 		t.Errorf("with an UNREADABLE record the recovery must go through `rm` (a bare `add` is refused on it); got %q", corrupt)
+	}
+}
+
+// An EXCLUSIVE check must run with nothing else in flight, and before the
+// concurrent phase. This is not a performance preference: a check that observes
+// the ACCOUNT (the DNS confinement measurement watches nft counters keyed on the
+// account's own sockets) cannot tell verify's OTHER probes from an unrelated
+// process, and `anonymized-exit` resolves a hostname as that very account. Run
+// concurrently, anonctl's own probe looks exactly like the third-party emitter the
+// measurement exists to catch, and a correctly configured host reports "could not
+// be attributed" for every DNS assertion. That was measured on a live host.
+func TestRunWithRunsExclusiveChecksFirstAndAlone(t *testing.T) {
+	var mu sync.Mutex
+	var inFlight, maxDuringExclusive int
+	var order []string
+	note := func(name string, exclusive bool) Assertion {
+		mu.Lock()
+		inFlight++
+		if exclusive && inFlight > maxDuringExclusive {
+			maxDuringExclusive = inFlight
+		}
+		order = append(order, name)
+		mu.Unlock()
+		time.Sleep(20 * time.Millisecond) // widen the window a racing check could enter
+		mu.Lock()
+		if exclusive && inFlight > maxDuringExclusive {
+			maxDuringExclusive = inFlight
+		}
+		inFlight--
+		mu.Unlock()
+		return Assertion{Name: name, Ok: true}
+	}
+	checks := []Check{
+		{Name: "concurrent-a", Run: func(context.Context) Assertion { return note("concurrent-a", false) }},
+		{Name: "exclusive-1", Exclusive: true, Run: func(context.Context) Assertion { return note("exclusive-1", true) }},
+		{Name: "concurrent-b", Run: func(context.Context) Assertion { return note("concurrent-b", false) }},
+		{Name: "exclusive-2", Exclusive: true, Run: func(context.Context) Assertion { return note("exclusive-2", true) }},
+	}
+	rep := RunWith(context.Background(), checks, Progress{})
+
+	if maxDuringExclusive != 1 {
+		t.Errorf("an exclusive check must run ALONE; saw %d checks in flight during one", maxDuringExclusive)
+	}
+	if len(order) < 2 || order[0] != "exclusive-1" || order[1] != "exclusive-2" {
+		t.Errorf("exclusive checks must run FIRST and in order; got %v", order)
+	}
+	// The report must still carry every assertion, in the ORIGINAL check order, so
+	// the two-phase run is invisible in the output contract.
+	if len(rep.Assertions) != 4 {
+		t.Fatalf("report must hold every assertion; got %d", len(rep.Assertions))
+	}
+	for i, want := range []string{"concurrent-a", "exclusive-1", "concurrent-b", "exclusive-2"} {
+		if rep.Assertions[i].Name != want {
+			t.Errorf("assertion %d = %q, want %q: phase order must not reorder the report", i, rep.Assertions[i].Name, want)
+		}
+	}
+	if !rep.Ok() {
+		t.Errorf("all checks passed, so the report must be green: %+v", rep)
 	}
 }

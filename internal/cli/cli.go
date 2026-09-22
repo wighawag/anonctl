@@ -92,6 +92,31 @@ type Command struct {
 	// deliberately narrow and loud (the pass detail announces the check was skipped);
 	// it is NOT a way to skip anonymization. Meaningful only for verify/use.
 	SkipTorExitCheck bool
+
+	// AllowNSSBypass is the EXPLICIT escape hatch for a host whose glibc resolves the
+	// `hosts` database OUT OF PROCESS (`--allow-nss-bypass`, on add). anonctl forces
+	// egress with `meta skuid`, which matches a socket's OWNER, so a lookup performed
+	// for the account by nscd/nsncd, systemd-resolved, sssd or winbind is not governed
+	// by any rule anonctl can write: every name the account visits is resolved by the
+	// host's resolver and attributable to the operator. `add` therefore REFUSES such a
+	// host by default (internal/nssbypass, docs/adr/0011).
+	//
+	// This flag proceeds anyway, for the operator who knows the account will never
+	// use NSS (a program pointed straight at the shim's DNS port) or who accepts the
+	// exposure. It is deliberately NOT a way to make the report green: `verify` keeps
+	// MEASURING the bypass and keeps failing `dns-nss-not-bypassed` on a host where it
+	// is real, because certifying a box that leaks is the one outcome this whole
+	// design exists to prevent.
+	//
+	// IT BUYS LESS THAN ITS NAME SUGGESTS, and `add` says so at the time. Because
+	// `use`/`exec` gate on a green verify and the marker is only written after one,
+	// the flag installs the forcing and nothing more: the account is entered with
+	// `sudo -iu <account>` (the documented day-to-day path anyway), and sibling tools
+	// see no marker for it. That combination is deliberate rather than an oversight:
+	// consent to a known leak is a reason to let an operator PROCEED, never a reason
+	// for anonctl to start certifying the box to itself or to other tools. Fixing the
+	// host clears all of it at once. Meaningful only for add.
+	AllowNSSBypass bool
 }
 
 // verbs is the recognised verb set. `use` is the verify-then-shell safe front
@@ -172,6 +197,8 @@ func Parse(args []string) (*Command, error) {
 			cmd.Force = true
 		case a == "--skip-tor-exit-check":
 			cmd.SkipTorExitCheck = true
+		case a == "--allow-nss-bypass":
+			cmd.AllowNSSBypass = true
 		case a == "--from":
 			wantSeedFromValue = true
 		case strings.HasPrefix(a, "--from="):

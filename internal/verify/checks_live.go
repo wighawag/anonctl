@@ -76,10 +76,19 @@ const (
 // It runs EVERY probe (RunVerify does not short-circuit) so the report is
 // complete: the load-bearing leak drop (v4 AND v6), both bypass closures, and,
 // when a LAN exemption is active (p.Exempt != ""), the split-tunnel-tight
-// assertion. The anonymized-exit and dns-remote assertions egress AS THE ANON UID
-// (setpriv + curl, transparently redirected into the shim) and compare against the
-// host baseline, NOT by dialling the relay port as a SOCKS proxy (the relay is a
+// assertion. The anonymized-exit assertion egresses AS THE ANON UID (setpriv +
+// curl, transparently redirected into the shim) and compares against the host
+// baseline, NOT by dialling the relay port as a SOCKS proxy (the relay is a
 // transparent SO_ORIGINAL_DST relay, not a SOCKS server).
+//
+// The THREE DNS assertions share one measurement and do NOT use a fetch as their
+// evidence. A successful fetch proves a name resolved somehow; it never proves
+// which resolver answered, and the assertion that rested on that inference
+// reported clean on a host where the account's DNS both leaked to the host
+// resolver and did not work at all (docs/adr/0011). They measure instead: a unique
+// unresolvable name looked up as the anon UID through NSS (the path a real program
+// takes) and a raw round trip on the account's own socket, both watched by nft
+// counters planted before and after the nat hook.
 //
 // CRITICAL probe polarity (the transparent-relay subtlety, BUG 2 of
 // work/notes/findings/e2e-binary-validation.md): the shim relay is reached via the
@@ -104,6 +113,11 @@ func needsHostBaseline(class endpoint.ShareClass, skipTorCheck bool) bool {
 }
 
 func LiveChecks(ctx context.Context, p LiveParams) []Check {
+	// The three DNS assertions share ONE measurement. They run concurrently with
+	// every other check, so without this each would plant its own counters and run
+	// its own lookups under a DIFFERENT probe name, and counters read for one probe
+	// could not be compared against a lookup made by another.
+	dnsEv := &dnsEvidenceCache{}
 	checks := []Check{
 		{Name: AssertAnonymizedExit, Run: func(ctx context.Context) Assertion {
 			// The DIRECT host-IP baseline reveals the REAL IP to the echo provider, so we
@@ -130,12 +144,40 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 			}
 			return AnonymizedExitAssertion(hostIP, exitIP, ev, p.Class, p.SkipTorExitCheck)
 		}},
-		{Name: AssertDNSRemote, Run: func(ctx context.Context) Assertion {
-			probe, proxyResolved, hostSaw, err := dnsRemoteEvidence(ctx, p)
+		{Name: AssertDNSRemote, Exclusive: true, Run: func(ctx context.Context) Assertion {
+			// MEASURED, not inferred. The old evidence here was a successful forced FETCH of a
+			// name plus a hardcoded `hostSaw=false`, reasoning that the anon UID cannot do
+			// plaintext DNS off-box so the name must have been resolved proxy-side. A fetch
+			// proves a name resolved SOMEHOW; it never proves which resolver answered, and on a
+			// real host both halves of that premise were false while this assertion passed.
+			ev, err := dnsEv.get(ctx, p)
 			if err != nil {
 				return Assertion{Name: AssertDNSRemote, Err: err}
 			}
-			return DNSRemoteAssertion(probe, proxyResolved, hostSaw)
+			return DNSRemoteAssertion(ev)
+		}},
+		{Name: AssertDNSNSSNotBypassed, Exclusive: true, Run: func(ctx context.Context) Assertion {
+			// The decisive bypass measurement: a name nothing can have cached is looked up
+			// through the ordinary NSS path as the anon UID while a counter watches the
+			// account's own sockets. A lookup that completes with that counter at zero was
+			// performed by another process under another uid, which no `meta skuid` rule can
+			// govern.
+			ev, err := dnsEv.get(ctx, p)
+			if err != nil {
+				return Assertion{Name: AssertDNSNSSNotBypassed, Err: err}
+			}
+			return DNSNSSNotBypassedAssertion(ev)
+		}},
+		{Name: AssertDNSForcedPathAnswers, Exclusive: true, Run: func(ctx context.Context) Assertion {
+			// Does the account's DNS actually WORK through the forced path? A broken forced
+			// path is not merely an outage: it is the condition under which a bypass is the
+			// only reason the account resolves anything at all, so it must be RED even though
+			// nothing leaked in this probe's own packets.
+			ev, err := dnsEv.get(ctx, p)
+			if err != nil {
+				return Assertion{Name: AssertDNSForcedPathAnswers, Err: err}
+			}
+			return DNSForcedPathAnswersAssertion(ev)
 		}},
 		{Name: AssertLeakDropV4, Run: func(ctx context.Context) Assertion {
 			// A direct v4 LEAK is an anon-UID packet leaving the box with an OFF-BOX v4

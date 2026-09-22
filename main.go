@@ -38,6 +38,7 @@ import (
 	"github.com/wighawag/anonctl/internal/forcing"
 	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anonctl/internal/nftables"
+	"github.com/wighawag/anonctl/internal/nssbypass"
 	"github.com/wighawag/anonctl/internal/systemd"
 	"github.com/wighawag/anonctl/internal/verify"
 )
@@ -244,6 +245,28 @@ func runAdd(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	if err := systemd.PreflightUnitBinaries(forcingDeps().Resolver); err != nil {
 		errorf("add: %v", err)
 		return 1
+	}
+
+	// THE OTHER LAST GUARD, and the one that is about the account's DNS rather than
+	// its packets: refuse a host whose glibc resolves `hosts` OUT OF PROCESS.
+	//
+	// anonctl's whole mechanism is `meta skuid <anonUID>`, which matches a socket's
+	// OWNER. When an nscd-compatible daemon or systemd-resolved does the resolving,
+	// the lookup happens in THAT process under THAT uid, so no rule anonctl can write
+	// governs it: every name the account visits is resolved by the host's resolver and
+	// is attributable to the operator, while the TCP connection exits correctly over
+	// the endpoint. That is precisely the correlation an anon account exists to
+	// prevent, and it is invisible unless somebody looks for it.
+	//
+	// It refuses BEFORE provision.Add for the same reason the unit-binary preflight
+	// does: refusing later would leave an account that exists, is jailed, and leaks
+	// its DNS. anonctl does NOT "fix" the host here, because the remedy belongs to a
+	// daemon that serves every uid on the box (forcing its egress is not anonctl's
+	// business) and there is no per-uid override of nsswitch.conf or resolv.conf a
+	// setup-and-verify manager could install without becoming a runtime wrapper. See
+	// docs/adr/0011.
+	if code := refuseNSSBypassHost(ctx, cmd); code != 0 {
+		return code
 	}
 
 	// RE-ASSERT THE PAIR RULE AGAINST THE STATE THAT EXISTS AT MUTATION TIME, and DECIDE
@@ -1592,6 +1615,93 @@ func promptEndpointChoice(ctx context.Context, offers []endpoint.Offer) (endpoin
 // forcingDeps wires the real runners + stores for the forcing orchestration (the
 // production seam; tests build fakes). It is the ONE place the ExecRunners + the
 // default Stores are assembled.
+// inspectNSSBypass is the INJECTABLE host-inspection seam behind `add`'s DNS
+// confinement gate. It is a package var for the same reason lookPathBinary is one
+// in the verify probes: without it the guard reads the REAL /etc of whatever
+// machine the suite runs on, so `add`'s tests would pass or fail according to
+// whether the developer's box happens to run nsncd (it does on the host this was
+// written on, which is how the defect was found). The tests drive both branches
+// explicitly; production points it at the real detector.
+var inspectNSSBypass = nssbypass.Inspect
+
+// measureHostResolution is the INJECTABLE measurement seam behind the same gate.
+// It needs root and nft, so without a seam every `add` test would fall into the
+// could-not-measure branch on an unprivileged runner and never exercise the
+// refusal at all.
+var measureHostResolution = verify.HostResolvesHostsInProcess
+
+// refuseNSSBypassHost is `add`'s DNS-confinement gate: it refuses a host on which
+// the account's name resolution would happen in another process under another uid,
+// naming the daemon, the evidence and the remedy, and returns the process exit
+// code (0 = proceed).
+//
+// Only a BROAD provider refuses (one that answers arbitrary hostnames: nscd/nsncd,
+// systemd-resolved, sssd, winbind). A bounded-namespace provider (avahi for
+// `.local`, machined for machine names) is WARNED about and allowed: it cannot
+// carry the account's general traffic, and refusing on it would refuse on most
+// Linux desktops for a narrow leak. `verify` reports it as a residual either way.
+//
+// A detector that could not READ something warns rather than passing silently: a
+// check that could not run is not a pass, and here that distinction decides
+// whether an operator is told their box leaks.
+func refuseNSSBypassHost(ctx context.Context, cmd *cli.Command) int {
+	providers, err := inspectNSSBypass()
+	if err != nil {
+		fmt.Printf("%s %v\n", outStyle.Red("WARNING:"), err)
+	}
+	broad := nssbypass.Broad(providers)
+	// THE DETECTOR IS A HINT; THE MEASUREMENT DECIDES. An nscd-compatible socket is
+	// reported as a broad provider because glibc consults such a socket before
+	// nsswitch.conf, which is the right default reading and is what found the original
+	// leak. But the socket's EXISTENCE does not prove the daemon serves hosts: nsncd
+	// with NSNCD_IGNORE_HOSTS=true keeps its socket (it still serves passwd/group)
+	// while refusing hosts, and that is the remedy anonctl itself recommends. So
+	// refusing on the detector alone refuses precisely the operator who has just done
+	// what we told them to, with a message telling them to do it again.
+	if len(broad) > 0 {
+		if inProcess, measured, why := measureHostResolution(ctx); measured && inProcess {
+			fmt.Printf("%s %s is configured on this host, but %s, so the forcing can govern this account's DNS. Proceeding\n",
+				outStyle.Yellow("note:"), nssbypass.Names(broad), why)
+			broad = nil
+		} else if !measured {
+			// Could not answer it here. Proceed with a loud warning rather than refuse: `add`
+			// runs `verify` inline moments later and MEASURES this per-account, so a wrong
+			// guess in this direction is caught within seconds and reported red, while a wrong
+			// refusal leaves a correctly configured operator with no way forward except a flag
+			// that costs them `use`/`exec` and the marker.
+			fmt.Printf("%s %s is configured on this host and %s. anonctl is proceeding, and the `verify` run at the end of this add will measure it for real\n",
+				outStyle.Yellow("WARNING:"), nssbypass.Names(broad), why)
+			broad = nil
+		}
+	}
+	if narrow := nssbypass.Narrow(providers); len(narrow) > 0 {
+		fmt.Printf("%s %s resolve a bounded class of names (.local, machine names) in ANOTHER process under another uid, which `meta skuid` cannot govern. Those names will not be anonymized; `verify` reports it as a residual on every run\n",
+			outStyle.Yellow("NOTE:"), nssbypass.Names(narrow))
+	}
+	if len(broad) == 0 {
+		return 0
+	}
+	if cmd.AllowNSSBypass {
+		// STATE THE FULL PRICE, not just the red assertion. The flag does not buy a green
+		// report, and because `use`/`exec` gate on a green report and the marker is only
+		// written after one, it does not buy a working session or a marker either. An
+		// operator who learns that from behaviour rather than from this message was misled
+		// by it.
+		fmt.Printf("%s proceeding past --allow-nss-bypass: %s will resolve this account's names OUT OF PROCESS, so every name it visits is resolved by the host's resolver and is attributable to you. Three consequences this flag does NOT remove:\n"+
+			"  1. `anonctl verify` keeps reporting dns-nss-not-bypassed RED for this account, by design (it measures, and the measurement will keep being true)\n"+
+			"  2. `anonctl use` and `anonctl exec` therefore REFUSE to open a session for it, since both gate on a green verify; log in with `sudo -iu %s` instead\n"+
+			"  3. the world-readable marker is only written after a green verify, so sibling tools (anon-pi, netcage) will not see this account as kernel-anonymized and may anonymize it a second time\n"+
+			"Fixing the host (see the remedies above and docs/nixos.md) clears all three.\n",
+			outStyle.Yellow("WARNING:"), nssbypass.Names(broad), cmd.Account)
+		return 0
+	}
+	errorf("add: this host resolves hostnames OUTSIDE the account's own processes, so anonctl cannot confine its DNS:\n%s"+
+		"anonctl forces egress with `meta skuid <uid>`, which matches a socket's OWNER; a lookup another daemon performs for the account is not governed by any rule anonctl can write, so the account's browsing would be resolved by the host's resolver and attributable to you while its TCP exits over the endpoint.\n"+
+		"Fix the host with one of the remedies above and re-run, or pass --allow-nss-bypass to force it (verify will keep reporting dns-nss-not-bypassed RED, which is the honest answer, not a bug). See docs/adr/0011 and docs/nixos.md.",
+		nssbypass.Explain(broad))
+	return 1
+}
+
 func forcingDeps() forcing.Deps {
 	return forcing.Deps{
 		NftRunner:     nftables.ExecRunner{},
@@ -1789,7 +1899,7 @@ func emitJSON(v any) int {
 }
 
 const usage = `usage:
-  anonctl add    [--endpoint <socks5h://host:port>] [--allow <IP|CIDR:port>]... [<name>]
+  anonctl add    [--endpoint <socks5h://host:port>] [--allow <IP|CIDR:port>]... [--allow-nss-bypass] [<name>]
                                      provision the account + shim UID, install fail-closed forcing that
                                      survives reboot (default endpoint: the local Tor SocksPort) (root).
                                      ADD-ONCE: refuses an account anonctl already MANAGES, i.e. one with a
@@ -1804,6 +1914,14 @@ const usage = `usage:
                                      REQUIRED, never :53): an RFC1918/link-local LAN host, OR a same-host
                                      loopback service 127.0.0.1:<port> (the anonymizer control/SOCKS/DNS
                                      ports 9050/9150/9051/1080 are refused on loopback)
+                                     REFUSES a host whose glibc resolves hostnames OUT OF PROCESS (an
+                                     nscd/nsncd socket, or nss-resolve/sssd/winbind in nsswitch.conf):
+                                     forcing keys on a socket's OWNER, so a lookup another daemon performs
+                                     for the account is ungovernable and every name it visits would be
+                                     resolved by the host's resolver. --allow-nss-bypass proceeds anyway,
+                                     but buys less than it looks: verify still reports dns-nss-not-bypassed
+                                     RED by design, so use/exec refuse the account (log in with sudo -iu)
+                                     and no marker is written for sibling tools. Fixing the host clears all three.
   anonctl rm     [--purge-account] [<name>]
                                      remove forcing; --purge-account also deletes the account (root)
   anonctl seed-home [--from <dir>] [--force] [<name>]

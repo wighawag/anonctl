@@ -538,29 +538,13 @@ func curlAsAnon(ctx context.Context, p LiveParams, url string) (string, error) {
 	return strings.TrimSpace(out.String()), nil
 }
 
-// dnsRemoteEvidence gathers the dns-remote evidence: a unique probe name resolved
-// THROUGH the shim (socks5h => proxy-side resolution). With a controllable
-// endpoint the proxy-side view is observed by the fixture in tests; against a live
-// endpoint the evidence is that the forced fetch of a name SUCCEEDED via socks5h
-// (proxy-side) while the host resolver was not consulted. It returns the probe
-// name, the proxy-resolved list, and whether the host resolver saw it. An error
-// feeds a failing dns-remote decision.
-func dnsRemoteEvidence(ctx context.Context, p LiveParams) (probe string, proxyResolved []string, hostSaw bool, err error) {
-	probe = "check.torproject.org"
-	// Fetch the name AS THE ANON UID: the anon UID's :53 is transparently redirected
-	// to the shim's DNS-over-SOCKS forwarder, so a successful HTTPS fetch of a NAME
-	// (never a bare IP) proves the name was resolved REMOTELY via the endpoint, not by
-	// a local/plaintext lookup. This does NOT dial the relay port as a SOCKS proxy
-	// (the relay is transparent, not a SOCKS server); it egresses the forced way, like
-	// the recipe's `sudo -u anon curl` that resolves through the shim.
-	if _, err := curlAsAnon(ctx, p, "https://"+probe+"/"); err != nil {
-		return probe, nil, false, err
-	}
-	// The anon UID cannot do plaintext DNS off-box (udp/53 is redirected to the shim,
-	// tcp/53 too), so the name was resolved proxy-side and the host resolver was never
-	// asked; hostSaw stays false.
-	return probe, []string{probe}, false, nil
-}
+// The inferred `dnsRemoteEvidence` that used to live here has been REMOVED, not
+// repaired. It fetched a name through the forced path and then returned
+// `hostSaw=false` HARDCODED, on the reasoning that the anon UID cannot do
+// plaintext DNS off-box so the name must have been resolved proxy-side. Both
+// halves of that premise were false on a measured host, and the check reported
+// clean precisely when it should not have. The replacement measures instead:
+// internal/verify/dns_live.go (the probes) and dns.go (the decisions).
 
 // httpGetTrimmed GETs url and returns the trimmed body, or an error.
 func httpGetTrimmed(ctx context.Context, client *http.Client, url string) (string, error) {

@@ -484,3 +484,33 @@ func TestSkipTorExitCheckFlag(t *testing.T) {
 		t.Error("use --skip-tor-exit-check must set SkipTorExitCheck")
 	}
 }
+
+// `--allow-nss-bypass` is add's explicit escape hatch for a host whose glibc
+// resolves `hosts` out of process. It parses before OR after the account name (the
+// flag-anywhere rule the other add flags follow), and it is OFF unless asked for:
+// the default on such a host is a refusal, because a per-UID rule cannot govern a
+// lookup another daemon performs.
+func TestParseAllowNSSBypass(t *testing.T) {
+	for _, args := range [][]string{
+		{"add", "--allow-nss-bypass", "work"},
+		{"add", "work", "--allow-nss-bypass"},
+	} {
+		cmd, err := cli.Parse(args)
+		if err != nil {
+			t.Fatalf("Parse(%v): %v", args, err)
+		}
+		if !cmd.AllowNSSBypass {
+			t.Errorf("Parse(%v) did not set AllowNSSBypass", args)
+		}
+		if cmd.Account != "anon-work" {
+			t.Errorf("Parse(%v) account = %q, want anon-work: the flag must not swallow the name", args, cmd.Account)
+		}
+	}
+	cmd, err := cli.Parse([]string{"add", "work"})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cmd.AllowNSSBypass {
+		t.Error("AllowNSSBypass must default to FALSE: the safe default is to refuse a host that resolves out of process")
+	}
+}

@@ -11,7 +11,8 @@ Read section 1 before you run anything. On this distro the default configuration
 - [3. The alternative (`users.mutableUsers = true`) and what it actually costs](#3-the-alternative-usersmutableusers--true-and-what-it-actually-costs)
 - [4. Choosing an account NAME is a privacy decision](#4-choosing-an-account-name-is-a-privacy-decision)
 - [5. NixOS-specific operational gotchas](#5-nixos-specific-operational-gotchas)
-- [6. Verify it actually worked on this host](#6-verify-it-actually-worked-on-this-host)
+- [6. nsncd resolves your account's names for it, and `add` refuses until you deal with it](#6-nsncd-resolves-your-accounts-names-for-it-and-add-refuses-until-you-deal-with-it)
+- [7. Verify it actually worked on this host](#7-verify-it-actually-worked-on-this-host)
 
 ## 1. Read this first: `users.mutableUsers = false` deletes anonctl's accounts
 
@@ -46,7 +47,7 @@ Everything anonctl installed survives the deletion: the nft tables, the shim uni
 - **Recreation unjails the real account.** Re-create the anon account and it may receive a DIFFERENT uid. The old rules then match nobody, the new account is completely unforced, and `/etc/anonctl` still records it as jailed. That is the exact "the account still exists and still looks anonymised" failure anonctl exists to prevent, arrived at from a direction nothing in the design anticipated.
 - **`anonctl rm` cannot clean it up**, because the account it wants to tear down no longer exists, so the orphaned tables outlive the teardown.
 
-`anonctl verify` detects the condition explicitly: its first assertion, `account-identity`, checks that both accounts still exist and still own the uids anonctl recorded, and reports that alone when they do not (see [section 6](#6-verify-it-actually-worked-on-this-host)).
+`anonctl verify` detects the condition explicitly: its first assertion, `account-identity`, checks that both accounts still exist and still own the uids anonctl recorded, and reports that alone when they do not (see [section 7](#7-verify-it-actually-worked-on-this-host)).
 
 You have two ways out, and they are not equivalent. [Declare the accounts](#2-the-supported-path-declare-both-accounts-then-let-add-adopt-them) is the supported one. [Setting `users.mutableUsers = true`](#3-the-alternative-usersmutableusers--true-and-what-it-actually-costs) has a real and non-obvious cost elsewhere on the box.
 
@@ -253,15 +254,63 @@ Every path must be under `/run/current-system/sw/bin` (or a real, non-store inst
 
 `/etc/systemd/system` is a read-only Nix store symlink on NixOS, and `systemctl enable` always writes its symlink into that directory no matter where the unit file lives. anonctl therefore installs its units into `/usr/local/lib/systemd/system` (systemd's documented home for "system units installed by the administrator", and in the unit load path on NixOS) and writes its own `.wants/` symlinks there.
 
-systemd honours `.wants/` in **every** load-path directory, so the dependency is real and boot-effective; this has been confirmed across an actual reboot on NixOS. But `systemctl is-enabled` inspects only the config directory, so it reports `disabled` for units that are genuinely wired to boot. Do not use it as your check. The truthful probe is `systemctl show <target> --property=Wants`, used in [section 6](#6-verify-it-actually-worked-on-this-host).
+systemd honours `.wants/` in **every** load-path directory, so the dependency is real and boot-effective; this has been confirmed across an actual reboot on NixOS. But `systemctl is-enabled` inspects only the config directory, so it reports `disabled` for units that are genuinely wired to boot. Do not use it as your check. The truthful probe is `systemctl show <target> --property=Wants`, used in [section 7](#7-verify-it-actually-worked-on-this-host).
 
-## 6. Verify it actually worked on this host
+## 6. nsncd resolves your account's names for it, and `add` refuses until you deal with it
+
+NixOS enables an nscd-compatible daemon by default, and since 23.05 that daemon is **nsncd**. glibc asks an nscd socket for the `hosts` database **before** it looks at `/etc/nsswitch.conf` at all, so on a stock NixOS host every `getaddrinfo` your anon account makes is executed inside nsncd's process, under uid `nscd`.
+
+That defeats anonctl completely for DNS. The forcing is `meta skuid <anonUID>`, which matches a socket's **owner**: a lookup another daemon performs on the account's behalf is not governed by any rule anonctl can write. The result is an account whose TCP exits correctly over Tor while every hostname it visits is resolved by your host's resolver and is attributable to you. This was measured, not theorised (`work/notes/findings/dns-confinement-defeated-by-nss-delegation-and-reply-un-nat.md`), and it is why `anonctl add` refuses such a host outright.
+
+You have three honest options.
+
+**Tell nsncd to ignore hosts (recommended, and measured on this box).** nsncd takes `NSNCD_IGNORE_<DATABASE>` environment variables, so it can be told to stop answering the `hosts` database while still serving `passwd`/`group`, which is what NixOS wants it for:
+
+```nix
+systemd.services.nscd.environment.NSNCD_IGNORE_HOSTS = "true";
+```
+
+The load-bearing question is what glibc does when nsncd refuses: it **falls back to in-process resolution** rather than failing. That was measured here rather than assumed, with a differential that can only come out one way: two nsncd instances, one default and one with the variable set, each reached through a mount namespace whose own `/etc/resolv.conf` points at a dead server. The default instance **resolved** a tailnet name (it answered using the host's real resolver, which is the bypass in miniature); the ignoring instance **failed** (glibc resolved it in-process and hit the dead server). In-process is what `meta skuid` can govern, so that is the fix.
+
+Consequence worth knowing: nsncd exists so foreign-libc binaries (`nix-ld`, `steam-run`, FHS environments) can use this glibc's NSS plugins. With hosts ignored, those binaries resolve with their own libc, so they keep `files` and `dns` but lose `mdns`/`mymachines`. Native programs are unaffected, and nsncd is non-caching, so no cache is lost.
+
+**Or swap nsncd for glibc's nscd with the hosts cache off.** `services.nscd.enableNsncd = false` plus `enable-cache hosts no` in `services.nscd.config`. The glibc `nscd` binary does still exist in nixpkgs (checked here: 2.42), but this is a bigger change than one environment variable, for the same effect.
+
+**Or accept it explicitly.** `anonctl add --allow-nss-bypass <name>` proceeds. Do this only if you know the account will never use NSS (a program pointed straight at the shim's DNS port). Know what it does and does not buy, because it is less than the name suggests:
+
+| after `--allow-nss-bypass` | state |
+| --- | --- |
+| the forcing (nft rules, shim, boot persistence) | installed and working |
+| `anonctl verify` | `dns-nss-not-bypassed` stays RED, every run, by design |
+| `anonctl use` / `anonctl exec` | REFUSE the account, because both gate on a green verify |
+| entering the account | `sudo -iu <account>`, which is the documented day-to-day path anyway |
+| the world-readable marker | not written (it needs a green verify), so anon-pi/netcage will not see this account as kernel-anonymized and may anonymize it again |
+
+That combination is deliberate. Your consent is a reason for anonctl to let you **proceed**; it is not a reason for anonctl to start certifying the box, to itself or to another tool. Fixing the host clears all four rows at once.
+
+**Do not** try to solve it by forcing nsncd's egress through the shim. It serves every uid on the machine, so capturing it would route your whole host's name resolution through one account's Tor circuit.
+
+### While you are here: check that the account's DNS actually works
+
+On this host the two problems are easy to confuse, and they compound: a Tailscale box additionally drops the shim's **answers**, because conntrack un-NATs the reply to the nameserver's address (`100.100.100.100`, inside `100.64.0.0/10`) and tailscaled's `ts-input` chain drops packets from that range arriving on `lo`. The account then has no working DNS at all, and the nsncd bypass is the only reason it appears to resolve anything.
+
+`anonctl verify` reports this as `dns-forced-path-answers`, separately from the bypass, and names the culprit when the nameserver is inside Tailscale's range. The fix is on the host side, because the rule doing the dropping is tailscaled's and is correct on its own terms: anonctl will not edit another tool's ruleset.
+
+What makes it go away is a **loopback** system nameserver. The problem is entirely about the address the answer is un-NATed to: from `127.0.0.53` or `127.0.0.1` the reply is an ordinary loopback packet that no anti-spoofing rule looks at, and the account's redirect (`udp dport 53` to the shim's loopback port) is then loopback-to-loopback throughout. A stub resolver in front of MagicDNS, or a local forwarder pointing at `100.100.100.100`, both do it. Note that the account's own queries never reach that stub: they are redirected into the shim before they get there. The stub is for the rest of the box.
+
+> **The obvious version of that fix trades one bypass for the other, so check it.** Enabling `services.resolved` on NixOS also adds `resolve [!UNAVAIL=return]` to `system.nssDatabases.hosts` (`nixos/modules/system/boot/resolved.nix`, `mkOrder 501`), and `nss-resolve` hands `getaddrinfo` to systemd-resolved over varlink, under uid `systemd-resolve`. That is the SAME out-of-process resolution nsncd was doing, so you would fix `dns-forced-path-answers` and keep `dns-nss-not-bypassed` red. You want the stub LISTENER without the NSS module: drop that entry with a `lib.mkForce` on `system.nssDatabases.hosts` and keep `dns`, so glibc queries `127.0.0.53` on the account's own socket, which the forcing governs correctly. Re-run `anonctl verify` after any such change; that is what it is for.
+
+> **anonctl drops the account's clear DNS at the baseline because of this.** A loopback nameserver makes an UNFORCED query look exactly like a forced one to the standing default-deny (both have a loopback destination, and the baseline returns loopback because that is forcing's own redirect target). Off-box nameservers were caught by the baseline's broad drop; loopback ones would not have been, so "forcing absent means dropped, not free" would have stopped holding for DNS on precisely the hosts this page tells you to configure. The baseline now drops the account's `:53` outright, which cannot touch forced traffic because forcing rewrites the port at `dstnat` before the baseline's chain runs. You do not have to do anything about this; it is here because it is the reason the recommendation above is safe.
+
+The general rule behind all of this, worth stating once: **a loopback system nameserver keeps the whole exchange on `lo`**, so no input filter keyed on a source address (tailscaled's or anyone else's) ever sees the account's DNS. An off-box nameserver makes the un-NATed answer visible to every such filter on the box, and whether it survives is then somebody else's policy decision, re-made on every update of that other tool.
+
+## 7. Verify it actually worked on this host
 
 Run this after `anonctl add`, and again **after a reboot**. On this distro the reboot is not a formality: activation is when accounts are deleted, so a green report before the first reboot proves nothing about whether the configuration is right.
 
 Substitute your own account name for `anon-a` throughout.
 
-### 6.1 The account still exists and still owns its pinned uid
+### 7.1 The account still exists and still owns its pinned uid
 
 ```sh
 sudo anonctl status anon-a
@@ -283,7 +332,7 @@ getent passwd anon-a anon-a-shim
 sudo cat /etc/anonctl/accounts/anon-a.json
 ```
 
-### 6.2 The tables are loaded
+### 7.2 The tables are loaded
 
 ```sh
 sudo nft list table inet anonctl_anon_a
@@ -294,7 +343,7 @@ Both must exist. The baseline table is the one that matters most: it is the stan
 
 (The table name replaces `-` with `_`, so account `anon-a` gives `anonctl_anon_a`.)
 
-### 6.3 No loaded table governs a uid that is no longer the account's
+### 7.3 No loaded table governs a uid that is no longer the account's
 
 This is the check that catches an orphaned table from a deleted account, including one belonging to an account you have since forgotten about:
 
@@ -309,7 +358,7 @@ sudo nft list ruleset \
 
 Every uid printed must resolve to one of your anon accounts or its shim. A `NO SUCH UID` line is an orphaned table: the rules are governing a uid that is free to be handed to an unrelated account. Clear it with `sudo anonctl rm --purge-account <account>` if you still know which account it was, or `sudo nft delete table inet <name>` for the table directly, and then fix the declaration so it does not recur.
 
-### 6.4 The forcing is actually wired to boot
+### 7.4 The forcing is actually wired to boot
 
 `systemctl is-enabled` will say `disabled` and be wrong (see [section 5](#systemctl-is-enabled-lies-about-anonctls-units-here)). Ask the loaded dependency graph instead:
 
@@ -320,7 +369,7 @@ systemctl show multi-user.target --property=Wants | tr ' ' '\n' | grep anonctl
 
 You want `anonctl-nftables.service` under `sysinit.target` and `anonctl-shim@anon-a.service` under `multi-user.target`.
 
-### 6.5 Reboot, then run 6.1 through 6.4 again
+### 7.5 Reboot, then run 7.1 through 7.4 again
 
 This is the only test that exercises what section 1 is about, because the deletion happens during activation at boot. A configuration that survives `nixos-rebuild switch` will usually survive a reboot too, but "usually" is not the standard anonctl holds itself to, and the failure it is guarding against is silent.
 
@@ -328,5 +377,6 @@ This is the only test that exercises what section 1 is about, because the deleti
 
 - [`docs/adr/0010-add-gates-on-the-ledger-and-adopts-existing-accounts.md`](adr/0010-add-gates-on-the-ledger-and-adopts-existing-accounts.md): why `add` gates on anonctl's own record rather than the passwd table, what adoption does and does not touch, and why half a pair is refused rather than completed.
 - [`docs/adr/0003-verify-assertion-names-and-json-contract.md`](adr/0003-verify-assertion-names-and-json-contract.md): the `account-identity` precondition and the `--json` contract.
+- [`docs/adr/0011-dns-confinement-is-measured-and-nss-bypass-is-refused.md`](adr/0011-dns-confinement-is-measured-and-nss-bypass-is-refused.md): why nsncd defeats per-UID DNS forcing, why anonctl refuses rather than works around it, and why the DNS assertions measure instead of inferring.
 - [`docs/adr/0005-reboot-persistence-and-boot-invariant.md`](adr/0005-reboot-persistence-and-boot-invariant.md): the boot invariant and why a store path in `ExecStart` is fail-open.
-- `work/notes/findings/nixos-account-conventions-break-anonctl-provisioning.md`, `work/notes/findings/systemd-enablement-target-and-nixos-fhs-gaps.md` and `work/notes/observations/resolved-unit-binaries-can-bake-a-nix-store-path-from-path.md`: the raw measurements this guide is built from.
+- `work/notes/findings/nixos-account-conventions-break-anonctl-provisioning.md`, `work/notes/findings/systemd-enablement-target-and-nixos-fhs-gaps.md`, `work/notes/findings/dns-confinement-defeated-by-nss-delegation-and-reply-un-nat.md` and `work/notes/observations/resolved-unit-binaries-can-bake-a-nix-store-path-from-path.md`: the raw measurements this guide is built from.

@@ -10,8 +10,18 @@
 //
 //   - anonymized-exit: the account's exit IP DIFFERS from the host's; for a
 //     tor-shared endpoint it is additionally a Tor exit (check.torproject.org).
-//   - dns-remote: DNS resolves REMOTELY via the endpoint (the proxy saw the
-//     lookup), never locally / in plaintext (the host resolver did NOT see it).
+//   - dns-remote: the account's OWN name resolution is carried into the shim, and
+//     therefore resolved REMOTELY via the endpoint. MEASURED (a unique
+//     `<random>.invalid` name looked up through NSS as the anon UID, watched by a
+//     counter on the shim's loopback DNS port), never inferred from the rules.
+//   - dns-nss-not-bypassed: the lookup happened on the ACCOUNT's own sockets at
+//     all, rather than being performed for it by nscd/nsncd, systemd-resolved,
+//     sssd or winbind in another process under another uid, where `meta skuid`
+//     cannot govern it (docs/adr/0011).
+//   - dns-forced-path-answers: a query from the account through the redirect
+//     actually COMES BACK. A forced path can be packet-perfect and still leave the
+//     account with no DNS, which is the condition under which a bypass becomes the
+//     only reason it resolves anything.
 //   - leak-drop-v4 / leak-drop-v6 (LOAD-BEARING): a direct, non-anonymized
 //     connection from the anon UID is actually DROPPED, on IPv4 AND IPv6. This is
 //     the fail-closed proof: fail-closed is DEMONSTRATED, not assumed.
@@ -75,8 +85,25 @@ const (
 	// AssertAnonymizedExit: the exit IP differs from the host's (and is a Tor exit
 	// for a tor-shared endpoint).
 	AssertAnonymizedExit = "anonymized-exit"
-	// AssertDNSRemote: DNS resolves remotely via the endpoint, not locally.
+	// AssertDNSRemote: the account's OWN name resolution is carried into the shim,
+	// and therefore resolved remotely via the endpoint, not locally. MEASURED (a
+	// unique name looked up through NSS as the anon UID, watched by a counter on the
+	// shim's loopback DNS port), never inferred from the installed rules.
 	AssertDNSRemote = "dns-remote"
+	// AssertDNSNSSNotBypassed: the account's name resolution happens on the ACCOUNT's
+	// OWN sockets, rather than in another process under another uid (nscd/nsncd,
+	// systemd-resolved, avahi, sssd, winbind). `meta skuid` matches a socket's OWNER,
+	// so a lookup performed by a daemon on the account's behalf is not governed by any
+	// rule anonctl can write. This is the NSS instance of the same principle as the
+	// v0.4.0 chain fix: a rule keyed on socket ownership cannot see work done in
+	// another process. See internal/nssbypass and docs/adr/0011.
+	AssertDNSNSSNotBypassed = "dns-nss-not-bypassed"
+	// AssertDNSForcedPathAnswers: a DNS query from the account, through the redirect,
+	// actually COMES BACK. A forced path can be packet-perfect and still leave the
+	// account with no DNS (measured: the redirect fired, the shim answered over Tor,
+	// and a host-owned input filter dropped the un-NATed reply), in which case any
+	// working resolution the account appears to have is coming from somewhere else.
+	AssertDNSForcedPathAnswers = "dns-forced-path-answers"
 	// AssertLeakDropV4 / AssertLeakDropV6: a direct connection from the anon UID is
 	// DROPPED on IPv4 / IPv6 (the load-bearing fail-closed proof).
 	AssertLeakDropV4 = "leak-drop-v4"
@@ -249,6 +276,25 @@ func (r Report) JSON() ([]byte, error) {
 type Check struct {
 	Name string
 	Run  func(ctx context.Context) Assertion
+	// Exclusive marks a check whose measurement requires that NO OTHER check is
+	// touching the account at the same time. RunWith runs every Exclusive check
+	// FIRST, one at a time, and only then runs the rest concurrently.
+	//
+	// It exists because verify could otherwise not measure itself. The DNS
+	// confinement checks watch nft counters keyed on the ACCOUNT's own sockets, and
+	// `anonymized-exit` fetches a URL with curl AS THAT ACCOUNT, which resolves a
+	// hostname and therefore emits the account's DNS. Run concurrently, verify's own
+	// probe is indistinguishable from the third-party process the DNS measurement is
+	// designed to detect, so a correctly configured host reported "could not be
+	// attributed" for all three DNS assertions (measured on telemaque once the host
+	// stopped resolving out of process, which is what made anonctl's own lookups
+	// visible on the account's sockets for the first time).
+	//
+	// The alternative was a lock shared between the DNS measurement and every
+	// name-resolving probe. This is preferred because it puts the requirement in the
+	// CHECK SET, where a reader can see it, rather than in a lock a future probe
+	// author must remember to take.
+	Exclusive bool
 }
 
 // Progress is an OPTIONAL per-check observation hook so a caller can show that
@@ -308,9 +354,31 @@ func RunWith(ctx context.Context, checks []Check, prog Progress) Report {
 			prog.Start(c.Name)
 		}
 	}
-	var wg sync.WaitGroup
+	// PHASE 1: the exclusive checks, one at a time, with nothing else running. A
+	// measurement that observes the ACCOUNT (rather than one connection of its own)
+	// cannot tell verify's other probes from an unrelated process, so it has to own
+	// the account while it runs. See Check.Exclusive.
 	var doneMu sync.Mutex // serialises prog.Done so a caller's writer never races
 	for i, c := range checks {
+		if !c.Exclusive {
+			continue
+		}
+		a := c.Run(ctx)
+		if a.Name == "" {
+			a.Name = c.Name
+		}
+		rep.Assertions[i] = a
+		if prog.Done != nil {
+			prog.Done(a)
+		}
+	}
+
+	// PHASE 2: everything else, concurrently, as before.
+	var wg sync.WaitGroup
+	for i, c := range checks {
+		if c.Exclusive {
+			continue
+		}
 		wg.Add(1)
 		go func(i int, c Check) {
 			defer wg.Done()
@@ -514,29 +582,11 @@ func torSourceDetail(ev TorExitEvidence) string {
 	}
 }
 
-// DNSRemoteAssertion is the PURE decision for the dns-remote assertion. Given the
-// unique probe name, the hostnames the ENDPOINT (proxy) was asked to resolve
-// proxy-side (proxyResolved), and whether the HOST resolver observed the same name
-// (hostResolverSaw), it passes IFF the name was resolved proxy-side AND the host
-// resolver never saw it: DNS goes via the anonymizer, never a plaintext/local
-// lookup. It is pure so it is unit-tested against the fixture's ResolvedHosts view
-// with no real resolver.
-func DNSRemoteAssertion(probeName string, proxyResolved []string, hostResolverSaw bool) Assertion {
-	a := Assertion{Name: AssertDNSRemote}
-	if hostResolverSaw {
-		a.Detail = "the host resolver observed " + probeName + ": DNS leaked locally in plaintext"
-		return a
-	}
-	for _, h := range proxyResolved {
-		if h == probeName {
-			a.Ok = true
-			a.Detail = probeName + " was resolved proxy-side (remotely, via the endpoint), not locally"
-			return a
-		}
-	}
-	a.Detail = probeName + " was NOT resolved proxy-side: DNS did not go through the anonymizer"
-	return a
-}
+// The dns-remote decision lives in dns.go now, alongside the two assertions it was
+// split into (dns-nss-not-bypassed and dns-forced-path-answers) and the measured
+// evidence type all three read. The version that stood here decided from
+// "proxyResolved" plus a "hostResolverSaw" flag that the live probe HARDCODED to
+// false, so on a real host the decision was sound and the evidence was fiction.
 
 // AccountIdentity is what the account-identity precondition is decided from: what
 // the BOX says right now (Exists/ShimExists + the live UIDs, read from the passwd
