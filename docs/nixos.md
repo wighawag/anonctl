@@ -250,6 +250,19 @@ grep -h '^ExecStart' /usr/local/lib/systemd/system/anonctl-*.service
 
 Every path must be under `/run/current-system/sw/bin` (or a real, non-store install prefix). If any path starts with `/nix/store/`, re-run `sudo anonctl update <account>` from a clean shell.
 
+### `/usr/local/bin` is not on `PATH` here, so the installer's default is invisible
+
+The installer puts both binaries in `/usr/local/bin`, which is the right choice on most distributions and is **not on `PATH` on NixOS**, for the operator or for `sudo`. So a perfectly good install produces:
+
+```
+$ sudo anonctl verify anon-01
+sudo: anonctl: command not found
+```
+
+Nothing is broken: call it by absolute path (`sudo /usr/local/bin/anonctl ...`), or install with a `PREFIX` that is on `PATH`. anonctl itself is unaffected either way, because it resolves the shim as its own sibling and writes that absolute path into the unit, so the units keep working regardless of your `PATH`.
+
+The better answer on this distro is to stop hand-installing altogether: a binary in `/usr/local/bin` is undeclared state that no rebuild reproduces and no rollback undoes, which on a box that pins its uids and declares its users is exactly the drift you are otherwise avoiding. Package it (`buildGoModule`, both binaries, `CGO_ENABLED = 0` to match the release) and put it in `environment.systemPackages`; anonctl's lookup then lands on `/run/current-system/sw/bin`, which is a stable alias rather than a garbage-collectable store path, so it satisfies the `ExecStart` rule above by construction.
+
 ### `systemctl is-enabled` lies about anonctl's units here
 
 `/etc/systemd/system` is a read-only Nix store symlink on NixOS, and `systemctl enable` always writes its symlink into that directory no matter where the unit file lives. anonctl therefore installs its units into `/usr/local/lib/systemd/system` (systemd's documented home for "system units installed by the administrator", and in the unit load path on NixOS) and writes its own `.wants/` symlinks there.
