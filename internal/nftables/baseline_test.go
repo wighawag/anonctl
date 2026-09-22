@@ -242,3 +242,70 @@ func TestGenerateBaselineRejectsBadParams(t *testing.T) {
 		t.Errorf("expected GenerateBaseline to reject a negative anon UID")
 	}
 }
+
+// THE BOOT-INVARIANT HOLE A LOOPBACK RESOLVER WOULD OTHERWISE OPEN.
+//
+// The baseline RETURNS loopback because forcing rewrites the account's traffic to
+// a loopback shim port, so "loopback dst" means "forcing is about to govern this".
+// That is true for every destination except a local RESOLVER: on a host whose
+// resolv.conf names 127.0.0.53 (systemd-resolved), 127.0.0.1 (dnsmasq/unbound) or
+// glibc's own 127.0.0.1 default, an UNFORCED query looks identical to a forced one
+// and would be returned, delivered to the host's resolver, and forwarded with the
+// host's real identity. With an off-box nameserver the broad drop caught it.
+//
+// This matters because a loopback resolver is exactly what anonctl now RECOMMENDS
+// (it is the remedy for the un-NATed-reply defect, ADR-0011), so the recommendation
+// would otherwise ship with a hole in "forcing absent means DROPPED, not free".
+func TestBaselineDropsClearDNSToALoopbackResolver(t *testing.T) {
+	rs, err := nftables.GenerateBaseline("anon", 8802, nil)
+	if err != nil {
+		t.Fatalf("GenerateBaseline: %v", err)
+	}
+	for _, want := range []string{
+		"meta skuid 8802 udp dport 53 drop",
+		"meta skuid 8802 tcp dport 53 drop",
+	} {
+		if !strings.Contains(rs, want) {
+			t.Errorf("the baseline must drop the anon UID's clear DNS; missing %q in:\n%s", want, rs)
+		}
+	}
+	// ORDER IS THE WHOLE POINT: the drop must precede the loopback return, or the
+	// return wins and the query reaches the host's resolver.
+	dropAt := strings.Index(rs, "meta skuid 8802 udp dport 53 drop")
+	returnAt := strings.Index(rs, "meta skuid 8802 ip daddr 127.0.0.0/8 return")
+	if dropAt < 0 || returnAt < 0 || dropAt > returnAt {
+		t.Errorf("the clear-DNS drop must come BEFORE the loopback return (drop@%d, return@%d):\n%s", dropAt, returnAt, rs)
+	}
+}
+
+// The drop must not touch the FORCED path. A forced query has already had its
+// destination port rewritten to the shim's DNS port by the forcing table's nat
+// chain at dstnat (-100), and the baseline runs at filter priority (0), so it
+// arrives carrying the shim port and never matches :53. This test pins the
+// PRIORITY RELATIONSHIP the safety rests on, since the rule above is only safe
+// because of it.
+func TestBaselineClearDNSDropCannotCatchForcedTraffic(t *testing.T) {
+	rs, err := nftables.GenerateBaseline("anon", 8802, nil)
+	if err != nil {
+		t.Fatalf("GenerateBaseline: %v", err)
+	}
+	if !strings.Contains(rs, "type filter hook output priority filter;") {
+		t.Fatalf("the baseline chain must sit at filter priority, AFTER dstnat, or the clear-DNS drop would kill forced DNS too:\n%s", rs)
+	}
+	// The forcing table's redirect must be at dstnat, i.e. earlier. If either side
+	// of this relationship ever moves, the baseline drop stops being safe.
+	forcing, err := nftables.Generate(nftables.Params{
+		Account: "anon", AnonUID: 8802, ShimUID: 413,
+		RelayPort: 19050, DNSPort: 19053,
+		EndpointHost: "127.0.0.1", EndpointPort: 9050,
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if !strings.Contains(forcing, "type nat hook output priority dstnat;") {
+		t.Fatalf("the forcing nat chain must run at dstnat (before filter), or a forced query would still carry :53 at the baseline:\n%s", forcing)
+	}
+	if !strings.Contains(forcing, "udp dport 53 redirect to :19053") {
+		t.Fatalf("the forcing table must rewrite the DNS port, which is what makes the baseline drop miss forced traffic:\n%s", forcing)
+	}
+}

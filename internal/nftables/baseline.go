@@ -138,6 +138,37 @@ func GenerateBaseline(account string, anonUID int, exemptions []lanexempt.Exempt
 	// forced traffic is handed on to the forcing table's own closures.
 	w("    chain baseline_out {")
 	w("        type filter hook output priority filter; policy accept;")
+	// CLEAR DNS TO A LOOPBACK RESOLVER IS DROPPED, and it must be dropped HERE,
+	// before the loopback return below, or the resting state has a hole in it.
+	//
+	// The rest of this chain rests on "loopback means forced": forcing rewrites the
+	// anon UID's destination to a loopback shim port, so a loopback dst is the
+	// signature of a packet the forcing table is about to govern, and returning it is
+	// correct. That reasoning holds for every destination EXCEPT a local resolver.
+	//
+	// A host whose `/etc/resolv.conf` names a LOOPBACK nameserver (127.0.0.53 with
+	// systemd-resolved, 127.0.0.1 with dnsmasq/unbound, or glibc's own 127.0.0.1
+	// default when no nameserver is declared) makes an UN-forced DNS query look
+	// exactly like a forced one to this chain: loopback dst, returned, delivered to
+	// the host's resolver, which forwards it and leaks the name with the host's real
+	// identity. With an OFF-BOX nameserver the broad drop below caught that query;
+	// with a loopback one it did not. So the boot invariant ("forcing absent means
+	// DROPPED, not free") silently stopped holding for DNS on exactly the hosts
+	// anonctl now RECOMMENDS configuring that way, because a loopback resolver is the
+	// remedy for the un-NATed-reply defect (docs/nixos.md, ADR-0011).
+	//
+	// The asymmetry that makes this safe is the same one the whole design uses: a
+	// FORCED query has already had its destination port rewritten to the shim's DNS
+	// port by `anon_nat` at dstnat (-100), and this chain runs at filter priority (0),
+	// so a forced query arrives here as `127.0.0.1:<dnsPort>` and does NOT match. Only
+	// an UNFORCED query still carries :53. Matching without a daddr covers every
+	// loopback address and both families in one rule; the off-box case was already
+	// covered by the drop below, so this widens nothing.
+	//
+	// It cannot collide with a loopback exemption either: `lanexempt` rejects :53
+	// outright (ADR-0008), so no exemption can ever name the port this drops.
+	w("        meta skuid %d udp dport 53 drop", anonUID)
+	w("        meta skuid %d tcp dport 53 drop", anonUID)
 	// Loopback RETURN first: forcing redirects the anon UID's egress to a loopback
 	// shim port, so its forced packets arrive here with a loopback dst; return them
 	// (do not drop) so the forcing table governs them. With forcing ABSENT there is
