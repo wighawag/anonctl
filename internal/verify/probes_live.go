@@ -154,11 +154,26 @@ func nftRun(ctx context.Context, stdin, name string, args ...string) (string, st
 // unit-proven against the fixture. Every probe fails SAFE (an error or empty
 // result feeds a FAILING pure decision), never a false pass.
 
-// ipEchoURL is the public IP-echo the exit-IP probes fetch: it returns the
-// caller's observed source IP as plain text. The host baseline hits it directly;
-// the forced-path probe hits it THROUGH the shim (socks5h), so a differing result
-// proves forced egress. Mirrors netcage's exit-IP evidence step.
-const ipEchoURL = "https://api.ipify.org"
+// ipEchoURLs are the public IP-echoes the exit-IP probes fetch, TRIED IN ORDER:
+// each returns the caller's observed source IP as plain text. The host baseline
+// hits one directly; the forced-path probe hits one THROUGH the shim (socks5h), so
+// a differing result proves forced egress. Mirrors netcage's exit-IP evidence step.
+//
+// WHY A LIST RATHER THAN ONE HARDCODED ECHO. A single echo makes one third party's
+// availability a precondition of the whole anonymized-exit assertion: a consumer
+// router blocking api.ipify.org failed the assertion on a CORRECTLY jailed account
+// and cost a real debugging session before the cause was found (it also looked
+// exactly like a forcing failure, which is the worst possible red herring on this
+// particular check). Tor exits are also blocked or rate-limited by some echoes
+// specifically, so the forced path is MORE likely to hit this than the host is.
+// Falling through a short list of independent operators removes the single point
+// of failure without weakening anything: the probe needs the exit IP as observed
+// by SOMEBODY off-box, and any of these answers that question.
+var ipEchoURLs = []string{
+	"https://api.ipify.org",
+	"https://ifconfig.me/ip",
+	"https://icanhazip.com",
+}
 
 // torCheckURL is check.torproject.org's machine endpoint: it reports whether the
 // requesting exit is a Tor exit (IsTor). The anonymized-exit assertion consults it
@@ -290,9 +305,30 @@ func pingAsAnon(ctx context.Context, p LiveParams, target string) (reached bool,
 // anonymized-exit assertion compares against. An error here is surfaced as a
 // failing assertion (never a false pass).
 func hostExitIP(ctx context.Context) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	return httpGetTrimmed(cctx, http.DefaultClient, ipEchoURL)
+	var errs []string
+	for _, u := range ipEchoURLs {
+		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		ip, err := httpGetTrimmed(cctx, http.DefaultClient, u)
+		cancel()
+		if err == nil && net.ParseIP(ip) != nil {
+			return ip, nil
+		}
+		if err == nil {
+			err = fmt.Errorf("answer %q is not an IP", truncateEcho(ip))
+		}
+		errs = append(errs, u+": "+err.Error())
+	}
+	return "", fmt.Errorf("no IP-echo could be reached for the host baseline (%s)", strings.Join(errs, "; "))
+}
+
+// truncateEcho bounds an echo's body before it is quoted into an error: a
+// misbehaving or captive-portal endpoint can answer with an entire HTML page, and
+// an unbounded body in an error string is a hostile thing to print at an operator.
+func truncateEcho(s string) string {
+	if len(s) > 60 {
+		return s[:60] + "..."
+	}
+	return s
 }
 
 // forcedExitIP fetches the exit IP OBSERVED THROUGH the forced path, and, for a
@@ -305,15 +341,33 @@ func hostExitIP(ctx context.Context) (string, error) {
 // server, so a direct SOCKS handshake to it would read the relay's own listen addr
 // and reset. Any error feeds a failing anonymized-exit decision (never a false pass).
 func forcedExitIP(ctx context.Context, p LiveParams) (exitIP string, ev TorExitEvidence, err error) {
-	exitIP, err = curlAsAnon(ctx, p, ipEchoURL)
-	if err != nil {
-		return "", TorExitEvidence{}, err
+	// THE TOR-SPECIFIC CHECK GOES FIRST for a tor-shared endpoint, and it also yields
+	// the exit IP, so the generic echoes are only a FALLBACK here.
+	//
+	// The old order asked a single hardcoded IP-echo first and consulted
+	// check.torproject.org only if that first fetch SUCCEEDED, which made one third
+	// party a precondition of a strictly stronger source that answers the same
+	// question plus the one actually being asked. A blocked echo therefore failed
+	// `anonymized-exit` on a correctly jailed account, and did it in the shape of a
+	// forcing failure. check.torproject.org reports both IP and IsTor, is operated by
+	// the project whose network this endpoint class uses, and is the hand recipe's own
+	// proof, so asking it first is both more robust and more direct.
+	if p.Class == "tor-shared" {
+		if body, terr := curlAsAnon(ctx, p, torCheckURL); terr == nil {
+			ev.CheckTorProject = strings.Contains(body, "\"IsTor\":true") || strings.Contains(body, "\"IsTor\": true")
+			if ip := torCheckIP(body); ip != "" {
+				exitIP = ip
+			}
+		}
+	}
+	if exitIP == "" {
+		exitIP, err = forcedEchoExitIP(ctx, p)
+		if err != nil {
+			return "", TorExitEvidence{}, err
+		}
 	}
 	if p.Class != "tor-shared" {
 		return exitIP, TorExitEvidence{}, nil
-	}
-	if body, terr := curlAsAnon(ctx, p, torCheckURL); terr == nil {
-		ev.CheckTorProject = strings.Contains(body, "\"IsTor\":true") || strings.Contains(body, "\"IsTor\": true")
 	}
 	// If check.torproject.org did NOT confirm a Tor exit, corroborate against onionoo
 	// (Tor's authoritative relay database), which does not lag the way IsTor's exit
@@ -331,6 +385,52 @@ func forcedExitIP(ctx context.Context, p LiveParams) (exitIP string, ev TorExitE
 		}
 	}
 	return exitIP, ev, nil
+}
+
+// forcedEchoExitIP fetches the exit IP through the forced path from the FIRST
+// IP-echo that answers with a parseable address, so one blocked or Tor-hostile
+// echo cannot fail the assertion on a correctly jailed account. Every failure is
+// carried into the error so the operator sees which endpoints were tried and why
+// each one did not answer, rather than a bare "curl failed".
+func forcedEchoExitIP(ctx context.Context, p LiveParams) (string, error) {
+	var errs []string
+	for _, u := range ipEchoURLs {
+		body, err := curlAsAnon(ctx, p, u)
+		if err == nil && net.ParseIP(body) != nil {
+			return body, nil
+		}
+		if err == nil {
+			err = fmt.Errorf("answer %q is not an IP", truncateEcho(body))
+		}
+		errs = append(errs, u+": "+err.Error())
+	}
+	return "", fmt.Errorf("no IP-echo could be reached through the forced path (%s)", strings.Join(errs, "; "))
+}
+
+// torCheckIP extracts the exit IP from a check.torproject.org /api/ip body
+// (`{"IsTor":true,"IP":"1.2.3.4"}`). It is deliberately a small string scan rather
+// than a JSON decode of a shape we do not own: a field we cannot parse yields "",
+// which simply falls through to the IP-echo list instead of failing the probe.
+func torCheckIP(body string) string {
+	const key = `"IP"`
+	i := strings.Index(body, key)
+	if i < 0 {
+		return ""
+	}
+	rest := body[i+len(key):]
+	j := strings.Index(rest, `"`)
+	if j < 0 {
+		return ""
+	}
+	rest = rest[j+1:]
+	k := strings.Index(rest, `"`)
+	if k < 0 {
+		return ""
+	}
+	if ip := strings.TrimSpace(rest[:k]); net.ParseIP(ip) != nil {
+		return ip
+	}
+	return ""
 }
 
 // onionooURL is Tor's authoritative relay-database query endpoint. We ask it whether

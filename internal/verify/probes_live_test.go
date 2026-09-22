@@ -455,3 +455,51 @@ func TestRunSetprivProbeReportsTimeoutHonestly(t *testing.T) {
 		t.Fatalf("the honest error must name the timeout; got %q", err.Error())
 	}
 }
+
+// --- the exit-IP evidence sources (the anonymized-exit robustness fix) ---
+
+// A single hardcoded IP-echo made one third party's availability a precondition of
+// the whole anonymized-exit assertion: a consumer router blocking api.ipify.org
+// failed the assertion on a CORRECTLY jailed account, in the shape of a forcing
+// failure, which is the worst possible red herring on this particular check. The
+// list must therefore hold several INDEPENDENT operators.
+func TestIPEchoListHasIndependentFallbacks(t *testing.T) {
+	if len(ipEchoURLs) < 2 {
+		t.Fatalf("a single IP-echo is a single point of failure for anonymized-exit; got %v", ipEchoURLs)
+	}
+	seen := map[string]bool{}
+	for _, u := range ipEchoURLs {
+		host := u
+		host = strings.TrimPrefix(host, "https://")
+		if i := strings.Index(host, "/"); i >= 0 {
+			host = host[:i]
+		}
+		if seen[host] {
+			t.Errorf("duplicate echo host %q: a fallback on the same operator is not a fallback", host)
+		}
+		seen[host] = true
+		if !strings.HasPrefix(u, "https://") {
+			t.Errorf("echo %q must be https: a plaintext echo is an observable request carrying the exit IP", u)
+		}
+	}
+}
+
+// check.torproject.org reports the exit IP as well as IsTor, which is why it is
+// now consulted FIRST for a tor-shared endpoint: it answers the same question as a
+// generic echo plus the one actually being asked, so the echoes become a fallback
+// rather than a precondition.
+func TestTorCheckIPExtractsTheExitIP(t *testing.T) {
+	if got := torCheckIP(`{"IsTor":true,"IP":"192.42.116.114"}`); got != "192.42.116.114" {
+		t.Errorf("torCheckIP = %q, want 192.42.116.114", got)
+	}
+	if got := torCheckIP(`{"IsTor": true, "IP": "1.2.3.4"}`); got != "1.2.3.4" {
+		t.Errorf("torCheckIP must tolerate whitespace; got %q", got)
+	}
+	// A shape we cannot parse must yield "" so the probe FALLS THROUGH to the echo
+	// list, never a bogus exit IP: this body is not ours to depend on.
+	for _, body := range []string{`{"IsTor":true}`, "not json", "", `{"IP":"not-an-ip"}`} {
+		if got := torCheckIP(body); got != "" {
+			t.Errorf("torCheckIP(%q) = %q, want \"\" (fall through to the echoes)", body, got)
+		}
+	}
+}
