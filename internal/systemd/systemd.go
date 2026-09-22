@@ -45,6 +45,7 @@ import (
 	"strings"
 
 	"github.com/wighawag/anoncore/accountconfig"
+	"time"
 )
 
 // UnitName is the templated unit's base name. It is an INSTANCE template (the
@@ -480,6 +481,44 @@ func ResolveUnitParams(r Resolver) (TemplateParams, LoaderParams, error) {
 // (mirrors provision.Runner / nftables.Runner). anonctl runs these as root.
 type Runner interface {
 	Run(ctx context.Context, name string, args ...string) (stdout, stderr string, err error)
+}
+
+// WaitUntilActive blocks until the account's shim instance is genuinely ACTIVE, or
+// returns a loud error naming what to look at.
+//
+// IT EXISTS BECAUSE `systemctl restart` LIES HERE, and that is measured, not
+// assumed. The shim unit carries `Restart=on-failure`, and with that directive a
+// start that fails immediately (a missing ExecStart binary, 203/EXEC) leaves the
+// unit in `activating` for its auto-restart backoff rather than `failed`, so the
+// restart JOB is reported as succeeding and `systemctl restart` exits 0. Probed
+// directly with a throwaway user unit: without Restart=on-failure the same failure
+// exits 1; with it, exit 0 and `is-active` says `activating`.
+//
+// The consequence was real: `update` printed "re-applied fail-closed, no leak
+// window" over a shim that never came up, and the account lost its forced DNS
+// until the next verify caught it. A restart is not done when the job is accepted;
+// it is done when the service is up, so that is what this checks.
+func WaitUntilActive(ctx context.Context, r Runner, account string, within time.Duration) error {
+	inst := InstanceName(account)
+	deadline := time.Now().Add(within)
+	var last string
+	for {
+		out, _, _ := r.Run(ctx, "systemctl", "is-active", inst)
+		last = strings.TrimSpace(out)
+		if last == "active" {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		select {
+		case <-time.After(250 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return fmt.Errorf("systemd: %s did not become active within %s (state: %q). `systemctl restart` reports success for a unit that is merely RETRYING, so the job was accepted and the service still did not come up. Look at `systemctl status %s` and `journalctl -u %s -n 50`: the usual cause is status=203/EXEC, an ExecStart naming a binary that has moved or been removed",
+		inst, within, last, inst, inst)
 }
 
 // DaemonReload runs `systemctl daemon-reload` so a newly written/removed unit or

@@ -3,12 +3,14 @@ package verify
 import (
 	"context"
 	"net"
+	"os"
 	"strconv"
 	"time"
 
 	"github.com/wighawag/anoncore/endpoint"
 	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anonctl/internal/shim"
+	"github.com/wighawag/anonctl/internal/systemd"
 )
 
 // icmpProbeTarget is the off-box address the icmp-drop probe pings AS the anon
@@ -143,6 +145,23 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 				return Assertion{Name: AssertAnonymizedExit, Err: eerr}
 			}
 			return AnonymizedExitAssertion(hostIP, exitIP, ev, p.Class, p.SkipTorExitCheck)
+		}},
+		{Name: AssertUnitBinariesPresent, Run: func(ctx context.Context) Assertion {
+			// Reads the unit FILES rather than asking systemd, so it sees what will be
+			// loaded at the NEXT boot rather than what the running generation happens to
+			// have. That is the whole point: the failure this catches is invisible until
+			// something restarts.
+			baked, err := systemd.DefaultStore().BakedBinaries()
+			if err != nil {
+				return Assertion{Name: AssertUnitBinariesPresent, Err: err}
+			}
+			var missing []string
+			for _, p := range baked {
+				if _, serr := os.Stat(p); serr != nil {
+					missing = append(missing, p)
+				}
+			}
+			return UnitBinariesPresentAssertion(baked, missing)
 		}},
 		{Name: AssertDNSRemote, Exclusive: true, Run: func(ctx context.Context) Assertion {
 			// MEASURED, not inferred. The old evidence here was a successful forced FETCH of a

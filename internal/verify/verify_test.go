@@ -1066,3 +1066,49 @@ func TestRunWithRunsExclusiveChecksFirstAndAlone(t *testing.T) {
 		t.Errorf("all checks passed, so the report must be green: %+v", rep)
 	}
 }
+
+// THE FAILURE THAT PASSED VERIFY TWICE. anonctl bakes absolute binary paths into
+// its units (a unit has no useful inherited $PATH) and, until this, wrote them
+// ONLY at install time. Moving the binaries therefore left the units naming a path
+// that was gone: the unit fails at its NEXT start with 203/EXEC, and nothing looks
+// wrong before that, because the running shim holds its open inode and verify
+// resolves its own probe binary independently. Measured on a live host while
+// migrating from a hand-installed /usr/local/bin to a packaged one, which is the
+// migration anonctl's own NixOS guide recommends.
+func TestUnitBinariesPresentAssertion(t *testing.T) {
+	baked := []string{"/run/current-system/sw/bin/setpriv", "/usr/local/bin/anonctl-shim", "/bin/sh"}
+
+	ok := UnitBinariesPresentAssertion(baked, nil)
+	if !ok.Ok {
+		t.Fatalf("all paths present must PASS; got %+v", ok)
+	}
+	if ok.Name != "unit-binaries-present" {
+		t.Errorf("assertion name = %q", ok.Name)
+	}
+
+	gone := UnitBinariesPresentAssertion(baked, []string{"/usr/local/bin/anonctl-shim"})
+	if gone.Ok {
+		t.Fatalf("a unit naming a missing binary must FAIL; got %+v", gone)
+	}
+	if !strings.Contains(gone.Detail, "/usr/local/bin/anonctl-shim") {
+		t.Errorf("the detail must name the missing path; got %q", gone.Detail)
+	}
+	// It must say WHY nothing looks wrong yet, or the operator will read the failure
+	// as spurious precisely because everything is currently working.
+	if !strings.Contains(gone.Detail, "203/EXEC") || !strings.Contains(gone.Detail, "open inode") {
+		t.Errorf("the detail must explain the deferred failure; got %q", gone.Detail)
+	}
+	if !strings.Contains(gone.Detail, "anonctl update") {
+		t.Errorf("the detail must give the remedy; got %q", gone.Detail)
+	}
+
+	// NOTHING CHECKED IS NOT A PASS, the same rule the report applies to an empty
+	// assertion set: an unreadable unit dir must not read as a clean bill of health.
+	empty := UnitBinariesPresentAssertion(nil, nil)
+	if empty.Ok {
+		t.Fatalf("no readable unit must FAIL, never pass vacuously; got %+v", empty)
+	}
+	if !strings.Contains(empty.Detail, "NOT checked") {
+		t.Errorf("the detail must say nothing was checked; got %q", empty.Detail)
+	}
+}

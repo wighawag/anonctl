@@ -506,3 +506,55 @@ func validAccount(account string) error {
 	}
 	return nil
 }
+
+// BakedBinaries returns the absolute BINARY paths the installed units name, so a
+// caller can check they still exist.
+//
+// WHY THIS IS WORTH A FUNCTION. Both units bake absolute paths at install time
+// (a unit has no useful inherited $PATH), and they are written ONLY by the install
+// path. So when a binary MOVES, nothing re-bakes them: the unit keeps naming a
+// path that is gone, and it fails at the next start with 203/EXEC while everything
+// looks healthy in the meantime, because a running shim still holds its open
+// inode. Two ways that happens in practice, both real:
+//
+//   - migrating from a hand-installed /usr/local/bin to a packaged binary, which
+//     anonctl's own NixOS guide now recommends (measured on telemaque: `verify`
+//     passed twice over a template unit naming a deleted shim);
+//   - a `/nix/store` path that a later garbage collection removes, which is the
+//     hazard the resolver's preferStableAlias exists to avoid but cannot prevent
+//     if the operator installed from a store path directly.
+//
+// It reads the files rather than asking systemd, so it sees what will be loaded at
+// the NEXT boot rather than what the running generation happens to have. Paths
+// containing a `$` (env-var interpolation) and the rule-file glob are skipped: they
+// are not binaries. A missing unit file is not an error here (an account may not be
+// installed yet); the caller decides what an empty result means.
+func (s Store) BakedBinaries() ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	for _, unit := range []string{filepath.Join(s.unitDir(), UnitName), filepath.Join(s.unitDir(), LoaderUnitName)} {
+		body, err := os.ReadFile(unit)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("systemd: read unit %s: %w", unit, err)
+		}
+		for _, line := range strings.Split(string(body), "\n") {
+			if !strings.HasPrefix(strings.TrimSpace(line), "ExecStart=") && !strings.HasPrefix(line, "    /") {
+				continue
+			}
+			for _, tok := range strings.Fields(strings.TrimPrefix(strings.TrimSpace(line), "ExecStart=")) {
+				tok = strings.Trim(tok, "'\"\\;")
+				if !strings.HasPrefix(tok, "/") || strings.Contains(tok, "$") || strings.Contains(tok, "*") {
+					continue
+				}
+				if !seen[tok] {
+					seen[tok] = true
+					out = append(out, tok)
+				}
+			}
+		}
+	}
+	return out, nil
+}

@@ -3,6 +3,7 @@ package forcing_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/wighawag/anoncore/endpoint"
 	"github.com/wighawag/anonctl/internal/forcing"
 	"github.com/wighawag/anonctl/internal/systemd"
+	"time"
 )
 
 // event is one recorded system mutation, in the order it happened, so a test can
@@ -37,12 +39,39 @@ func (f fakeNft) Run(_ context.Context, stdin, name string, args ...string) (str
 }
 
 // fakeSystemctl records systemctl calls in order.
-type fakeSystemctl struct{ ev *[]event }
+// fakeSystemctl models the systemctl surface these paths use. It MUST answer
+// `is-active`, because Install/Reconfigure now confirm the shim genuinely came up
+// rather than trusting the restart job's exit code: a unit with
+// `Restart=on-failure` reports a SUCCESSFUL restart while merely retrying a start
+// that failed (measured with a throwaway user unit), which is how `update` once
+// printed "re-applied fail-closed, no leak window" over a shim that never started.
+// `activeReply` lets a test drive the unhappy side.
+type fakeSystemctl struct {
+	ev          *[]event
+	activeReply string
+}
 
 func (f fakeSystemctl) Run(_ context.Context, name string, args ...string) (string, string, error) {
 	*f.ev = append(*f.ev, event{"systemctl", strings.Join(args, " ")})
+	if len(args) > 0 && args[0] == "is-active" {
+		reply := f.activeReply
+		if reply == "" {
+			reply = "active"
+		}
+		if reply != "active" {
+			// systemctl exits non-zero for a unit that is not active; the caller reads the
+			// STATE from stdout rather than the code, so both are modelled.
+			return reply + "\n", "", &exitError{code: 3}
+		}
+		return reply + "\n", "", nil
+	}
 	return "", "", nil
 }
+
+// exitError is a stand-in for exec's non-zero exit.
+type exitError struct{ code int }
+
+func (e *exitError) Error() string { return fmt.Sprintf("exit status %d", e.code) }
 
 // fakeResolver resolves the unit binaries to fixed absolute paths WITHOUT touching
 // the host's $PATH, so the orchestration tests neither depend on setpriv/nft being
@@ -62,7 +91,7 @@ func testDeps(t *testing.T) (forcing.Deps, *[]event) {
 	var ev []event
 	d := forcing.Deps{
 		NftRunner:     fakeNft{&ev},
-		SystemdRunner: fakeSystemctl{&ev},
+		SystemdRunner: fakeSystemctl{ev: &ev},
 		ConfigStore:   accountconfig.Store{BaseDir: filepath.Join(root, "cfg")},
 		SystemdStore: systemd.Store{
 			UnitDir:  filepath.Join(root, "systemd"),
@@ -491,4 +520,57 @@ func readEnv(d forcing.Deps, account string) (string, error) {
 	path := filepath.Join(d.SystemdStore.EnvDir, account+".env")
 	b, err := os.ReadFile(path)
 	return string(b), err
+}
+
+// THE FAILURE THAT REPORTED SUCCESS. `systemctl restart` exits 0 for a unit that
+// merely entered its `Restart=on-failure` backoff, so the exit code says the job
+// was accepted, NOT that the service came up. Measured with a throwaway user unit:
+// a 203/EXEC start exits 1 without that directive and 0 with it, leaving the unit
+// `activating` rather than `failed`. On a live host that produced `update`
+// printing "re-applied fail-closed, no leak window" over a shim that never
+// started, which cost the account its forced DNS until the next verify caught it.
+//
+// So both paths now CONFIRM the unit is active, and must fail loudly when it never
+// is, naming what to look at.
+func TestReconfigureFailsWhenTheShimNeverBecomesActive(t *testing.T) {
+	d, _ := testDeps(t)
+	var ev []event
+	d.SystemdRunner = fakeSystemctl{ev: &ev, activeReply: "activating"}
+	forcing.SetShimStartTimeoutForTest(300 * time.Millisecond)
+
+	err := forcing.Reconfigure(context.Background(), d, sampleConfig(), nil)
+	if err == nil {
+		t.Fatalf("a shim that never becomes active must FAIL the reconfigure, not report success")
+	}
+	for _, want := range []string{"did not become active", "203/EXEC", "systemctl status"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error must mention %q so the operator knows where to look; got %v", want, err)
+		}
+	}
+	// And it must actually have asked, rather than assuming.
+	if firstIndexOf(ev, "systemctl", "is-active") < 0 {
+		t.Errorf("the reconfigure must CHECK is-active; calls were %+v", ev)
+	}
+}
+
+// The happy path must not regress into waiting: an active unit resolves on the
+// first poll.
+func TestReconfigureAcceptsAnActiveShimImmediately(t *testing.T) {
+	d, ev := testDeps(t)
+	forcing.SetShimStartTimeoutForTest(10 * time.Second)
+	start := time.Now()
+	if err := forcing.Reconfigure(context.Background(), d, sampleConfig(), nil); err != nil {
+		t.Fatalf("Reconfigure on a healthy host: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("an active shim must resolve immediately; took %v", elapsed)
+	}
+	if firstIndexOf(*ev, "systemctl", "daemon-reload") < 0 {
+		t.Errorf("the reconfigure must daemon-reload before restarting, or the restart runs the STALE unit; calls were %+v", *ev)
+	}
+	reload := firstIndexOf(*ev, "systemctl", "daemon-reload")
+	restart := firstIndexOf(*ev, "systemctl", "restart")
+	if reload > restart {
+		t.Errorf("daemon-reload must come BEFORE restart (reload@%d, restart@%d): restarting first runs the unit systemd still has in memory", reload, restart)
+	}
 }

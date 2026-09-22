@@ -44,6 +44,7 @@ import (
 	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anonctl/internal/nftables"
 	"github.com/wighawag/anonctl/internal/systemd"
+	"time"
 )
 
 // Deps bundles the seams the orchestration mutates through, so a caller (main)
@@ -75,6 +76,13 @@ type Deps struct {
 // DROP) are applied BEFORE the shim is enabled, so from the first moment the anon
 // UID exists-under-forcing its egress is dropped-or-redirected, never direct. If
 // the shim is not yet up, egress is DROPPED (fail-closed), never leaked.
+// shimStartTimeout is how long `add`/`update` wait for the shim to be genuinely
+// ACTIVE before giving up. Generous next to a Type=simple unit that is active as
+// soon as its exec succeeds, and deliberately longer than the unit's RestartSec
+// (2s) so a single transient retry still resolves inside it rather than being
+// reported as a failure.
+var shimStartTimeout = 10 * time.Second
+
 func Install(ctx context.Context, d Deps, c accountconfig.Config, exemptions []lanexempt.Exempt) error {
 	c = normalize(c)
 	// RESOLVE BEFORE MUTATING ANYTHING. The three binaries the generated units name
@@ -155,6 +163,11 @@ func Install(ctx context.Context, d Deps, c accountconfig.Config, exemptions []l
 	if err := systemd.StartNow(ctx, d.SystemdRunner, c.Account); err != nil {
 		return err
 	}
+	// Same reason as the reconfigure path: a start that is merely RETRYING reports
+	// success, so `add` would otherwise finish green over a shim that never came up.
+	if err := systemd.WaitUntilActive(ctx, d.SystemdRunner, c.Account, shimStartTimeout); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -167,13 +180,20 @@ func Install(ctx context.Context, d Deps, c accountconfig.Config, exemptions []l
 // reconfigure (story 21).
 func Reconfigure(ctx context.Context, d Deps, c accountconfig.Config, exemptions []lanexempt.Exempt) error {
 	c = normalize(c)
+	// Resolve the unit binaries BEFORE mutating anything, exactly as Install does: a
+	// reconfigure that cannot name the shim must fail while the old, working units are
+	// still in place, not half way through.
+	tp, lp, err := systemd.ResolveUnitParams(d.Resolver)
+	if err != nil {
+		return err
+	}
 	if err := d.ConfigStore.Write(c); err != nil {
 		return fmt.Errorf("forcing: rewrite account config: %w", err)
 	}
 
-	ruleset, err := nftables.Generate(nftParams(c, exemptions))
-	if err != nil {
-		return fmt.Errorf("forcing: generate ruleset: %w", err)
+	ruleset, gerr := nftables.Generate(nftParams(c, exemptions))
+	if gerr != nil {
+		return fmt.Errorf("forcing: generate ruleset: %w", gerr)
 	}
 	// Re-apply the rules FIRST (atomic table replace: the default-DROP is never
 	// gone), so the new endpoint's closure (b) is in force before the shim is
@@ -192,12 +212,45 @@ func Reconfigure(ctx context.Context, d Deps, c accountconfig.Config, exemptions
 	if err := d.SystemdStore.WriteAccount(c, ruleset); err != nil {
 		return fmt.Errorf("forcing: re-persist per-account systemd files: %w", err)
 	}
+	// RE-RESOLVE AND REWRITE THE SHARED UNITS TOO, which this verb did not used to do.
+	//
+	// The @-template's ExecStart and the loader's `nft` path are baked ABSOLUTE at
+	// install time, and only `add` wrote them. So when the binaries MOVE, nothing
+	// re-bakes them and the units keep naming a path that no longer exists: the unit
+	// fails at the next start with 203/EXEC, and until then everything looks healthy
+	// because the RUNNING shim still holds its open inode.
+	//
+	// That is not hypothetical, and it is a migration anonctl itself now recommends:
+	// moving from a hand-installed /usr/local/bin to a packaged binary (docs/nixos.md)
+	// leaves exactly this state, and `verify` passed twice over it because the running
+	// shim was fine and verify resolves its own probe binary independently. Measured
+	// on telemaque.
+	//
+	// Re-resolving here also costs nothing when nothing moved (the same paths are
+	// written back), and it fails LOUD if a binary cannot be resolved at all, which is
+	// the same guard `add` applies before it touches the box.
+	if err := d.SystemdStore.InstallCommon(tp, lp); err != nil {
+		return fmt.Errorf("forcing: rewrite the shared unit files: %w", err)
+	}
+	// RELOAD BEFORE RESTARTING, or the restart runs the unit systemd still has in
+	// memory rather than the one just written. That is not a cosmetic ordering point:
+	// measured on a live host, rewriting the template to fix a stale binary path and
+	// then restarting WITHOUT a reload restarted the STALE unit, which still named the
+	// deleted binary, so the shim failed 203/EXEC and the account lost its forced DNS
+	// entirely (fail-closed, so not a leak, but broken). Install already reloads after
+	// writing its units for the same reason; this path was missing it.
+	if err := systemd.DaemonReload(ctx, d.SystemdRunner); err != nil {
+		return err
+	}
 	// Restart the shim to pick up the rewritten env file (the new endpoint). The
 	// still-applied fail-closed rules cover the brief bounce, so no leak window.
 	if err := systemd.RestartNow(ctx, d.SystemdRunner, c.Account); err != nil {
 		return err
 	}
-	return nil
+	// AND CONFIRM IT ACTUALLY CAME UP. `systemctl restart` exits 0 for a unit that
+	// merely entered its Restart=on-failure backoff, so the exit code proves the job
+	// was accepted and nothing more (measured; see WaitUntilActive).
+	return systemd.WaitUntilActive(ctx, d.SystemdRunner, c.Account, shimStartTimeout)
 }
 
 // Remove turns off forcing for an account: it disables --now the shim instance,

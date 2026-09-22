@@ -137,6 +137,17 @@ const (
 	// explicitly NOT exhaustive: verify cannot enumerate every daemon on every host,
 	// so it proves only that the CHECKED vectors do not escape, never total absence.
 	AssertNoUIDTransitionEgress = "no-uid-transition-egress"
+	// AssertUnitBinariesPresent: every absolute binary path BAKED into anonctl's
+	// installed units still exists. A unit has no useful inherited $PATH, so those
+	// paths are absolute and are written only at install time; when a binary MOVES,
+	// nothing re-bakes them and the unit fails at the NEXT start (203/EXEC) while
+	// everything looks healthy in the meantime, because a running shim still holds
+	// its open inode. Measured: migrating from a hand-installed /usr/local/bin to a
+	// packaged binary left the template naming a deleted shim, and verify passed
+	// twice over it. For the SHIM that failure is fail-closed (the account is
+	// dropped); for the LOADER it is fail-OPEN, which is why this is an assertion
+	// rather than a warning.
+	AssertUnitBinariesPresent = "unit-binaries-present"
 	// AssertAccountIdentity: the account (and its shim) STILL EXISTS and still owns
 	// the UID anonctl's rules and records govern. It is the PRECONDITION every other
 	// assertion rests on, because every live probe keys on `meta skuid <uid>`: if the
@@ -587,6 +598,58 @@ func torSourceDetail(ev TorExitEvidence) string {
 // evidence type all three read. The version that stood here decided from
 // "proxyResolved" plus a "hostResolverSaw" flag that the live probe HARDCODED to
 // false, so on a real host the decision was sound and the evidence was fiction.
+
+// UnitBinariesPresentAssertion is the PURE decision for unit-binaries-present:
+// given the absolute paths the installed units name and the subset that could not
+// be found, it passes IFF nothing is missing. An EMPTY path list is a FAILURE, not
+// a pass: it means no unit was readable, and "nothing was checked" must never read
+// as "everything is fine" (the same rule the report applies to an empty assertion
+// set).
+func UnitBinariesPresentAssertion(baked, missing []string) Assertion {
+	a := Assertion{Name: AssertUnitBinariesPresent}
+	volatile := volatileBakedPaths(baked)
+	switch {
+	case len(baked) == 0:
+		a.Detail = "no anonctl unit could be read, so the paths they bake were NOT checked: the units are missing, or this is not the unit dir anonctl installed into"
+	case len(missing) > 0:
+		a.Detail = fmt.Sprintf("the installed units name %d binaries; %s no longer exist(s). The unit will fail at its next start (203/EXEC) even though a running instance looks healthy, because it holds an open inode. Re-run `anonctl update <account> --endpoint <endpoint>` to re-resolve and re-bake the unit paths",
+			len(baked), strings.Join(missing, ", "))
+	case len(volatile) > 0:
+		// PRESENT BUT DOOMED. A path under /tmp (or another cleaned-at-boot location)
+		// satisfies "the file exists" today and will not survive the next boot, which is
+		// precisely when the unit is next started, so it fails 203/EXEC exactly when
+		// nobody is watching. Measured: running `update` from a binary in /tmp baked
+		// that /tmp path into the unit, and the plain existence check passed it.
+		a.Detail = fmt.Sprintf("the installed units name %s, which is in a directory that is cleaned at boot: the file exists now and will be gone when the unit is next started. Re-run `anonctl update <account> --endpoint <endpoint>` from a DURABLE copy of the binaries (a package, or an install into a system prefix), not from a build directory",
+			strings.Join(volatile, ", "))
+	default:
+		a.Ok = true
+		a.Detail = fmt.Sprintf("all %d binaries baked into anonctl's units still exist and live in durable locations (%s)", len(baked), strings.Join(baked, ", "))
+	}
+	return a
+}
+
+// volatileBakedPaths returns the baked paths that live where the system deletes
+// files, so "it exists" is true now and false at the next boot.
+//
+// /run is deliberately NOT in the list even though it is a tmpfs: on NixOS the
+// canonical, RECOMMENDED location is `/run/current-system/sw/bin`, which the
+// activation recreates on every boot and which anonctl's resolver prefers exactly
+// because it is stable across rebuilds where a /nix/store path is not. Flagging it
+// would condemn the correct configuration. /run/user is a different matter (a
+// per-session dir), so it is listed.
+func volatileBakedPaths(baked []string) []string {
+	var out []string
+	for _, p := range baked {
+		for _, prefix := range []string{"/tmp/", "/var/tmp/", "/dev/shm/", "/run/user/"} {
+			if strings.HasPrefix(p, prefix) {
+				out = append(out, p)
+				break
+			}
+		}
+	}
+	return out
+}
 
 // AccountIdentity is what the account-identity precondition is decided from: what
 // the BOX says right now (Exists/ShimExists + the live UIDs, read from the passwd
