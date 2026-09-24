@@ -56,6 +56,17 @@ type Store struct {
 	// EnvDir is at its default (production), and NO root when it has been repointed at
 	// a scratch dir, so a test can never make this package chmod a scratch dir's parent.
 	RootDir string
+	// HostOwnedMarker is the marker file whose presence hands ownership of the two
+	// SHARED unit files to the host (see hostowned.go). Empty derives it from the
+	// config root, which yields NO marker for a store repointed at scratch dirs, so a
+	// unit test can never read the host's real marker by accident; a test that wants
+	// the mode names the file explicitly.
+	HostOwnedMarker string
+	// SearchDirs overrides the directories a unit file is looked up in, in systemd's
+	// precedence order (highest first). Empty uses the real ones. Behind a field so the
+	// host-owned lookups (is the host's unit really there? is anonctl's copy being
+	// shadowed?) are testable against scratch dirs instead of the host's real /etc.
+	SearchDirs []string
 }
 
 // UnitDirEnv lets an operator repoint the unit dir on a host whose layout does not
@@ -98,7 +109,7 @@ func DefaultStore() Store {
 			}
 		}
 	}
-	return Store{UnitDir: unitDir, EnvDir: DefaultEnvDir, RulesDir: DefaultRulesDir, LegacyUnitDir: LegacyUnitDir, RootDir: configroot.DefaultDir}
+	return Store{UnitDir: unitDir, EnvDir: DefaultEnvDir, RulesDir: DefaultRulesDir, LegacyUnitDir: LegacyUnitDir, RootDir: configroot.DefaultDir, HostOwnedMarker: DefaultHostOwnedUnitsMarker}
 }
 
 // isKnownUnitSearchDir reports whether dir is one of systemd's standard system unit
@@ -144,7 +155,27 @@ func orDefault(v, def string) string {
 // own files) and touches ONLY anonctl's files, never the host's nftables.service or
 // its /etc/nftables.conf. The RulesGlob in the loader is pinned to this Store's
 // rules dir so the generated loader and the actual rule-file writes agree.
+//
+// It writes NOTHING when the host owns the units (hostowned.go), and the check
+// lives HERE, in the mechanism, rather than only in the orchestration that calls
+// it: "anonctl must not write this file" is a property of the file, so the function
+// that writes it is where a future caller cannot forget it. It returns BEFORE
+// generating, because in that mode the caller is not required to have resolved the
+// binary paths at all: the host's units name the host's own paths, so demanding a
+// local `setpriv` or a local shim binary would refuse a correctly configured host
+// for the sake of text that is thrown away.
 func (s Store) InstallCommon(tp TemplateParams, lp LoaderParams) error {
+	own, err := s.UnitOwnership()
+	if err != nil {
+		return err
+	}
+	if own.HostOwned {
+		// The host declares these two files; anonctl's copy would be a SECOND definition of
+		// the same unit, and the higher-precedence one wins silently (measured). The
+		// per-account enablement symlinks are still anonctl's and are still written, by the
+		// caller, into this same dir.
+		return nil
+	}
 	if tp.EnvDir == "" {
 		tp.EnvDir = s.envDir()
 	}
@@ -276,6 +307,23 @@ func (s Store) IsUnitEnabled(unitFile, linkName, target string) (bool, error) {
 // If anonctl files ARE present but cannot be removed, it fails LOUDLY rather than
 // leaving a shadowing copy behind.
 func (s Store) MigrateLegacyUnits() ([]string, error) {
+	// NOT WHEN THE HOST OWNS THE UNITS. The legacy dir IS /etc/systemd/system, which is
+	// precisely where a declarative host puts the units it declares (NixOS's
+	// `systemd.units` renders there, as a symlink into the store). In that mode anonctl
+	// cannot tell pre-0.4 residue from the host's own declaration by path, and the two
+	// errors are not symmetric: leaving residue means a stale file that the host's copy
+	// outranks anyway, while deleting a declaration means the unit is GONE at the next
+	// boot -- no early loader, so no standing default-deny, so the anon UID egresses
+	// freely with the host's real IP until someone rebuilds. Skipping is the only safe
+	// direction, and shadowing is instead REPORTED (ShadowedUnits) rather than resolved
+	// by deletion.
+	own, err := s.UnitOwnership()
+	if err != nil {
+		return nil, err
+	}
+	if own.HostOwned {
+		return nil, nil
+	}
 	legacy := s.legacyDir()
 	same, err := sameDir(legacy, s.unitDir())
 	if err != nil {
@@ -375,17 +423,31 @@ func sameDir(a, b string) (bool, error) {
 // ONLY when they are empty (os.Remove refuses a non-empty dir), so it can never
 // rip out a survivor account's files even if called out of turn.
 func (s Store) RemoveCommon() error {
+	own, err := s.UnitOwnership()
+	if err != nil {
+		return err
+	}
 	// Drop the loader's enablement symlink before its unit file, so a torn-down host
-	// never keeps a .wants symlink pointing at a unit that no longer exists.
+	// never keeps a .wants symlink pointing at a unit that no longer exists. The
+	// symlinks are anonctl's in EVERY mode, so this half is unconditional.
 	if err := s.DisableUnit(LoaderUnitName, LoaderWantedBy); err != nil {
 		return err
 	}
-	for _, path := range []string{
-		filepath.Join(s.unitDir(), UnitName),
-		filepath.Join(s.unitDir(), LoaderUnitName),
-	} {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("systemd: remove %q: %w", path, err)
+	// THE UNIT FILES ARE REMOVED ONLY IF ANONCTL WROTE THEM. This is the one place where
+	// tidying up a torn-down host would otherwise break a machine's DECLARED
+	// configuration: on a host that owns the units, these paths may hold the host's own
+	// files (nothing stops a host declaring them straight into anonctl's unit dir), and
+	// removing the last account is not consent to delete a declaration. The deletion
+	// would also be invisible until the next rebuild put the file back, or until the
+	// next boot did not.
+	if !own.HostOwned {
+		for _, path := range []string{
+			filepath.Join(s.unitDir(), UnitName),
+			filepath.Join(s.unitDir(), LoaderUnitName),
+		} {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("systemd: remove %q: %w", path, err)
+			}
 		}
 	}
 	// The shim's `.wants` dir is removed too, but only when empty (DisableUnit's own
@@ -556,10 +618,36 @@ func validAccount(account string) error {
 // containing a `$` (env-var interpolation) and the rule-file glob are skipped: they
 // are not binaries. A missing unit file is not an error here (an account may not be
 // installed yet); the caller decides what an empty result means.
+//
+// WHEN THE HOST OWNS THE UNITS it reads the files systemd would LOAD (resolved
+// through the search path) instead of this store's unit dir, which holds no unit
+// files in that mode. Without that, the check would find nothing and
+// `unit-binaries-present` would report "no anonctl unit could be read" on a host
+// that is correctly configured -- and, worse, would stop checking the binaries that
+// the host's units actually name, which is exactly where a garbage-collected or
+// moved path would show up.
 func (s Store) BakedBinaries() ([]string, error) {
+	own, err := s.UnitOwnership()
+	if err != nil {
+		return nil, err
+	}
+	units := make([]string, 0, 2)
+	for _, name := range SharedUnitNames() {
+		if !own.HostOwned {
+			units = append(units, filepath.Join(s.unitDir(), name))
+			continue
+		}
+		path, ferr := s.FindUnitFile(name)
+		if ferr != nil {
+			return nil, ferr
+		}
+		if path != "" {
+			units = append(units, path)
+		}
+	}
 	var out []string
 	seen := map[string]bool{}
-	for _, unit := range []string{filepath.Join(s.unitDir(), UnitName), filepath.Join(s.unitDir(), LoaderUnitName)} {
+	for _, unit := range units {
 		body, err := os.ReadFile(unit)
 		if err != nil {
 			if os.IsNotExist(err) {

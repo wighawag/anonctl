@@ -13,6 +13,7 @@ Read section 1 before you run anything. On this distro the default configuration
 - [5. NixOS-specific operational gotchas](#5-nixos-specific-operational-gotchas)
 - [6. nsncd resolves your account's names for it, and `add` refuses until you deal with it](#6-nsncd-resolves-your-accounts-names-for-it-and-add-refuses-until-you-deal-with-it)
 - [7. Verify it actually worked on this host](#7-verify-it-actually-worked-on-this-host)
+- [8. Declaring anonctl's units in your configuration](#8-declaring-anonctls-units-in-your-configuration)
 
 ## 1. Read this first: `users.mutableUsers = false` deletes anonctl's accounts
 
@@ -386,10 +387,135 @@ You want `anonctl-nftables.service` under `sysinit.target` and `anonctl-shim@ano
 
 This is the only test that exercises what section 1 is about, because the deletion happens during activation at boot. A configuration that survives `nixos-rebuild switch` will usually survive a reboot too, but "usually" is not the standard anonctl holds itself to, and the failure it is guarding against is silent.
 
+## 8. Declaring anonctl's units in your configuration
+
+Everything up to here still leaves one piece of your machine undeclared. You declared the accounts, you pinned their uids, and (if you followed [section 5](#usrlocalbin-is-not-on-path-here-so-the-installers-default-is-invisible)) you packaged the binaries. But `anonctl add` writes two unit files into `/usr/local/lib/systemd/system`, and **nothing in your configuration knows they exist**: no rebuild reproduces them, no rollback undoes them, and a reinstall of the machine restores the declared accounts and the declared binary while leaving the accounts with nothing that installs their forcing at boot.
+
+From 0.9.0 you can declare those two files yourself, from text anonctl emits, and tell anonctl to stop writing its own copy.
+
+Do this only if you actually want it. On a host that says nothing, everything behaves exactly as it does today, and that is a perfectly good way to run anonctl. What you gain is that the units roll forward and back with the rest of the system; what you take on is that a unit anonctl can no longer repair is now yours to keep correct.
+
+### What you may declare, and what you must not
+
+| artifact | owner | why |
+| --- | --- | --- |
+| `anonctl-shim@.service` (the `@`-template) | **you may** | account-agnostic: the account is the `%i` instance and every per-account value arrives through an `EnvironmentFile` |
+| `anonctl-nftables.service` (the early loader) | **you may** | account-agnostic: it globs a directory of rule files |
+| `multi-user.target.wants/anonctl-shim@<account>.service` | **anonctl, always** | its NAME says which slot is in use |
+| `/etc/anonctl/shim/<account>.env`, `/etc/anonctl/nftables/*.nft` | **anonctl, always** | per-account state, and the env file carries the endpoint |
+
+The third row is the one that matters, and it is not negotiable. [Section 4](#4-choosing-an-account-name-is-a-privacy-decision) asks you to declare a POOL of opaque slots in a single commit, so your configuration repository reveals a slot COUNT and nothing else. A per-account `.wants` entry in that same repository would reveal which slots are live, when each became live, and in what order, which is exactly the timeline the pool exists to withhold. anonctl therefore keeps those symlinks, in `/usr/local/lib/systemd/system`, which is writable here and survives a reboot. They are not exported and there is no flag to export them.
+
+### Step 1: declare the two units
+
+Both shapes below produce **byte-identical** text, which is enforced by test rather than by care: the emitter is the same function `anonctl add` installs through, so the file you declare cannot drift from the definition anonctl believes it installed.
+
+The data-file shape, if your package installs `share/anonctl/units` (no build-time execution, works when cross-compiling):
+
+```nix
+{ config, pkgs, lib, ... }:
+
+let
+  anonctl = pkgs.anonctl; # your packaged anonctl, the same one in environment.systemPackages
+  unit = name: subs:
+    builtins.replaceStrings (builtins.attrNames subs) (builtins.attrValues subs)
+      (builtins.readFile "${anonctl}/share/anonctl/units/${name}.in");
+in {
+  systemd.units."anonctl-shim@.service".text = unit "anonctl-shim@.service" {
+    "@setpriv@" = "${pkgs.util-linux}/bin/setpriv";
+    "@shim@" = "${anonctl}/bin/anonctl-shim";
+    "@envDir@" = "/etc/anonctl/shim";
+  };
+
+  systemd.units."anonctl-nftables.service".text = unit "anonctl-nftables.service" {
+    "@nft@" = "${pkgs.nftables}/bin/nft";
+    "@rulesDir@" = "/etc/anonctl/nftables";
+  };
+}
+```
+
+The emitter shape, if you would rather generate the text in a derivation:
+
+```nix
+systemd.units."anonctl-nftables.service".text = builtins.readFile (pkgs.runCommand "anonctl-nftables.service" { } ''
+  ${anonctl}/bin/anonctl units print --kind nftables \
+    --nft ${pkgs.nftables}/bin/nft \
+    --rules-dir /etc/anonctl/nftables > $out
+'');
+```
+
+`anonctl units print` needs no root, reads nothing, probes nothing and resolves nothing against `$PATH`: it is a pure function of its flags, so the derivation is reproducible. Every path is a flag and a missing one is an error rather than a default, because a unit naming a path that merely looks plausible fails `203/EXEC` at the next boot, long after the command that wrote it succeeded.
+
+**Three of those values are not free, and `anonctl add` will refuse if you get them wrong.** `--env-dir` must be `/etc/anonctl/shim` and `--rules-dir` must be `/etc/anonctl/nftables`, because those are where anonctl writes the per-account `EnvironmentFile`s and the persisted `.nft` files. And every binary path must be **absolute**: a systemd unit inherits no useful `$PATH`, so `--nft nft` is not resolved at boot, it is exit 127.
+
+Both mistakes have the same shape and it is the worst one available. A loader that globs a directory anonctl does not write to, or that cannot run `nft` at all, loads **nothing** at boot: no forcing, and no standing baseline default-deny, so the account egresses with your real IP. It is completely silent, because the live rules are correct while the machine is up and the loader is not started until the boot it is supposed to protect. anonctl therefore refuses a relative path when it **emits** the text, compares all three values against its own before it will touch the box, and re-checks them on every `anonctl verify` (your configuration can change without anonctl ever running, so the install-time check is not the last word).
+
+> **Both snippets above use import-from-derivation.** `builtins.readFile` on a path inside a package forces that package to be BUILT during evaluation. That is fine under `nixos-rebuild` (IFD is enabled by default) and fails under restricted evaluation (`nix flake check`, Hydra with `allow-import-from-derivation = false`). If that applies to you, substitute at build time and hand the result to `systemd.packages` instead, which never reads the text at eval time:
+>
+> ```nix
+> systemd.packages = [
+>   (pkgs.runCommand "anonctl-units" { } ''
+>     mkdir -p $out/lib/systemd/system
+>     substitute ${anonctl}/share/anonctl/units/anonctl-nftables.service.in \
+>       $out/lib/systemd/system/anonctl-nftables.service \
+>       --replace-fail '@nft@' ${pkgs.nftables}/bin/nft \
+>       --replace-fail '@rulesDir@' /etc/anonctl/nftables
+>     substitute ${anonctl}/share/anonctl/units/'anonctl-shim@.service.in' \
+>       $out/lib/systemd/system/'anonctl-shim@.service' \
+>       --replace-fail '@setpriv@' ${pkgs.util-linux}/bin/setpriv \
+>       --replace-fail '@shim@' ${anonctl}/bin/anonctl-shim \
+>       --replace-fail '@envDir@' /etc/anonctl/shim
+>   '')
+> ];
+> ```
+>
+> NixOS symlinks units from `$out/lib/systemd/system` into `/etc/systemd/system`, and it deliberately skips `.wants` directories, so this shape cannot smuggle in an enablement either. `--replace-fail` makes a token you forgot a BUILD error rather than a unit that ships with `@rulesDir@` still in it. (anonctl refuses a surviving placeholder too, but failing at build time is better than failing at `add` time.)
+
+**Do not set `wantedBy` on either unit.** Enablement stays anonctl's: it writes `multi-user.target.wants/anonctl-shim@<account>.service` and `sysinit.target.wants/anonctl-nftables.service` into its own unit dir when you `add` an account. Those symlinks point at a path in `/usr/local/lib/systemd/system` that now holds no file, and that is FINE: systemd resolves a `.wants` entry by unit NAME and loads the fragment from wherever the search path finds it. Measured on systemd 260 here, with the unit declared in the higher-precedence directory and the dangling symlink in the lower one: `Wants=` is present, `LoadState=loaded`, `FragmentPath` points at the declared file, and starting the target starts the instance.
+
+### Step 2: hand ownership over
+
+```nix
+environment.etc."anonctl/units.host-owned".text = ''
+  The two shared anonctl unit files are declared by this host's configuration
+  (modules/anonctl.nix). anonctl must not write, rewrite or delete them.
+'';
+```
+
+The presence of the file is the whole signal; anonctl ignores the content, so use it to tell the next person which module to look in. With it in place:
+
+- **`add` and `update` write neither unit file.** They still write everything else: the per-account env file, the rule files, the enablement symlinks, and the live nft rules.
+- **`add` refuses, before creating or adopting anything, if the units are not actually there** or if a binary they name does not exist. The marker without the units would otherwise be the worst outcome available: an account that exists, is enabled, and at the next boot loads neither its shim nor the early loader, which means no standing default-deny and free egress with your real IP.
+- **`rm` never deletes them**, including the last-account teardown that removes the shared units on an ordinary host.
+- **The pre-0.4 sweep of `/etc/systemd/system` is skipped**, because that is where you just declared them and anonctl cannot tell your declaration from someone's leftovers.
+
+### Step 3: check it
+
+```sh
+# Exactly one definition of each, and it is yours.
+systemctl show anonctl-shim@anon-a.service -p FragmentPath -p LoadState
+systemctl show anonctl-nftables.service    -p FragmentPath -p LoadState
+ls -l /usr/local/lib/systemd/system/          # the two .service files must be ABSENT
+ls -l /usr/local/lib/systemd/system/*.wants/  # the enablement symlinks must be PRESENT
+```
+
+If `add` or `update` tells you a unit is defined in two places, you have both a declaration and a copy anonctl wrote before you set the marker. Delete anonctl's copy (the one in `/usr/local/lib/systemd/system`); anonctl will not delete it for you, because on a host that declares units the file it would be deleting might be the declaration.
+
+Then re-run [section 7](#7-verify-it-actually-worked-on-this-host) in full, including the reboot. `anonctl verify` keeps its `unit-binaries-present` assertion honest in this mode by reading the units systemd would LOAD rather than anonctl's own directory, so it is still checking the binaries that will actually be exec'd.
+
+### A `/nix/store` path in `ExecStart` is correct HERE, and only here
+
+[Section 5](#a-unit-execstart-must-never-bake-a-nixstore-path) says a store path in `ExecStart` is fail-open. That rule is about a path anonctl RESOLVES and bakes at install time: nothing tracks that reference, so the next garbage collection can remove the file and the unit dies weeks later with nothing in your configuration having changed.
+
+A path you DECLARE is the opposite case, and the difference is not a matter of taste. The unit text is itself a store file, and Nix computes its references by scanning it, so `${pkgs.nftables}/bin/nft` inside that text is a real dependency edge from your system closure (verified on this host: a declared unit's reference set contains the package its `ExecStart` names). It cannot be collected while the generation that names it exists, and it rolls back with everything else. That is strictly more coherent than the stable alias, because `/run/current-system/sw/bin/nft` is repointed by the next rebuild under a unit nobody edited, while a declared store path changes only when you change it.
+
+This is why `verify` does not flag store paths, and it should stay that way: the volatile-path check names `/tmp`, `/var/tmp`, `/dev/shm` and `/run/user`, all of which are emptied by the system, and a heuristic that added `/nix/store` would condemn the configuration this section recommends.
+
 ## Related reading
 
 - [`docs/adr/0010-add-gates-on-the-ledger-and-adopts-existing-accounts.md`](adr/0010-add-gates-on-the-ledger-and-adopts-existing-accounts.md): why `add` gates on anonctl's own record rather than the passwd table, what adoption does and does not touch, and why half a pair is refused rather than completed.
 - [`docs/adr/0003-verify-assertion-names-and-json-contract.md`](adr/0003-verify-assertion-names-and-json-contract.md): the `account-identity` precondition and the `--json` contract.
 - [`docs/adr/0011-dns-confinement-is-measured-and-nss-bypass-is-refused.md`](adr/0011-dns-confinement-is-measured-and-nss-bypass-is-refused.md): why nsncd defeats per-UID DNS forcing, why anonctl refuses rather than works around it, and why the DNS assertions measure instead of inferring.
 - [`docs/adr/0005-reboot-persistence-and-boot-invariant.md`](adr/0005-reboot-persistence-and-boot-invariant.md): the boot invariant and why a store path in `ExecStart` is fail-open.
+- [`docs/adr/0012-the-shared-units-are-exportable-and-the-host-may-own-them.md`](adr/0012-the-shared-units-are-exportable-and-the-host-may-own-them.md): why the two shared units are exportable and single-sourced, why the per-account enablement symlinks are not, and what `add`/`update`/`rm` do once a host owns the units.
 - `work/notes/findings/nixos-account-conventions-break-anonctl-provisioning.md`, `work/notes/findings/systemd-enablement-target-and-nixos-fhs-gaps.md`, `work/notes/findings/dns-confinement-defeated-by-nss-delegation-and-reply-un-nat.md` and `work/notes/observations/resolved-unit-binaries-can-bake-a-nix-store-path-from-path.md`: the raw measurements this guide is built from.

@@ -93,9 +93,9 @@ func Install(ctx context.Context, d Deps, c accountconfig.Config, exemptions []l
 	// default-deny nor the forcing, and the anon UID would egress with the host's real
 	// IP. `add` additionally pre-flights this before it creates the account at all (see
 	// PreflightUnitBinaries), so reaching a failure here should be near-impossible.
-	tp, lp, err := systemd.ResolveUnitParams(d.Resolver)
+	tp, lp, own, err := prepareUnits(d)
 	if err != nil {
-		return fmt.Errorf("forcing: %w", err)
+		return err
 	}
 	// GENERATE BEFORE PERSISTING. Generate is pure and validates the whole Params (a
 	// zero uid, equal uids, a hostname endpoint, an account name whose nft table name
@@ -129,9 +129,15 @@ func Install(ctx context.Context, d Deps, c accountconfig.Config, exemptions []l
 	}
 
 	// Install the account-agnostic template unit + anonctl's early-boot loader unit
-	// (idempotent).
-	if err := d.SystemdStore.InstallCommon(tp, lp); err != nil {
-		return fmt.Errorf("forcing: install common systemd artifacts: %w", err)
+	// (idempotent). SKIPPED when the host owns those two files: they are already there,
+	// declared, and anonctl writing its own copy would be a second definition of the
+	// same unit that the host's higher-ranked one silently wins over. Everything below
+	// this point is unchanged in both modes, because the per-account enablement
+	// symlinks are anonctl's either way.
+	if !own.HostOwned {
+		if err := d.SystemdStore.InstallCommon(tp, lp); err != nil {
+			return fmt.Errorf("forcing: install common systemd artifacts: %w", err)
+		}
 	}
 	// ENABLE BEFORE MIGRATING. Both orders leave exactly one definition once the whole
 	// sequence completes, but only this one is safe if the sequence is INTERRUPTED: if
@@ -190,7 +196,7 @@ func Reconfigure(ctx context.Context, d Deps, c accountconfig.Config, exemptions
 	// Resolve the unit binaries BEFORE mutating anything, exactly as Install does: a
 	// reconfigure that cannot name the shim must fail while the old, working units are
 	// still in place, not half way through.
-	tp, lp, err := systemd.ResolveUnitParams(d.Resolver)
+	tp, lp, own, err := prepareUnits(d)
 	if err != nil {
 		return err
 	}
@@ -236,8 +242,17 @@ func Reconfigure(ctx context.Context, d Deps, c accountconfig.Config, exemptions
 	// Re-resolving here also costs nothing when nothing moved (the same paths are
 	// written back), and it fails LOUD if a binary cannot be resolved at all, which is
 	// the same guard `add` applies before it touches the box.
-	if err := d.SystemdStore.InstallCommon(tp, lp); err != nil {
-		return fmt.Errorf("forcing: rewrite the shared unit files: %w", err)
+	//
+	// NOT when the host owns the units: there is nothing for anonctl to re-bake, because
+	// the paths in those files came from the host's own pin and move only when the host
+	// rebuilds. prepareUnits has already asserted both files are present and that the
+	// binaries they name still exist, which is the same property this re-bake exists to
+	// restore -- reported instead of repaired, because repairing would mean writing a
+	// file anonctl does not own.
+	if !own.HostOwned {
+		if err := d.SystemdStore.InstallCommon(tp, lp); err != nil {
+			return fmt.Errorf("forcing: rewrite the shared unit files: %w", err)
+		}
 	}
 	// RELOAD BEFORE RESTARTING, or the restart runs the unit systemd still has in
 	// memory rather than the one just written. That is not a cosmetic ordering point:
@@ -330,6 +345,50 @@ func Remove(ctx context.Context, d Deps, account string) error {
 		}
 	}
 	return nil
+}
+
+// prepareUnits is the BEFORE-ANY-MUTATION unit preflight both Install and
+// Reconfigure open with. It decides who owns the two shared unit files and returns
+// the generation params for the anonctl-owned case.
+//
+// The two modes preflight DIFFERENT things, and the difference is the point:
+//
+//   - anonctl-owned: resolve the three binaries the generated units will name, so an
+//     unresolvable one aborts before a single byte of host state changes. Doing this
+//     late is a fail-OPEN regression (the account would exist with live rules but no
+//     unit installed, so the next boot loads neither the baseline default-deny nor the
+//     forcing).
+//   - host-owned: do NOT resolve anything. The host's units name the host's own paths,
+//     from the same pin as the binary, so requiring a local `setpriv` or a local shim
+//     on $PATH would refuse a correctly configured host over text that is discarded.
+//     Assert instead that both declared units exist and that the binaries THEY name
+//     exist, which is the same fail-closed property, measured where it now lives.
+//
+// The unit dir's writability is checked in the HOST-OWNED mode only. In the default
+// mode nothing changes: InstallCommon creates that directory and fails loudly there
+// exactly as it always has. In host-owned mode there is no unit write left to fail,
+// so the per-account enablement symlink becomes the only thing that touches it, and
+// an account that cannot be enabled is an account that silently does not come back
+// after a reboot.
+func prepareUnits(d Deps) (systemd.TemplateParams, systemd.LoaderParams, systemd.UnitOwnership, error) {
+	none := func(own systemd.UnitOwnership, err error) (systemd.TemplateParams, systemd.LoaderParams, systemd.UnitOwnership, error) {
+		return systemd.TemplateParams{}, systemd.LoaderParams{}, own, fmt.Errorf("forcing: %w", err)
+	}
+	// The SAME preflight `add` runs before it creates the account, so the two cannot
+	// disagree about what this host must satisfy.
+	own, err := systemd.PreflightUnits(d.SystemdStore, d.Resolver)
+	if err != nil {
+		return none(own, err)
+	}
+	if own.HostOwned {
+		// Nothing to generate: the host's files are already in place and were just asserted.
+		return systemd.TemplateParams{}, systemd.LoaderParams{}, own, nil
+	}
+	tp, lp, err := systemd.ResolveUnitParams(d.Resolver)
+	if err != nil {
+		return none(own, err)
+	}
+	return tp, lp, own, nil
 }
 
 // applyRuleset generates and applies the account's nft rules through the injected

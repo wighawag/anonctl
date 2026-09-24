@@ -7,6 +7,7 @@ package cli
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/wighawag/anoncore/account"
@@ -76,6 +77,19 @@ type Command struct {
 	// list/status/rm/verify.
 	Exemptions []lanexempt.Exempt
 
+	// UnitsSubcommand is the `units` subcommand (only `print` exists). The unit flags
+	// below carry its arguments: the kind to emit and the host paths to bake into it.
+	// All are meaningful ONLY for `units`, which takes no account name and needs no
+	// root: it is a pure function of these values, so a build system can call it.
+	UnitsSubcommand  string
+	UnitKind         string
+	UnitSetprivPath  string
+	UnitShimPath     string
+	UnitNftPath      string
+	UnitEnvDir       string
+	UnitRulesDir     string
+	UnitPlaceholders bool
+
 	// Program is the program `exec` runs INSIDE the anonymized account (the first
 	// positional after any `--as <name>`). Meaningful only for `exec`; empty for every
 	// other verb.
@@ -141,12 +155,15 @@ var verbs = map[string]bool{
 	"use":         true,
 	"exec":        true,
 	"seed-home":   true,
+	"units":       true,
 }
 
 // takesName reports whether a verb accepts an account name. `list` enumerates ALL
-// accounts, so it takes none; every other verb targets one account (bare =
-// default `anon`).
-func takesName(verb string) bool { return verb != "list" }
+// accounts, so it takes none; `units` emits the account-AGNOSTIC unit text and must
+// never take one (naming an account there would invite a host to declare per-account
+// artifacts, which is exactly what must not become declarable); every other verb
+// targets one account (bare = default `anon`).
+func takesName(verb string) bool { return verb != "list" && verb != "units" }
 
 // Parse turns argv (WITHOUT the program name) into a Command. It is pure: it
 // never touches the system, so it is safe to call and test without root. A bad
@@ -169,6 +186,12 @@ func Parse(args []string) (*Command, error) {
 	// function.
 	if verb == "exec" {
 		return parseExec(cmd, args[1:])
+	}
+
+	// `units` has its own grammar too (`units print --kind <kind> --<path> <value>...`):
+	// a subcommand plus path-valued flags that no other verb has, and NO account name.
+	if verb == "units" {
+		return parseUnits(cmd, args[1:])
 	}
 
 	// Separate flags from the single optional positional (the account name).
@@ -322,6 +345,98 @@ func parseExec(cmd *Command, rest []string) (*Command, error) {
 		return nil, fmt.Errorf("exec: --as needs a value (the account name, e.g. `--as work` for anon-work)")
 	}
 	return nil, fmt.Errorf("exec needs a program to run (usage: `anonctl exec [--as <name>] <program> [args...]`)")
+}
+
+// parseUnits parses `units print --kind shim|nftables [path flags...]`, the PURE
+// emitter that prints the text of one of anonctl's two shared unit files so a host
+// can declare it in its own configuration instead of depending on a file `add` wrote
+// out of band.
+//
+// Every path is a FLAG, never a lookup: a host that declares the unit points
+// ExecStart at a path from the same pin as the binary, and a generator that resolved
+// anything against the running host's $PATH would emit different text on the build
+// machine than on the target. `--placeholders` is the same emitter with each path
+// left as a substitutable `@name@` token, which is how the packaged `.in` data files
+// are produced.
+//
+// A missing required path is a loud error and NEVER a silent default, because the
+// failure it would cause is invisible until a reboot: a unit whose ExecStart names a
+// path that is not there fails 203/EXEC at the next start, and for the loader that
+// means no standing default-deny at boot.
+func parseUnits(cmd *Command, rest []string) (*Command, error) {
+	if len(rest) == 0 {
+		return nil, fmt.Errorf("units needs a subcommand (usage: `anonctl units print --kind shim|nftables ...`)")
+	}
+	sub := rest[0]
+	if sub != "print" {
+		if strings.HasPrefix(sub, "-") {
+			return nil, fmt.Errorf("units: the subcommand comes first (usage: `anonctl units print --kind shim|nftables ...`), got flag %q", sub)
+		}
+		return nil, fmt.Errorf("units: unknown subcommand %q (only `print` exists)", sub)
+	}
+	cmd.UnitsSubcommand = sub
+
+	// One table for the five path flags + --kind, so adding a flag cannot forget the
+	// space form, the `=` form, or the missing-value error.
+	targets := map[string]*string{
+		"--kind":      &cmd.UnitKind,
+		"--setpriv":   &cmd.UnitSetprivPath,
+		"--shim":      &cmd.UnitShimPath,
+		"--nft":       &cmd.UnitNftPath,
+		"--env-dir":   &cmd.UnitEnvDir,
+		"--rules-dir": &cmd.UnitRulesDir,
+	}
+	var pending string
+	for _, a := range rest[1:] {
+		if pending != "" {
+			*targets[pending] = a
+			pending = ""
+			continue
+		}
+		if a == "--placeholders" {
+			cmd.UnitPlaceholders = true
+			continue
+		}
+		if !strings.HasPrefix(a, "-") {
+			// Name the mistake a user of every OTHER verb will make, rather than calling an
+			// account name an unknown flag. The refusal itself is the privacy rule: the unit
+			// files are account-agnostic, and the artifact that names an account is never
+			// exportable.
+			return nil, fmt.Errorf("units print takes no positional argument (got %q): the unit files are account-AGNOSTIC, one template serves every account, and the per-account enablement symlink is anonctl's alone", a)
+		}
+		name, value, hasValue := strings.Cut(a, "=")
+		p, known := targets[name]
+		if !known {
+			return nil, fmt.Errorf("units print: unknown flag %q", a)
+		}
+		if hasValue {
+			*p = value
+			continue
+		}
+		pending = name
+	}
+	if pending != "" {
+		return nil, fmt.Errorf("units print: %s needs a value", pending)
+	}
+	if strings.TrimSpace(cmd.UnitKind) == "" {
+		return nil, fmt.Errorf("units print: --kind is required (shim for the per-account shim @-template, nftables for the early-boot loader)")
+	}
+	if cmd.UnitPlaceholders {
+		// Collect and SORT before reporting: map iteration order is random, and a build log
+		// is the only place this message is ever read, so it must not differ between two
+		// runs of the same command (the same rule systemd.rejectForeign follows).
+		var clashes []string
+		for flag, p := range targets {
+			if flag != "--kind" && strings.TrimSpace(*p) != "" {
+				clashes = append(clashes, flag)
+			}
+		}
+		if len(clashes) > 0 {
+			sort.Strings(clashes)
+			return nil, fmt.Errorf("units print: --placeholders emits every path as an @name@ token, so it cannot be combined with %s", strings.Join(clashes, ", "))
+		}
+	}
+	return cmd, nil
 }
 
 // addExemption parses one `--allow` value through the lanexempt guardrail and

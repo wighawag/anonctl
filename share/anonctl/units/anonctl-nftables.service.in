@@ -1,0 +1,19 @@
+# anonctl early-boot nftables loader (generated). anonctl's OWN unit: it does NOT
+# ride on the host's firewall service (which Debian ships disabled, so the rules
+# were absent at boot and the anon UID leaked the host's real IP). It loads
+# anonctl's per-account rule files (the standing baseline default-deny AND the
+# forcing tables) EARLY, before the network is up, so the resting-state DROP is
+# present from the first moment the anon UID could egress (the boot invariant).
+[Unit]
+Description=anonctl early-boot nftables loader (baseline default-deny + forcing)
+DefaultDependencies=no
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for f in @rulesDir@/*.nft; do [ -e "$f" ] && @nft@ -f "$f"; done'
+
+[Install]
+WantedBy=sysinit.target

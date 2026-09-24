@@ -580,3 +580,47 @@ func TestTheNameRefusalExplainsTheNftReason(t *testing.T) {
 		}
 	}
 }
+
+// `units` is the only verb that takes NO account name, and that is a privacy
+// property rather than a convenience: the unit FILES are account-agnostic, while the
+// artifact that names an account (the per-account enablement symlink) is never
+// exportable. A `units` grammar that accepted a name would invite a host to declare
+// the one artifact whose name says which slot is in use.
+func TestUnitsTakesNoAccountName(t *testing.T) {
+	if _, err := cli.Parse([]string{"units", "print", "--kind", "shim", "anon-01"}); err == nil {
+		t.Fatal("units accepted an account name; the exported units are account-agnostic by construction")
+	}
+}
+
+// The `units print` grammar: both flag spellings, and a loud refusal for everything
+// underspecified. A path that is silently defaulted would produce a unit that fails
+// 203/EXEC at the next boot, long after whoever ran this saw it succeed.
+func TestUnitsPrintGrammar(t *testing.T) {
+	cmd, err := cli.Parse([]string{"units", "print", "--kind=shim", "--setpriv=/p/setpriv", "--shim", "/p/shim", "--env-dir=/etc/anonctl/shim"})
+	if err != nil {
+		t.Fatalf("units print: %v", err)
+	}
+	if cmd.Verb != "units" || cmd.UnitsSubcommand != "print" {
+		t.Errorf("verb/subcommand = %q/%q, want units/print", cmd.Verb, cmd.UnitsSubcommand)
+	}
+	if cmd.UnitKind != "shim" || cmd.UnitSetprivPath != "/p/setpriv" || cmd.UnitShimPath != "/p/shim" || cmd.UnitEnvDir != "/etc/anonctl/shim" {
+		t.Errorf("flags parsed as %+v", cmd)
+	}
+	if cmd.Account != "" {
+		t.Errorf("units resolved an account %q; it must resolve none", cmd.Account)
+	}
+
+	for _, args := range [][]string{
+		{"units"},
+		{"units", "list"},
+		{"units", "--kind", "shim"},
+		{"units", "print", "--kind"},
+		{"units", "print", "--setpriv", "/p/setpriv"},
+		{"units", "print", "--kind", "shim", "--unknown", "x"},
+		{"units", "print", "--kind", "shim", "--placeholders", "--nft", "/p/nft"},
+	} {
+		if _, err := cli.Parse(args); err == nil {
+			t.Errorf("cli.Parse(%q) succeeded; it must refuse", args)
+		}
+	}
+}

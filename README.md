@@ -37,6 +37,7 @@ You need a running **socks5h endpoint** to anonymize through. If you run Tor, an
 - [What anonctl guarantees and what it does NOT](#what-anonctl-guarantees-and-what-it-does-not)
 - [Operating notes](#operating-notes)
 - [Running on NixOS](#running-on-nixos) (read before installing there)
+- [Declaring anonctl's units on a declarative host](#declaring-anonctls-units-on-a-declarative-host)
 - [Decisions (ADRs)](#decisions-adrs)
 
 ## How it works
@@ -119,6 +120,7 @@ The verbs at a glance (a **bare verb** targets the default `anon` account; `<nam
 | `seed-home` | Copy a template dir into an account's home | yes |
 | `update` / `reconfigure` | Re-point an account at a new endpoint, fail-closed | yes |
 | `rm` | Remove forcing (`--purge-account` also deletes the account) | yes |
+| `units print` | Print one of the two shared unit files so a **host** can declare it | no |
 
 Full synopsis:
 
@@ -133,6 +135,8 @@ anonctl verify [<name>] [--json]                             PROVE the account i
 anonctl use    [<name>]                                      verify, then open a shell as the account ONLY on green (root)
 anonctl exec   [--as <name>] <program> [args...]             verify, then RUN <program> in the account ONLY on green; args forwarded verbatim (root)
 anonctl update|reconfigure --endpoint <socks5h://host:port> [--allow <IP|CIDR:port>]... [<name>]   re-point an account, re-applied fail-closed (root)
+anonctl units print --kind shim|nftables [--setpriv PATH --shim PATH --env-dir DIR] [--nft PATH --rules-dir DIR] [--placeholders]
+                                                             print one of the two shared unit files for a host to DECLARE (pure, no root)
 anonctl --version | version                                  print the version
 ```
 
@@ -408,6 +412,32 @@ A traversable root does mean any local user can `ls /etc/anonctl` and learn the 
 The short version: with `users.mutableUsers = false` NixOS deletes every account that is not declared in your configuration on **every activation and every boot**, and anonctl's two accounts are undeclared by construction. What survives the deletion is the nft tables, the shim unit and anonctl's own records, all still naming UIDs that are now free, so the forcing can end up governing an unrelated account while `/etc/anonctl` still records yours as jailed. `anonctl verify`'s first assertion, `account-identity`, detects exactly this and reports it on its own rather than as a scatter of leak failures.
 
 The supported fix is to **declare both the login account and its `-shim` account with pinned uids**, then let `anonctl add` **adopt** them: it gates on whether anonctl already has a record for the account, not on whether a passwd entry exists, so it creates nothing, leaves the home alone, and installs the forcing against the uids your configuration pinned. Declare only one of the two and `add` refuses, naming both accounts, rather than creating the missing half, which on this distro would be deleted again at the next activation. `docs/nixos.md` gives the copy-pasteable `users.users` snippet, explains why flipping `users.mutableUsers = true` instead silently makes declarative passwords box-wide advisory, covers the privacy rules for **choosing an account name** on a distro that writes it into a world-readable store path, and lists the NixOS FHS gotchas (no user-private group, no `/bin/bash`, and why a `/nix/store` path in a unit's `ExecStart` is a fail-open time bomb).
+
+## Declaring anonctl's units on a declarative host
+
+anonctl installs exactly two account-agnostic unit files (`anonctl-shim@.service`, the `@`-template all accounts instantiate, and `anonctl-nftables.service`, the early-boot loader). On an ordinary host it writes and owns them, and you need to know nothing about this section.
+
+On a host that **declares** its configuration, those two files are the last piece of out-of-band state: no rebuild reproduces them and no rollback undoes them, so a rebuilt machine restores the declared accounts and the declared binary while the units that install their forcing at boot are simply gone. From **0.9.0** you can declare them yourself:
+
+```sh
+# The text, as a pure function of the paths you pin. No root, no lookups, byte-stable.
+anonctl units print --kind nftables --nft /path/to/nft --rules-dir /etc/anonctl/nftables
+
+# Or consume the same text as data, with @name@ tokens to substitute. The release
+# archive carries them at share/anonctl/units/ (install.sh installs the two BINARIES
+# only; a distro package decides where its own share/anonctl/units lands):
+#   share/anonctl/units/anonctl-shim@.service.in
+#   share/anonctl/units/anonctl-nftables.service.in
+```
+
+Then create `/etc/anonctl/units.host-owned`. With that marker present, `add` and `update` write neither unit file, `rm` never deletes them (including the last-account teardown that removes them on an ordinary host), and `add` refuses **before it creates or adopts anything** if the units you claim to own are not actually in systemd's search path, name a binary that does not exist, still carry an unsubstituted `@name@` token, or point at directories anonctl does not write to. That last one is the check that matters most: a loader globbing the wrong directory loads nothing at boot, so there is no standing default-deny and the account egresses with the host's real IP, and nothing else would ever catch it (the live rules are correct, and the loader is not started until the boot it is meant to protect).
+
+Two properties are load-bearing and are enforced by test rather than by care:
+
+- **The exported text is byte-identical to what `add` writes.** Both come from the same generator; there is no second copy of the template in this repository, not even in testdata, so the definition you declare cannot drift from the one anonctl believes it installed.
+- **anonctl keeps the per-account enablement symlinks**, and they are deliberately NOT exportable. `multi-user.target.wants/anonctl-shim@<account>.service` is the one artifact whose NAME says which account slot is in use, and a host that declared it would publish that to its configuration repository and its git history. The unit files say nothing about which accounts exist; the symlinks say everything.
+
+The full recipe, including a NixOS module and why a `/nix/store` path in a **declared** `ExecStart` is correct while a **baked** one is a fail-open time bomb, is [`docs/nixos.md` section 8](docs/nixos.md#8-declaring-anonctls-units-in-your-configuration); the reasoning is [ADR-0012](docs/adr/0012-the-shared-units-are-exportable-and-the-host-may-own-them.md).
 
 ## Decisions (ADRs)
 

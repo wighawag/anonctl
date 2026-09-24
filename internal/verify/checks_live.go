@@ -147,21 +147,7 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 			return AnonymizedExitAssertion(hostIP, exitIP, ev, p.Class, p.SkipTorExitCheck)
 		}},
 		{Name: AssertUnitBinariesPresent, Run: func(ctx context.Context) Assertion {
-			// Reads the unit FILES rather than asking systemd, so it sees what will be
-			// loaded at the NEXT boot rather than what the running generation happens to
-			// have. That is the whole point: the failure this catches is invisible until
-			// something restarts.
-			baked, err := systemd.DefaultStore().BakedBinaries()
-			if err != nil {
-				return Assertion{Name: AssertUnitBinariesPresent, Err: err}
-			}
-			var missing []string
-			for _, p := range baked {
-				if _, serr := os.Stat(p); serr != nil {
-					missing = append(missing, p)
-				}
-			}
-			return UnitBinariesPresentAssertion(baked, missing)
+			return UnitsAssertion(systemd.DefaultStore())
 		}},
 		{Name: AssertDNSRemote, Exclusive: true, Run: func(ctx context.Context) Assertion {
 			// MEASURED, not inferred. The old evidence here was a successful forced FETCH of a
@@ -439,4 +425,50 @@ func probeAsAnon(ctx context.Context, p LiveParams, network, addr string) (bool,
 	defer cancel()
 	reached, _, err := runSetprivProbe(pctx, p.AnonUID, network, addr)
 	return reached, err
+}
+
+// UnitsAssertion decides `unit-binaries-present` from a Store: it reads the unit
+// FILES rather than asking systemd, so it sees what will be loaded at the NEXT boot
+// rather than what the running generation happens to have. That is the whole point,
+// because the failure it catches is invisible until something restarts.
+//
+// WHEN THE HOST OWNS THE UNITS it asserts more than the binaries, and the reason is
+// specific to that mode. anonctl checks a host's declaration at `add`/`update` time,
+// but a declarative host changes its configuration WITHOUT running anonctl: it edits
+// a module and rebuilds. So the install-time gate is not the last word there, and
+// the drift it would miss is the fail-OPEN one -- a loader pointed at a directory
+// anonctl does not write to loads nothing at boot, which means no standing baseline
+// default-deny, which means the account egresses with the host's real IP. This runs
+// the SAME check (Store.PreflightHostUnits) at verify time, so the trust anchor
+// covers the window the install-time gate cannot see.
+//
+// It takes the Store as a parameter so the decision is testable against scratch
+// dirs; only the DefaultStore() injection at the call site is untested wiring.
+func UnitsAssertion(store systemd.Store) Assertion {
+	own, err := store.UnitOwnership()
+	if err != nil {
+		return Assertion{Name: AssertUnitBinariesPresent, Err: err}
+	}
+	if own.HostOwned {
+		if _, perr := store.PreflightHostUnits(); perr != nil {
+			// A DECIDED failure, not an undetermined one: the units were read and they are
+			// wrong. Naming the marker keeps the message self-explanatory for whoever did
+			// not set this host up.
+			return Assertion{
+				Name:   AssertUnitBinariesPresent,
+				Detail: "this host declares anonctl's units (" + own.MarkerPath + ") and the declaration is not usable: " + perr.Error(),
+			}
+		}
+	}
+	baked, err := store.BakedBinaries()
+	if err != nil {
+		return Assertion{Name: AssertUnitBinariesPresent, Err: err}
+	}
+	var missing []string
+	for _, p := range baked {
+		if _, serr := os.Stat(p); serr != nil {
+			missing = append(missing, p)
+		}
+	}
+	return UnitBinariesPresentAssertion(baked, missing)
 }

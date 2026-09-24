@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -13,6 +15,7 @@ import (
 	"github.com/wighawag/anoncore/endpoint"
 	"github.com/wighawag/anoncore/sudoprobe"
 	"github.com/wighawag/anonctl/internal/socks5hfixture"
+	"github.com/wighawag/anonctl/internal/systemd"
 )
 
 // --- Report: greenness, exit code, no-short-circuit (the CI-gating contract) ---
@@ -1110,5 +1113,112 @@ func TestUnitBinariesPresentAssertion(t *testing.T) {
 	}
 	if !strings.Contains(empty.Detail, "NOT checked") {
 		t.Errorf("the detail must say nothing was checked; got %q", empty.Detail)
+	}
+}
+
+// A /nix/store path is DURABLE and must keep passing. This is the assertion a host
+// that DECLARES anonctl's units depends on (docs/nixos.md section 8, ADR-0012): such
+// a host pins ExecStart to a store path from the same closure as the binary, which
+// is more coherent than a stable alias because the unit and the binary roll forward
+// and back together.
+//
+// It is pinned as a test because the tempting "improvement" is exactly wrong. A
+// store path reached from a system closure is a GC ROOT (the unit file is itself a
+// store file, and Nix computes its references by scanning it), so it cannot be
+// collected while the generation naming it exists. Adding /nix/store to the volatile
+// list would condemn the correct configuration, which is the same mistake the
+// /run/current-system/sw/bin reasoning already avoids.
+func TestStorePathsAreDurableNotVolatile(t *testing.T) {
+	baked := []string{
+		"/nix/store/0000000000000000000000000000000-util-linux-2.41/bin/setpriv",
+		"/nix/store/1111111111111111111111111111111-anonctl-0.9.0/bin/anonctl-shim",
+		"/bin/sh",
+	}
+	a := UnitBinariesPresentAssertion(baked, nil)
+	if !a.Ok {
+		t.Fatalf("a /nix/store path that EXISTS must pass: it is rooted by the system closure and cannot be garbage-collected. Got %+v", a)
+	}
+
+	// The genuinely volatile ones must still fail, so this is a statement about
+	// /nix/store specifically and not a blanket relaxation.
+	for _, volatile := range []string{"/tmp/build/anonctl-shim", "/run/user/1000/anonctl-shim"} {
+		v := UnitBinariesPresentAssertion(append([]string{volatile}, baked...), nil)
+		if v.Ok {
+			t.Errorf("%s must still be reported as volatile; got %+v", volatile, v)
+		}
+	}
+}
+
+// verify must catch a host-owned declaration that has DRIFTED, because on a
+// declarative host the configuration changes without anonctl ever running: someone
+// edits a module and rebuilds, and the install-time gate never sees it. The drift
+// that matters is fail-OPEN (a loader pointed at a directory anonctl does not write
+// to loads nothing at boot, so there is no standing default-deny), and it is silent:
+// the live rules are still correct, so every other assertion stays green.
+func TestUnitsAssertionCatchesADriftedHostOwnedDeclaration(t *testing.T) {
+	root := t.TempDir()
+	hostDir := filepath.Join(root, "host-systemd")
+	if err := os.MkdirAll(hostDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// The binaries the declared units name must be absolute, existing AND durable:
+	// this assertion also flags a path under a directory the system empties at boot,
+	// so a t.TempDir() binary would fail the test for the wrong reason (measured: it
+	// did). /bin/sh exists on every host this suite runs on and is not volatile; the
+	// unit's content is what is under test, not what the binary does.
+	const durable = "/bin/sh"
+	nft := durable
+	marker := filepath.Join(root, "units.host-owned")
+	if err := os.WriteFile(marker, nil, 0o644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	store := systemd.Store{
+		UnitDir:         filepath.Join(root, "systemd"),
+		EnvDir:          filepath.Join(root, "shim"),
+		RulesDir:        filepath.Join(root, "nftables"),
+		LegacyUnitDir:   filepath.Join(root, "legacy"),
+		HostOwnedMarker: marker,
+		SearchDirs:      []string{hostDir},
+	}
+	declare := func(t *testing.T, rulesDir string) {
+		t.Helper()
+		shim, err := systemd.Export(systemd.ExportParams{
+			Kind: systemd.KindShim, SetprivPath: durable,
+			ShimBinaryPath: durable, EnvDir: store.EnvDir,
+		})
+		if err != nil {
+			t.Fatalf("export shim: %v", err)
+		}
+		loader, err := systemd.Export(systemd.ExportParams{
+			Kind: systemd.KindNftables, NftPath: nft, RulesDir: rulesDir,
+		})
+		if err != nil {
+			t.Fatalf("export loader: %v", err)
+		}
+		for name, text := range map[string]string{systemd.UnitName: shim, systemd.LoaderUnitName: loader} {
+			if werr := os.WriteFile(filepath.Join(hostDir, name), []byte(text), 0o644); werr != nil {
+				t.Fatalf("write %s: %v", name, werr)
+			}
+		}
+	}
+
+	// A correct declaration passes, so this cannot be a test that only ever fails.
+	declare(t, store.RulesDir)
+	if a := UnitsAssertion(store); !a.Ok {
+		t.Fatalf("a correct host-owned declaration must PASS; got %+v", a)
+	}
+
+	// The same host, after someone changed the rules dir in its configuration and
+	// rebuilt. Nothing else about the box changed.
+	declare(t, filepath.Join(root, "somewhere-else"))
+	drifted := UnitsAssertion(store)
+	if drifted.Ok {
+		t.Fatal("a host-owned loader pointed at the wrong rules dir PASSED verify: at the next boot it loads no baseline default-deny at all, and the account egresses with the host's real IP")
+	}
+	if drifted.Err != nil {
+		t.Errorf("this is a DECIDED failure (the units were read and they are wrong), not an undetermined one; got Err=%v", drifted.Err)
+	}
+	if !strings.Contains(drifted.Detail, marker) {
+		t.Errorf("the detail must name the marker that put this host in the mode, for whoever did not set it up; got %q", drifted.Detail)
 	}
 }

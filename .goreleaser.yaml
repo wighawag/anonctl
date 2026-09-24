@@ -83,6 +83,14 @@ archives:
       - README.md
       - LICENSE
       - docs/adr/*.md
+      # The two shared unit files as DATA, with every host-varying path left as an
+      # @name@ token, so a packager can install them at $out/share/anonctl/units and a
+      # host can declare the units in its own configuration instead of depending on
+      # files `anonctl add` wrote out of band (no rebuild reproduces those, and no
+      # rollback undoes them). They are GENERATED from the same emitter `add` installs
+      # through (`go generate ./...`), and a test fails the build if they drift, so
+      # shipping them adds no second definition of the unit template.
+      - share/anonctl/units/*.in
 
 checksum:
   name_template: "checksums.txt"

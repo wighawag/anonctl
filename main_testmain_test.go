@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/wighawag/anonctl/internal/nssbypass"
+	"github.com/wighawag/anonctl/internal/systemd"
 )
 
 // TestMain neutralises the dispatch-time self-elevation seam for the whole package
@@ -41,7 +42,27 @@ func TestMain(m *testing.M) {
 	measureHostResolution = func(context.Context) (bool, bool, string) {
 		return false, true, "a lookup put NO DNS query on this process's own socket (test stub)"
 	}
+	// And the unit preflight, for the SAME reason spelled out above: it reads the real
+	// host-owned marker under /etc/anonctl, the real unit files in systemd's search
+	// path, and the real $PATH for the binaries a generated unit would name. Left
+	// un-stubbed, every `add` test would depend on whether the developer's box declares
+	// anonctl's units or has setpriv installed. Its own behaviour is tested against
+	// scratch stores in internal/systemd and internal/forcing; tests that want the
+	// refusal here use swapUnitPreflight.
+	preflightUnits = func(systemd.Store, systemd.Resolver) (systemd.UnitOwnership, error) {
+		return systemd.UnitOwnership{}, nil
+	}
 	os.Exit(m.Run())
+}
+
+// swapUnitPreflight scripts `add`'s unit preflight (the guard that must refuse
+// BEFORE the account is created) and returns the restore.
+func swapUnitPreflight(own systemd.UnitOwnership, err error) func() {
+	orig := preflightUnits
+	preflightUnits = func(systemd.Store, systemd.Resolver) (systemd.UnitOwnership, error) {
+		return own, err
+	}
+	return func() { preflightUnits = orig }
 }
 
 // swapNSSBypassInspector points `add`'s DNS-confinement gate at a scripted host

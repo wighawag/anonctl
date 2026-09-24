@@ -194,8 +194,12 @@ func TemplateUnit(p TemplateParams) (string, error) {
 	w("[Service]")
 	w("Type=simple")
 	// Per-account parameters come from the per-instance env file, so ONE template
-	// serves every account. The `-` prefix means a missing file is not fatal at
-	// unit-parse time (anonctl writes it before enabling).
+	// serves every account. There is deliberately NO `-` prefix: a missing env file must
+	// be fatal to the START, because an instance that came up without ANONCTL_SHIM_UID,
+	// the loopback ports or the endpoint would be a shim running as the wrong uid or
+	// pointing nowhere. Failing is fail-closed (the baseline still drops); starting is
+	// not. This is now text a HOST may declare, so it must not carry a comment
+	// describing a leading dash that is not there.
 	w("EnvironmentFile=%s/%%i.env", envDir)
 	// Drop to the account's dedicated shim UID (from the env file) via setpriv,
 	// exactly as the validated recipe runs the shim. The unit starts as root only to

@@ -1,0 +1,31 @@
+# anonctl per-account shim (generated). ONE @-template for all accounts: each
+# account runs as its OWN supervised instance under its OWN dedicated shim UID.
+# The per-account process boundary IS the security boundary (a distinct shim UID
+# per account), which is why this is a templated per-account unit and not a single
+# multiplexer for all accounts.
+#
+# Managed by `anonctl add` / `anonctl rm` -- do not enable this by hand. anonctl
+# writes its OWN enablement symlink into multi-user.target.wants/ next to this
+# file, because `systemctl enable` writes into /etc/systemd/system whatever the
+# unit dir is, and that path is read-only on some hosts (NixOS). A consequence:
+# `systemctl is-enabled` will say "disabled" even when this IS wired to start at
+# boot. To check for real: systemctl show multi-user.target --property=Wants
+[Unit]
+Description=anonctl forced-egress shim for account %i
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=@envDir@/%i.env
+ExecStart=@setpriv@ --reuid ${ANONCTL_SHIM_UID} --regid ${ANONCTL_SHIM_UID} --clear-groups \
+    @shim@ \
+    -relay ${ANONCTL_RELAY_ADDR} \
+    -dns ${ANONCTL_DNS_ADDR} \
+    -proxy ${ANONCTL_PROXY_ADDR} \
+    -socks-user ${ANONCTL_SOCKS_USER} \
+    -upstream-dns ${ANONCTL_UPSTREAM_DNS}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
