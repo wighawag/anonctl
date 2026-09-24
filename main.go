@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -39,6 +40,7 @@ import (
 	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anonctl/internal/nftables"
 	"github.com/wighawag/anonctl/internal/nssbypass"
+	"github.com/wighawag/anonctl/internal/probe"
 	"github.com/wighawag/anonctl/internal/systemd"
 	"github.com/wighawag/anonctl/internal/verify"
 )
@@ -77,6 +79,13 @@ func run(args []string) int {
 		return 2
 	}
 
+	// A non-fatal note about the account NAME (a read/teardown verb given a name the
+	// forcing verbs refuse). It goes to stderr, before anything runs and before any
+	// possible self-elevation, so it is visible without polluting a `--json` stdout.
+	if cmd.NameWarning != "" {
+		fmt.Fprintf(os.Stderr, "%s%s\n", errStyle.Yellow("anonctl: warning: "), cmd.NameWarning)
+	}
+
 	// Self-elevation: a root-requiring verb (add/rm/verify/use/update/reconfigure)
 	// run WITHOUT root re-execs itself via `sudo <self> <args...>`, so a bare
 	// `anonctl verify` prompts for the password inline (no `sudo anonctl` prefix
@@ -87,6 +96,29 @@ func run(args []string) int {
 	// stdout stays pure. See elevate.go.
 	if handled, code := maybeElevate(cmd.Verb, cmd.Account, args); handled {
 		return code
+	}
+
+	// ASSERT THE MODES OF THE OPERATOR-PLACED ARTIFACTS under the config root, once,
+	// at the single dispatch chokepoint - not in each verb, where the next verb added
+	// would forget.
+	//
+	// `/etc/anonctl` is 0755 so the credential-free marker is readable by any uid, as
+	// its contract promises. That traversable root is exactly what removes the
+	// incidental protection `default-home/` and `defaults.json` used to get from a
+	// 0700 parent: the operator creates them with a plain `cp`/editor, so they carry
+	// whatever the umask gave them (typically 0755/0644). Widening the root must widen
+	// nothing inside it, and for the two paths anonctl does NOT create, this is where
+	// that rule is enforced.
+	//
+	// Root only (a chmod needs it), best-effort, and a WARNING rather than a failure:
+	// being unable to tighten a template is not a reason to refuse to provision an
+	// account, but it is absolutely something the operator must be told, because the
+	// failure mode is silent disclosure.
+	if elevateGeteuid() == 0 {
+		if terr := defaultsStore.Tighten(); terr != nil {
+			fmt.Fprintf(os.Stderr, "%s%v\n", errStyle.Yellow("anonctl: warning: could not tighten the operator-placed files under /etc/anonctl: "), terr)
+			fmt.Fprintf(os.Stderr, "  /etc/anonctl is world-traversable (the marker must be readable by any uid), so anything under it that is not mode-protected is readable by every local user.\n")
+		}
 	}
 
 	// SIGINT/SIGTERM cancels the context that flows into provisioning, so a
@@ -104,6 +136,8 @@ func run(args []string) int {
 		return runList(ctx, runner, cmd)
 	case "status":
 		return runStatus(ctx, runner, cmd)
+	case "probe":
+		return runProbe(ctx, runner, cmd)
 	case "verify":
 		return runVerify(ctx, runner, cmd)
 	case "use":
@@ -741,28 +775,123 @@ func runRm(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	return 0
 }
 
-// runList enumerates the anon accounts that exist on the box, reading the real
-// passwd table (not a maintained index). Read-only: no root needed.
+// readPasswd is the account-table read `list` enumerates from. A package var so a
+// unit test can script the passwd table (and therefore the whole listing) without
+// depending on which anon accounts happen to exist on the developer's box.
+var readPasswd = provision.ReadPasswd
+
+// listSchemaVersion is the version of the `list --json` CONTRACT: the document
+// shape a sibling tool parses. It mirrors verify.SchemaVersion / marker's /
+// accountconfig's: a consumer guards on it before trusting the rest, it evolves
+// ADDITIVELY (new optional fields do not bump it), and a breaking reshape bumps it.
+//
+// It starts at 2, not 1, and the gap is deliberate documentation: version 1 is the
+// unversioned shape 0.6.x emitted (a bare top-level ARRAY of rows carrying
+// `forced`, `sudoChecked` and `sudoAllowed` bools that NOTHING on the list path
+// ever computed, so every row reported false at every privilege level). Numbering
+// this 2 lets a consumer that finds no `schemaVersion` key at all conclude it is
+// reading exactly that broken shape, rather than having to guess.
+const listSchemaVersion = 2
+
+// listReport is the `list --json` document. It is an OBJECT wrapping the rows
+// rather than a bare array, because a bare array has nowhere to carry a schema
+// version - which is the whole reason the previous reshape could not be announced
+// to consumers.
+type listReport struct {
+	SchemaVersion int                        `json:"schemaVersion"`
+	Accounts      []provision.AccountListing `json:"accounts"`
+}
+
+// runList enumerates the anon accounts, from TWO sources: the passwd table (the
+// existence source, honest box truth) and anonctl's ledger (the managed-ness
+// source, unioned in so an account anonctl records but the box no longer has is
+// visible rather than silently absent). Each row's forcing state is read from the
+// marker as an explicit TRI-STATE.
+//
+// Read-only, and it needs no root - but WITHOUT root it will honestly report
+// `managed: null` and `forcing: {"state": "unknown"}`, because the ledger is
+// root-only by design. That is the point: `list` used to answer those questions
+// confidently at every privilege level from fields nothing computed, so an
+// unprivileged caller was told "not forced" about accounts that were forced.
 func runList(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
-	accounts, err := provision.List(ctx, r, provision.ReadPasswd(ctx, r))
+	rows, err := provision.List(ctx, r, readPasswd(ctx, r))
 	if err != nil {
 		errorf("list: %v", err)
 		return 1
 	}
+	// Resolve deliberately cannot fail: an unreadable ledger/marker is a STATE of the
+	// answer (null / unknown, each with its reason), never a substituted zero value.
+	accounts := provision.Resolve(rows, configStore, markerStore)
 	if cmd.JSON {
-		return emitJSON(accounts)
+		return emitJSON(listReport{SchemaVersion: listSchemaVersion, Accounts: accounts})
 	}
 	if len(accounts) == 0 {
 		fmt.Println("no anon accounts")
 		return 0
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ACCOUNT\tUID\tSHIM\tSHIM-UID")
+	fmt.Fprintln(tw, "ACCOUNT\tUID\tSHIM\tSHIM-UID\tMANAGED\tFORCING")
 	for _, a := range accounts {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", a.Account, a.UID, a.Shim, a.ShimUID)
+		uid, shimUID := a.UID, a.ShimUID
+		if !a.Exists {
+			// A ledger-only row: anonctl records the account, the box has no passwd entry.
+			uid = outStyle.Red("NO PASSWD ENTRY")
+		}
+		if shimUID == "" {
+			shimUID = "-"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", a.Account, uid, a.Shim, shimUID, renderManaged(a), renderForcing(a.Forcing))
 	}
 	tw.Flush()
+	// An undetermined column is not a blank to be skimmed past: say WHY, once, so an
+	// unprivileged operator knows the answer is missing rather than negative.
+	if reason := firstUndeterminedReason(accounts); reason != "" {
+		fmt.Printf("\n%s some columns could not be determined (%s).\n", outStyle.Yellow("note:"), reason)
+		fmt.Printf("  anonctl's ledger is root-only by design; re-run as root for a determined answer.\n")
+	}
+	fmt.Printf("\nforcing is a CLAIM that `verify` passed at some point, not a live proof; `%s` is the cheap live check.\n",
+		outStyle.Cyan("anonctl probe <name>"))
 	return 0
+}
+
+// renderManaged renders the tri-state managed-ness: yes / no / UNKNOWN, with
+// UNKNOWN visually distinct so it is never skimmed as a "no".
+func renderManaged(a provision.AccountListing) string {
+	switch {
+	case a.Managed == nil:
+		return outStyle.Yellow("UNKNOWN")
+	case *a.Managed:
+		return outStyle.Green("yes")
+	default:
+		return "no"
+	}
+}
+
+// renderForcing renders the tri-state forcing verdict.
+func renderForcing(f provision.Forcing) string {
+	switch f.State {
+	case provision.StateForced:
+		return outStyle.Green("forced")
+	case provision.StateUnforced:
+		return outStyle.Red("unforced")
+	default:
+		return outStyle.Yellow("UNKNOWN")
+	}
+}
+
+// firstUndeterminedReason returns the first reason an answer could not be
+// determined, so the human output can explain the UNKNOWN columns instead of
+// leaving them to be read as negatives.
+func firstUndeterminedReason(accounts []provision.AccountListing) string {
+	for _, a := range accounts {
+		if a.ManagedReason != "" {
+			return a.ManagedReason
+		}
+		if a.Forcing.State == provision.StateUnknown && a.Forcing.Reason != "" {
+			return a.Forcing.Reason
+		}
+	}
+	return ""
 }
 
 // statusReport is the `status --json` document: the account state read from the box
@@ -771,9 +900,21 @@ func runList(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 // on the box still agrees with what anonctl RECORDED. A consumer that gates on the
 // old fields is unaffected; one that cares reads `identity.state`.
 type statusReport struct {
+	// SchemaVersion is the version of the `status --json` CONTRACT, so a sibling tool
+	// can guard on the shape it understands before trusting the rest - the same
+	// discipline verify, the marker and the account config already follow, applied to
+	// the two documents a consumer actually parses. It is ADDITIVE here (the existing
+	// field names are unchanged), so a consumer pinned to the old shape is unaffected
+	// and gains a version to key on.
+	SchemaVersion int `json:"schemaVersion"`
 	provision.AccountStatus
 	Identity statusIdentity `json:"identity"`
 }
+
+// statusSchemaVersion is the version of the `status --json` document. It starts at
+// 1: unlike `list`, this document's shape is UNCHANGED (the version is purely
+// additive), so there is no earlier broken shape to number around.
+const statusSchemaVersion = 1
 
 // statusIdentity is the machine-readable identity verdict: the same classification
 // `verify`'s account-identity precondition gates on (verify.AccountIdentity.State),
@@ -831,6 +972,7 @@ func runStatus(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 
 	if cmd.JSON {
 		return emitJSON(statusReport{
+			SchemaVersion: statusSchemaVersion,
 			AccountStatus: st,
 			Identity: statusIdentity{
 				State:           string(state),
@@ -905,6 +1047,162 @@ func runStatus(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		fmt.Printf("  forced: %s (no marker)\n", outStyle.Yellow("no"))
 	}
 	return 0
+}
+
+// probeNftRun is the seam `probe` reads the live ruleset through (`nft list table
+// inet anonctl_<account>`). A package var so the unit tests drive every verdict
+// path - table loaded, table missing, ruleset unreadable - with no root and no real
+// nft. Production wires the real shell-out.
+// It returns (ruleset, tableAbsent, err) and CLASSIFIES the failure, which is the
+// whole reason it is not a one-liner. `nft list table` exits non-zero both when the
+// table does not exist AND when the caller may not read the ruleset, so a gatherer
+// that mapped every failure to an error would make "the rules are gone" -
+// the post-reboot condition this verb exists to catch - indistinguishable from "you
+// are not root", and would tell a root operator to re-run as root.
+//
+// The classifier is PRIVILEGE, not stderr text: if we are not root we could not
+// have read the ruleset whatever nft said, and if we ARE root and nft ran, a
+// non-zero exit means the table is not there. Matching nft's English error strings
+// would be a translation and version dependency; the euid is neither.
+var probeNftRun = func(ctx context.Context, table string) (string, bool, error) {
+	cmd := exec.CommandContext(ctx, "nft", "list", "table", "inet", table)
+	var out, errb strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &errb
+	err := cmd.Run()
+	if err == nil {
+		return strings.TrimSpace(out.String()), false, nil
+	}
+	msg := strings.TrimSpace(errb.String())
+	if msg == "" {
+		msg = err.Error()
+	}
+	// nft's stderr is multi-line (a netlink note follows the error). Flatten it: this
+	// string lands inside a one-line check evidence field, and a raw newline there
+	// breaks the report's alignment and any consumer reading it line by line.
+	flat := strings.Join(strings.Fields(msg), " ")
+	// A failure to even START nft (not installed, not on PATH) is UNDETERMINED: it says
+	// nothing about whether the table is loaded.
+	var execErr *exec.Error
+	if errors.As(err, &execErr) {
+		return "", false, fmt.Errorf("%s", flat)
+	}
+	if elevateGeteuid() != 0 {
+		return "", false, fmt.Errorf("%s", flat)
+	}
+	// Root, and nft ran and refused: the table is not loaded.
+	return "", true, nil
+}
+
+// probeBootID is the seam for the running kernel's boot id, so a test can pin it.
+var probeBootID = marker.CurrentBootID
+
+// runProbe answers "is this account jailed RIGHT NOW" cheaply: no network, no Tor
+// exit check, no probes run as the account. It is the verb every automated
+// consumer needs on every trigger, and it exists HERE rather than in each
+// consumer because the two things it has to know - the per-account nft table name
+// and which rule actually attributes a uid to the forcing - are anonctl's private
+// convention. A consumer grepping anonctl's ruleset is a coupling anonctl did not
+// choose and could not refactor away.
+//
+// It EXITS NON-ZERO when the account is not jailed, including when a check could
+// not be determined, so a shell consumer can gate on the exit status alone. That
+// is a deliberate divergence from `status`, which is exit-code neutral because it
+// reports; probe adjudicates one narrow question, like `verify` does for the broad
+// one.
+//
+// Reading the ruleset needs root (`nft` is privileged). Probe does NOT
+// self-elevate: it is built to be called from automation on every trigger, and a
+// verb that can pop a sudo password prompt is unusable there. Without root it
+// reports rules-unreadable - UNDETERMINED, and therefore not jailed - and says to
+// re-run as root, rather than certifying an account from a question it could not
+// ask.
+func runProbe(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
+	st, err := provision.Status(ctx, r, cmd.Account)
+	if err != nil {
+		errorf("probe: %v", err)
+		return 1
+	}
+
+	in := probe.Input{
+		Account:       cmd.Account,
+		AccountExists: st.Exists,
+		LiveUID:       st.UID,
+		TableName:     nftables.TableName(cmd.Account),
+	}
+
+	m, merr := markerStore.Read(cmd.Account)
+	if merr != nil {
+		in.MarkerErr = merr
+	} else {
+		in.Marker = &m
+	}
+
+	// The uid the rules must govern is the account's LIVE uid. Using the live uid (not
+	// the marker's) is what makes uid drift show up as "the loaded rules do not govern
+	// this account" rather than being papered over by a self-consistent stale pair.
+	if uid, convErr := strconv.Atoi(st.UID); convErr == nil {
+		in.GoverningRule = nftables.GoverningRule(uid)
+	}
+	in.Ruleset, in.TableAbsent, in.RulesetErr = probeNftRun(ctx, in.TableName)
+
+	// A missing boot id is not an error: it is additive, and its absence is reported
+	// as an UNKNOWN boot state rather than as a failure.
+	if bootID, berr := probeBootID(); berr == nil {
+		in.CurrentBootID = bootID
+	}
+
+	rep := probe.Decide(in)
+	if cmd.JSON {
+		if code := emitJSON(rep); code != 0 {
+			return code
+		}
+		return probeExit(rep)
+	}
+	printProbe(rep)
+	return probeExit(rep)
+}
+
+// probeExit maps the verdict onto the process exit code: 0 jailed, 1 not.
+func probeExit(rep probe.Report) int {
+	if rep.Jailed {
+		return 0
+	}
+	return 1
+}
+
+// printProbe renders the human form: the verdict, then every check (all of them,
+// passing and failing, so the report is complete), then the boot line.
+func printProbe(rep probe.Report) {
+	if rep.Jailed {
+		fmt.Printf("%s: %s (uid %s)\n", outStyle.Bold(rep.Account), outStyle.Green("JAILED"), rep.UID)
+	} else {
+		fmt.Printf("%s: %s (%s)\n", outStyle.Bold(rep.Account), outStyle.Red("NOT JAILED"), rep.FirstFailure())
+	}
+	for _, c := range rep.Checks {
+		mark := outStyle.Red("FAIL")
+		if c.Ok {
+			mark = outStyle.Green("ok")
+		}
+		if c.Ok {
+			fmt.Printf("  %-16s %s   %s\n", c.Name, mark, c.Detail)
+		} else {
+			fmt.Printf("  %-16s %s %s: %s\n", c.Name, mark, c.Reason, c.Detail)
+		}
+	}
+	switch rep.Boot.State {
+	case probe.BootThisBoot:
+		fmt.Printf("  boot             %s   the forcing was PROVEN during this boot\n", outStyle.Green("ok"))
+	case probe.BootEarlierBoot:
+		fmt.Printf("  boot             %s the marker was written in an EARLIER boot: the rules above are loaded now, but nothing has re-PROVEN them since this machine came up (`%s`)\n",
+			outStyle.Yellow("note"), outStyle.Cyan(verifyHint(accountArg(rep.Account))))
+	default:
+		fmt.Printf("  boot             %s no boot id to compare, so whether the claim was proven in THIS boot is unknown (an unreadable marker, one written by an anonctl older than the bootId field, or a host without /proc/sys/kernel/random/boot_id)\n", outStyle.Yellow("note"))
+	}
+	if rep.Jailed {
+		fmt.Printf("\nprobe proves the rules are LOADED and attributed to this uid. It does not prove the forced path is leak-free: `%s` is that proof.\n",
+			outStyle.Cyan(verifyHint(accountArg(rep.Account))))
+	}
 }
 
 // printStatusIdentity renders the identity line for an account that EXISTS: does
@@ -1115,6 +1413,21 @@ func verifyAndMark(ctx context.Context, r provision.Runner, cmd *cli.Command, pr
 	// nothing and leaves any prior claim to be cleared by `rm`.
 	if rep.Ok() {
 		m := marker.New(cmd.Account, st.UID, p.Class, resolveVersion(), time.Now())
+		// Stamp the BOOT the proof was made in. The marker is durable and the proof is
+		// not: after a reboot the rules are re-loaded by the early-boot loader and NOTHING
+		// re-verifies, so a marker written last week reads exactly as green as one written
+		// a second ago. Recording the boot id lets a consumer (and `anonctl probe`) tell
+		// "proven THIS boot" from "proven some earlier boot".
+		//
+		// Best-effort by design: a host that cannot produce a boot id gets a marker
+		// WITHOUT the field (absent reads as "unknown boot", never as a mismatch). Refusing
+		// to record a proof that actually passed, over an optional diagnostic field, would
+		// be the wrong trade.
+		if bootID, berr := probeBootID(); berr == nil {
+			m = m.WithBootID(bootID)
+		} else {
+			fmt.Fprintf(os.Stderr, "anonctl: note: could not read this host's boot id (%v); the marker is written without one, so `anonctl probe` will report an UNKNOWN boot rather than 'proven this boot'\n", berr)
+		}
 		if werr := markerStore.WriteVerified(m, true); werr != nil {
 			errorf("verify: writing marker: %v", werr)
 		}
@@ -1929,8 +2242,29 @@ const usage = `usage:
                                      the directory-exists /etc/anonctl/default-home/); a per-file
                                      collision errors unless --force. Setuid/setgid bits are stripped
                                      on copy. add also seeds from default-home on fresh creation (root)
-  anonctl list   [--json]           list the anon accounts that exist on the box
-  anonctl status [<name>] [--json]  show one account's state (machine-readable with --json)
+  anonctl list   [--json]           list the anon accounts, from BOTH the passwd table (existence)
+                                     and anonctl's ledger (managed-ness, unioned in so an account
+                                     anonctl records but the box no longer has is visible). Each row
+                                     carries an explicit TRI-STATE forcing verdict and a managed
+                                     true/false/null; without root the ledger is unreadable by design,
+                                     so those read UNKNOWN/null rather than a confident "no".
+                                     --json is versioned (schemaVersion 2)
+  anonctl status [<name>] [--json]  show one account's state (machine-readable with --json,
+                                     schemaVersion 1)
+  anonctl probe  [<name>] [--json]  cheap "is this account jailed RIGHT NOW": no network, no Tor exit
+                                     check. Three checks - the marker is present, its uid is the
+                                     account's LIVE uid, and the account's nft table is actually loaded
+                                     and funnels that uid into the fail-closed chain - each with a named
+                                     reason on failure, plus whether the claim was proven during THIS
+                                     boot. NON-ZERO EXIT when not jailed (or when a check could not be
+                                     determined), so automation can gate on the exit status. Reading the
+                                     ruleset needs root; probe never self-elevates (it is built for
+                                     unattended callers), it reports the undetermined state instead.
+                                     It is the middle ground between the marker (a durable CLAIM that
+                                     verify passed at some point, which survives a reboot the rules may
+                                     not have) and verify (a live, tens-of-seconds PROOF). It does NOT
+                                     replace verify: it proves the rules are loaded and attributed, not
+                                     that the forced path is leak-free
   anonctl verify [<name>] [--json] [--skip-tor-exit-check]
                                      prove the account is anonymized (named assertions, non-zero exit on
                                      failure). --skip-tor-exit-check accepts an exit that forced egress but

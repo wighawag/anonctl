@@ -86,6 +86,7 @@ package nftables
 
 import (
 	"fmt"
+	"github.com/wighawag/anoncore/account"
 	"net"
 	"strings"
 
@@ -142,8 +143,33 @@ type Params struct {
 // identifiers cannot contain '-', so a named account's '-' becomes '_'
 // (`anon-work` -> `anonctl_anon_work`); this only names the table, never the Unix
 // account.
+//
+// The mapping is injective ONLY over account names that have no underscore of
+// their own: `anon-a_b` and `anon-a-b` both render `anonctl_anon_a_b`, and since
+// the ruleset is loaded as an atomic table REPLACE, the second account's forcing
+// would silently overwrite the first's while every kernel query about one answered
+// about the other. Injectivity is therefore enforced UPSTREAM, at name resolution
+// (anoncore/account.ValidateName), and again here in Params.validate so that a
+// caller bypassing the CLI still cannot install a colliding table. This function
+// stays a total, pure string mapping so it can be used on already-validated names
+// (including in teardown paths that must work for whatever is on the box).
 func TableName(account string) string {
 	return "anonctl_" + strings.ReplaceAll(account, "-", "_")
+}
+
+// GoverningRule is the ONE rule whose presence in a LOADED table means the anon
+// UID's packets are actually attributed to this account's forcing: the positive
+// `meta skuid` jump from the filter base chain into the fail-closed closure chain.
+// Without it the table can be loaded and the account still completely ungoverned.
+//
+// It is exported because `anonctl probe` matches it against a live `nft list
+// table` dump, and it is BUILT HERE, by the same package that generates the
+// ruleset, so the live matcher cannot drift away from what is actually emitted
+// (the generator calls this function too). The kernel re-renders a loaded ruleset
+// when printing it, and this exact spelling is what it prints back - pinned by the
+// boot-invariant integration test against a real `nft list table` on a real box.
+func GoverningRule(anonUID int) string {
+	return fmt.Sprintf("meta skuid %d jump %s", anonUID, anonFilterChain)
 }
 
 // The per-UID CLOSURE chains. These are REGULAR (non-base) chains: they are
@@ -257,7 +283,7 @@ func Generate(p Params) (string, error) {
 	w("    chain filter_out {")
 	w("        type filter hook output priority filter; policy accept;")
 	w("        meta skuid %d jump %s", p.ShimUID, shimFilterChain)
-	w("        meta skuid %d jump %s", p.AnonUID, anonFilterChain)
+	w("        %s", GoverningRule(p.AnonUID))
 	w("    }")
 	w("")
 	// SHIM UID: the ONLY UID allowed to reach the endpoint, then the world. Entered
@@ -398,6 +424,13 @@ func (p Params) validate() error {
 		return fmt.Errorf("nftables: empty endpoint host")
 	case p.EndpointPort <= 0 || p.EndpointPort > 65535:
 		return fmt.Errorf("nftables: endpoint port out of range (got %d)", p.EndpointPort)
+	}
+	// The account name must be one TableName can render UNAMBIGUOUSLY. This repeats
+	// the check name resolution already made, deliberately: it is the last gate before
+	// a ruleset is generated, and generating a table whose name another account also
+	// maps onto would silently replace that account's forcing.
+	if err := account.ValidateName(p.Account); err != nil {
+		return fmt.Errorf("nftables: %w", err)
 	}
 	if net.ParseIP(p.EndpointHost) == nil {
 		// The closure (b) rule needs a literal IP to pick the ip/ip6 family and to

@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -89,6 +90,76 @@ func (s Store) DefaultHomeDir() string {
 func (s Store) DefaultHomePresent() bool {
 	info, err := os.Stat(s.DefaultHomeDir())
 	return err == nil && info.IsDir()
+}
+
+// The modes Tighten asserts on the two OPERATOR-PLACED artifacts under the config
+// root. They are not anonctl's to create - the operator populates default-home
+// with a plain `cp` and writes defaults.json by hand - but they ARE anonctl's to
+// protect, for a reason that only appeared when the config root's mode was fixed.
+const (
+	// defaultHomeMode is 0700: the seed template holds the operator's dotfiles and
+	// tool configs, which the README itself treats as sensitive.
+	defaultHomeMode os.FileMode = 0o700
+	// defaultsFileMode is 0600: box-wide defaults are anonctl's operational config,
+	// not a public signal.
+	defaultsFileMode os.FileMode = 0o600
+)
+
+// Tighten asserts anonctl-private modes on the two operator-placed artifacts under
+// the config root: `default-home/` (0700, recursively) and `defaults.json` (0600).
+//
+// IT EXISTS BECAUSE FIXING THE CONFIG ROOT'S MODE REMOVED THEIR ONLY PROTECTION.
+// Until the root was fixed it was 0700 on every real box, so nothing under it was
+// reachable by another uid whatever its own mode said. The operator creates
+// default-home with `sudo cp -r <src>/. /etc/anonctl/default-home/`, which under a
+// normal umask yields 0755 dirs and 0644 files - harmless while the parent blocked
+// traversal, and a disclosure the moment the parent became 0755 so the markers
+// could be read. The marker has to be world-readable; the operator's dotfiles must
+// not be. Both are true only if these two paths carry their own mode.
+//
+// It is a REPAIR, not a create: a missing path is a clean no-op (the
+// directory-exists convention means absence is the normal state), and it never
+// creates either artifact. Errors are returned for the caller to surface as a
+// warning rather than a fatal, because failing to tighten a template is not a
+// reason to refuse to provision an account - but it IS a reason to tell the
+// operator.
+func (s Store) Tighten() error {
+	var errs []error
+	home := s.DefaultHomeDir()
+	if info, err := os.Stat(home); err == nil && info.IsDir() {
+		// Recursive: a template is a TREE, and a 0700 top directory over 0644 files is
+		// only as private as every path that reaches them. Files get 0600, directories
+		// 0700; the seeder strips setuid/setgid on copy anyway, and narrowing here cannot
+		// break seeding because anonctl reads these as root.
+		if err := filepath.WalkDir(home, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			mode := defaultsFileMode
+			if d.IsDir() {
+				mode = defaultHomeMode
+			}
+			// Leave a symlink alone: chmod would follow it OUT of the template tree and
+			// change the mode of whatever it points at. (seedhome refuses symlinks on copy;
+			// this is the same caution on the repair path.)
+			if d.Type()&fs.ModeSymlink != 0 {
+				return nil
+			}
+			if cerr := os.Chmod(path, mode); cerr != nil {
+				return fmt.Errorf("chmod %q to %#o: %w", path, mode, cerr)
+			}
+			return nil
+		}); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	file := filepath.Join(s.baseDir(), defaultsFile)
+	if info, err := os.Stat(file); err == nil && !info.IsDir() {
+		if cerr := os.Chmod(file, defaultsFileMode); cerr != nil {
+			errs = append(errs, fmt.Errorf("chmod %q to %#o: %w", file, defaultsFileMode, cerr))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Read loads the box-wide defaults. A MISSING file is a clean empty Defaults (the

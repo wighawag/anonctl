@@ -126,8 +126,9 @@ Full synopsis:
 anonctl add    [--endpoint <socks5h://host:port>] [--allow <IP|CIDR:port>]... [<name>]   provision (or ADOPT) + force an account (root)
 anonctl rm     [--purge-account] [<name>]                    remove forcing; --purge-account also deletes the account (root)
 anonctl seed-home [--from <dir>] [--force] [<name>]          copy a template dir into the account's home (root)
-anonctl list   [--json]                                      list the anon accounts on the box
+anonctl list   [--json]                                      list the anon accounts: passwd existence + managed-ness + a tri-state forcing verdict
 anonctl status [<name>] [--json]                             show one account's state
+anonctl probe  [<name>] [--json]                             cheap live "is it jailed RIGHT NOW" (no network; non-zero exit when not)
 anonctl verify [<name>] [--json]                             PROVE the account is anonymized (non-zero exit on failure)
 anonctl use    [<name>]                                      verify, then open a shell as the account ONLY on green (root)
 anonctl exec   [--as <name>] <program> [args...]             verify, then RUN <program> in the account ONLY on green; args forwarded verbatim (root)
@@ -145,7 +146,25 @@ sudo anonctl verify                 # prove it: anonymized exit, DNS remote, a d
 sudo anonctl add --endpoint socks5h://127.0.0.1:1080 work   # a second account through another endpoint
 ```
 
-The `sudo` prefix above is optional: the root-requiring verbs (`add`, `rm`, `verify`, `use`, `exec`, `update`/`reconfigure`) **self-elevate**. Run a bare `anonctl verify` and it re-execs itself via `sudo` and prompts for your password **inline in the terminal** (not a GUI dialog), then runs the verb and hands back its exit code exactly. Already-root (you typed `sudo anonctl ...`) runs directly with no second prompt; the read-only verbs (`list`, `status`) and `--version` never elevate; and if `sudo` is not installed you get the plain "must be root" error, never a polkit/GUI popup.
+### The three questions: `list`, `probe`, `verify`
+
+They answer different questions at very different costs, and picking the wrong one is how an automated consumer ends up trusting a stale claim.
+
+| | cost | question | wrong answer looks like |
+|---|---|---|---|
+| the **marker** (`/etc/anonctl/<account>.json`), read directly or via `anonctl list` / `status` | free, a file read | "did `verify` pass at SOME point?" | a marker survives a reboot; the rules may not have been re-loaded, and nothing re-verifies |
+| `anonctl probe <name>` | milliseconds, no network | "is this account jailed RIGHT NOW?" | it proves the rules are LOADED and attributed to this uid, not that the path is leak-free |
+| `anonctl verify <name>` | tens of seconds, live network | "is the forced path actually anonymous and leak-free?" | it is a point-in-time proof, which is why the marker records that it happened |
+
+**`anonctl probe` is the one to call on every trigger of an automated loop.** It runs three checks and nothing else: the marker is present, its recorded uid IS the account's live uid, and the account's nftables table is loaded AND funnels that uid into the fail-closed chain. It exits **non-zero** when the account is not jailed **or when a check could not be determined** (reading the ruleset needs root), so a shell consumer can gate on the exit status alone; `--json` gives a named reason per failing check (`no-marker`, `marker-unreadable`, `account-missing`, `uid-drift`, `rules-unreadable`, `table-missing`, `uid-not-governed`). Probe never self-elevates, because a verb that can pop a password prompt is unusable from automation.
+
+If you are integrating against anonctl, **call `probe` rather than grepping `nft list table inet anonctl_<account>` yourself**: the table naming is anonctl's private convention, and a marker-only check (the shortcut most integrations reach for first) is the unsafe subset - it is exactly the case that survives a failed rule load.
+
+The marker also records a **`bootId`**, so `probe` can tell "proven during THIS boot" from "proven during an earlier one". A missing `bootId` (an older marker, or a host without `/proc/sys/kernel/random/boot_id`) means UNKNOWN, never a mismatch.
+
+`anonctl list` reads two sources and keeps them apart: the **passwd table** is the existence source, and anonctl's **ledger** is the managed-ness source (`managed: true/false/null`, null when the root-only ledger could not be read). On a host that DECLARES its accounts, every slot exists in passwd from the first converge whether `anonctl add` ever touched it or not, so existence alone would tell a provisioning consumer nothing. An account in the ledger with **no** passwd entry is shown too (`exists: false`), because that is the drift `verify`'s identity precondition catches. Forcing is a **tri-state** (`forced` / `unforced` / `unknown` with a reason), never a bare bool: without root the answer is genuinely unknown, and saying "unforced" there would fail in the unsafe direction.
+
+The `sudo` prefix above is optional: the root-requiring verbs (`add`, `rm`, `verify`, `use`, `exec`, `update`/`reconfigure`) **self-elevate**. Run a bare `anonctl verify` and it re-execs itself via `sudo` and prompts for your password **inline in the terminal** (not a GUI dialog), then runs the verb and hands back its exit code exactly. Already-root (you typed `sudo anonctl ...`) runs directly with no second prompt; the read-only verbs (`list`, `status`, `probe`) and `--version` never elevate; and if `sudo` is not installed you get the plain "must be root" error, never a polkit/GUI popup.
 
 ## Seeding a home and box-wide add-time defaults
 
@@ -369,6 +388,12 @@ The cross-identification defense is therefore real but **bounded**: it holds for
 ## Tor-over-Tor (double-anonymization) caveat
 
 If the anon account is ALREADY anonymized, forcing it through a SECOND anonymizer (Tor over Tor) degrades anonymity and breaks connectivity. anonctl makes this caveat both **documented** (here) and **detectable**: after `verify` passes, anonctl writes a marker at `/etc/anonctl/<account>.json`, a versioned, credential-free JSON record that a sibling tool (anon-pi, netcage) reads to detect "this account is already kernel-anonymized" and SKIP re-forcing. The marker is a dependency-free signal (no anonctl binary needed to read it), it is written strictly AFTER `verify` passes (it is a coordination claim, not a live security proof), and it deliberately excludes the endpoint URL and any credentials because it is world-readable under `/etc`. `anonctl status --json` is a convenience reader of the same truth. See [ADR-0004](docs/adr/0004-marker-contract-schema-precedence-and-trust.md).
+
+**`/etc/anonctl` itself is mode 0755** so that promise is true in practice: the directory is world-traversable and the markers in it are 0644. Everything else under it carries its own mode: `accounts/` (the ledger), `shim/` (env files) and `nftables/` (rule files) are 0700/0600 and are written by anonctl, and the two OPERATOR-placed paths, `default-home/` (0700, recursively) and `defaults.json` (0600), are **tightened by anonctl** on any root invocation.
+
+That last part is a real change and not housekeeping. Until 0.7.0 the root was created 0700 as a side effect of whichever store wrote first (always the ledger, since `add` writes it before its inline `verify` writes the marker), so the marker was unreadable by exactly the unprivileged consumers it exists for. Upgrading repairs the root's mode on the next write — and because `/etc/anonctl` was the only thing protecting them, anything an operator had placed under it with a plain `sudo cp` (0755 dirs, 0644 files under a normal umask) would have become world-readable at the same moment. anonctl therefore asserts 0700/0600 on the seed template and the defaults file itself; if it cannot, it warns loudly rather than leaving the disclosure silent. **If you keep anything else of your own under `/etc/anonctl`, give it its own mode: the directory no longer protects it.**
+
+A traversable root does mean any local user can `ls /etc/anonctl` and learn the NAMES of accounts that have markers. That is intended, since the marker is credential-free by construction and a local account name is already visible to every local user in `/etc/passwd`.
 
 ## Operating notes
 

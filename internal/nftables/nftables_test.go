@@ -673,3 +673,49 @@ func mustContain(t *testing.T, haystack, needle string) {
 		t.Errorf("expected output to contain:\n  %s\ngot:\n%s", needle, haystack)
 	}
 }
+
+// THE INJECTIVITY HALF. TableName rewrites `-` to `_`, so an account name that
+// CONTAINS an underscore collides with its all-dashes twin: `anon-a_b` and
+// `anon-a-b` both render `anonctl_anon_a_b`. This test pins the collision as the
+// REASON the name rule exists (if the mapping ever became injective on its own,
+// this test is the place that says the rule can be relaxed).
+func TestTableNameIsNotInjectiveAcrossUnderscoreAndDash(t *testing.T) {
+	underscore := nftables.TableName("anon-a_b")
+	dash := nftables.TableName("anon-a-b")
+	if underscore != dash {
+		t.Fatalf("expected the underscore/dash collision this rule exists for; got %q vs %q", underscore, dash)
+	}
+	if underscore != "anonctl_anon_a_b" {
+		t.Errorf("TableName(anon-a_b) = %q, want anonctl_anon_a_b", underscore)
+	}
+}
+
+// ...and Generate REFUSES the colliding name, so a caller that bypasses the CLI
+// (name resolution is the first gate) still cannot install a ruleset whose table
+// another account also maps onto, which would silently replace that account's
+// forcing.
+func TestGenerateRefusesAnAccountNameThatCollidesInTheTableName(t *testing.T) {
+	p := nftables.Params{
+		Account:      "anon-a_b",
+		AnonUID:      8801,
+		ShimUID:      412,
+		RelayPort:    19050,
+		DNSPort:      19053,
+		EndpointHost: "127.0.0.1",
+		EndpointPort: 9050,
+	}
+	_, err := nftables.Generate(p)
+	if err == nil {
+		t.Fatal("Generate accepted an account name whose nft table name is ambiguous; it must refuse")
+	}
+	if !strings.Contains(err.Error(), "underscore") || !strings.Contains(err.Error(), "table") {
+		t.Errorf("the refusal must name the nft table-name reason; got: %v", err)
+	}
+
+	// The same account with a legal name generates fine, so the guard rejects the
+	// ambiguity and nothing else.
+	p.Account = "anon-a-b"
+	if _, err := nftables.Generate(p); err != nil {
+		t.Errorf("a legal account name must still generate: %v", err)
+	}
+}

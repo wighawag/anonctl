@@ -39,7 +39,10 @@ func TestUseExecLoginShellDropsToAccount(t *testing.T) {
 
 	ctx := context.Background()
 	r := provision.ExecRunner{}
-	account := cli.ResolveAccount("useitest")
+	account, rerr := cli.ResolveAccount("useitest")
+	if rerr != nil {
+		t.Fatalf("resolve account: %v", rerr)
+	}
 
 	if _, err := provision.Add(ctx, r, account); err != nil {
 		t.Fatalf("provision.Add(%s): %v", account, err)
@@ -119,7 +122,10 @@ func TestExecProgramRunsAsAccount(t *testing.T) {
 
 	ctx := context.Background()
 	r := provision.ExecRunner{}
-	account := cli.ResolveAccount("execitest")
+	account, rerr := cli.ResolveAccount("execitest")
+	if rerr != nil {
+		t.Fatalf("resolve account: %v", rerr)
+	}
 
 	if _, err := provision.Add(ctx, r, account); err != nil {
 		t.Fatalf("provision.Add(%s): %v", account, err)

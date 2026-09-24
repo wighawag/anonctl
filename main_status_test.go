@@ -308,3 +308,37 @@ func TestStatusDoesNotCallAMissingAccountNotProvisionedWhenTheRecordIsUnreadable
 		t.Errorf("identity = %+v, want ok=false", got.Identity)
 	}
 }
+
+// `status --json` carries a SCHEMA VERSION. verify, the marker and the account
+// config all had one; the two documents a sibling tool actually parses (`status`
+// and `list`) did not, which is what made the `list` reshape impossible to announce
+// cleanly. Adding it here is purely ADDITIVE: every existing field name is
+// unchanged, so a consumer pinned to the old shape is unaffected and gains a
+// version to guard on.
+func TestStatusJSONIsVersionedAdditively(t *testing.T) {
+	swapStatusSeams(t)
+	r := &declaredFakeRunner{uids: map[string]int{"anon-01": 1500, "anon-01-shim": 412}}
+	out := captureStdout(t, func() {
+		if code := runStatus(context.Background(), r, mustParse(t, []string{"status", "01", "--json"})); code != 0 {
+			t.Fatalf("status --json != 0")
+		}
+	})
+
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("unparseable: %v\n%s", err, out)
+	}
+	v, ok := got["schemaVersion"]
+	if !ok {
+		t.Fatalf("status --json must carry a schemaVersion:\n%s", out)
+	}
+	if int(v.(float64)) != statusSchemaVersion {
+		t.Errorf("schemaVersion = %v, want %d", v, statusSchemaVersion)
+	}
+	// The additive promise: the fields a consumer already reads are all still there.
+	for _, key := range []string{"account", "shim", "exists", "shimExists", "uid", "forced", "sudoChecked", "sudoAllowed", "identity"} {
+		if _, ok := got[key]; !ok {
+			t.Errorf("status --json dropped the pre-existing field %q; this change must be ADDITIVE:\n%s", key, out)
+		}
+	}
+}

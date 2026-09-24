@@ -97,13 +97,20 @@ func Install(ctx context.Context, d Deps, c accountconfig.Config, exemptions []l
 	if err != nil {
 		return fmt.Errorf("forcing: %w", err)
 	}
-	if err := d.ConfigStore.Write(c); err != nil {
-		return fmt.Errorf("forcing: persist account config: %w", err)
-	}
-
+	// GENERATE BEFORE PERSISTING. Generate is pure and validates the whole Params (a
+	// zero uid, equal uids, a hostname endpoint, an account name whose nft table name
+	// would be ambiguous), so it is the last thing that can REFUSE this install. Doing
+	// it after the ledger write left a record on disk for an account that then got no
+	// forcing at all - and the ledger is what `list` now reads managed-ness from, so
+	// that residue reports as `managed: true, forcing: unforced`, i.e. "anonctl took
+	// this account on and has not proven it yet" rather than "this install was
+	// refused". A refusal must leave nothing behind.
 	ruleset, err := nftables.Generate(nftParams(c, exemptions))
 	if err != nil {
 		return fmt.Errorf("forcing: generate ruleset: %w", err)
+	}
+	if err := d.ConfigStore.Write(c); err != nil {
+		return fmt.Errorf("forcing: persist account config: %w", err)
 	}
 	// Apply the live rules (fail-closed default-DROP) FIRST, then persist the rule
 	// file the boot drop-in loads, so the running state and the persisted state

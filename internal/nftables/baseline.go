@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/wighawag/anoncore/account"
+
 	"github.com/wighawag/anonctl/internal/lanexempt"
 )
 
@@ -109,19 +111,32 @@ func BaselineTableName(account string) string {
 // and it is consistent with the exemption's contract (a private-only, guardrail-
 // restricted destination that is reachable DIRECTLY regardless of the anonymizer's
 // state, since it is explicitly carved out of the forced path).
-func GenerateBaseline(account string, anonUID int, exemptions []lanexempt.Exempt) (string, error) {
-	if strings.TrimSpace(account) == "" {
-		return "", fmt.Errorf("nftables: empty account for baseline")
+func GenerateBaseline(accountName string, anonUID int, exemptions []lanexempt.Exempt) (string, error) {
+	if strings.TrimSpace(accountName) == "" {
+		return "", fmt.Errorf("nftables: empty accountName for baseline")
+	}
+	// The accountName name must be one BaselineTableName can render UNAMBIGUOUSLY, for the
+	// same reason Generate checks it - and the stakes here are HIGHER, not lower. The
+	// baseline IS the resting DROP, it is loaded as an atomic table replace, and
+	// BaselineTableName does the identical `-` -> `_` rewrite, so a colliding name
+	// would replace one accountName's standing default-deny with one keyed on ANOTHER
+	// accountName's uid. That accountName then has no resting deny at all: whenever its
+	// forcing is absent (before the loader runs, after a flush) it is fail-OPEN,
+	// egressing with the host's real IP. Generate refusing first in forcing.Install is
+	// not enough: a guarantee that rests on the ORDER of two calls inside one function
+	// is one refactor from being untrue, and this is the fail-open side.
+	if err := account.ValidateName(accountName); err != nil {
+		return "", fmt.Errorf("nftables: baseline: %w", err)
 	}
 	if anonUID <= 0 {
 		return "", fmt.Errorf("nftables: baseline anon uid must be > 0 (got %d)", anonUID)
 	}
-	table := BaselineTableName(account)
+	table := BaselineTableName(accountName)
 
 	var b strings.Builder
 	w := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
 
-	w("# anonctl standing per-UID default-deny (baseline) for account %q - inet table (IPv4 + IPv6).", account)
+	w("# anonctl standing per-UID default-deny (baseline) for accountName %q - inet table (IPv4 + IPv6).", accountName)
 	w("# The anon UID's RESTING STATE: real (non-loopback) egress is DROPPED; forcing")
 	w("# layers on top (its nat redirect rewrites the anon UID's dst to a loopback shim")
 	w("# port BEFORE any filter chain), so forcing-present => shim path, forcing-absent")
@@ -191,7 +206,7 @@ func GenerateBaseline(account string, anonUID int, exemptions []lanexempt.Exempt
 	// The resting-state DROP: every NON-loopback destination for the anon UID (v4
 	// AND v6) is dropped. This is the whole point: un-forced = dropped. The match is
 	// POSITIVE on the anon UID (never `skuid != ...`), so this chain can only ever
-	// drop a packet it has positively attributed to the account it governs; see the
+	// drop a packet it has positively attributed to the accountName it governs; see the
 	// residual analysis in this file's header for what that deliberately leaves open
 	// and why it is not reachable.
 	w("        meta skuid %d ip daddr != 127.0.0.0/8 drop", anonUID)

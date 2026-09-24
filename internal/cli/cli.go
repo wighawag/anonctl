@@ -34,6 +34,13 @@ type Command struct {
 	Account string
 
 	// JSON requests machine-readable output. Meaningful for status (and list);
+	// NameWarning is a non-fatal note about the account NAME, printed to stderr by the
+	// caller before the verb runs. It is set when a READ or TEARDOWN verb was given a
+	// name that the forcing verbs refuse (an account an older anonctl created under a
+	// name whose nftables table name is ambiguous): the verb proceeds, but the operator
+	// is told. Empty for every well-formed name.
+	NameWarning string
+
 	// ignored by the mutating verbs.
 	JSON bool
 
@@ -127,6 +134,7 @@ var verbs = map[string]bool{
 	"rm":          true,
 	"list":        true,
 	"status":      true,
+	"probe":       true,
 	"verify":      true,
 	"update":      true,
 	"reconfigure": true,
@@ -240,7 +248,11 @@ func Parse(args []string) (*Command, error) {
 	case 0:
 		cmd.Account = DefaultAccount
 	case 1:
-		cmd.Account = ResolveAccount(positionals[0])
+		resolved, warning, err := resolveFor(verb, positionals[0])
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", verb, err)
+		}
+		cmd.Account, cmd.NameWarning = resolved, warning
 	default:
 		return nil, fmt.Errorf("%s takes at most one account name (got %d)", verb, len(positionals))
 	}
@@ -273,7 +285,11 @@ func parseExec(cmd *Command, rest []string) (*Command, error) {
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
 		if wantAsValue {
-			cmd.Account = ResolveAccount(a)
+			resolved, warning, err := resolveFor("exec", a)
+			if err != nil {
+				return nil, fmt.Errorf("exec: --as: %w", err)
+			}
+			cmd.Account, cmd.NameWarning = resolved, warning
 			wantAsValue = false
 			continue
 		}
@@ -281,7 +297,11 @@ func parseExec(cmd *Command, rest []string) (*Command, error) {
 		case a == "--as":
 			wantAsValue = true
 		case strings.HasPrefix(a, "--as="):
-			cmd.Account = ResolveAccount(strings.TrimPrefix(a, "--as="))
+			resolved, warning, err := resolveFor("exec", strings.TrimPrefix(a, "--as="))
+			if err != nil {
+				return nil, fmt.Errorf("exec: --as: %w", err)
+			}
+			cmd.Account, cmd.NameWarning = resolved, warning
 		case a == "--skip-tor-exit-check":
 			cmd.SkipTorExitCheck = true
 		case strings.HasPrefix(a, "-"):
@@ -324,7 +344,50 @@ func (c *Command) addExemption(verb, raw string) error {
 // double-prefixed (`anon-work` stays `anon-work`, never `anon-anon-work`). The
 // implementation lives in anoncore/account (shared with anoncore/provision); this
 // is a thin re-export so anonctl's callers keep the cli.ResolveAccount name.
-func ResolveAccount(name string) string { return account.ResolveAccount(name) }
+//
+// It can REFUSE a name: anonctl derives each account's nftables table name from
+// the account (`anonctl_<account>`, with `-` rewritten to `_`), and that
+// derivation is only unambiguous for lowercase letters, digits and `-`. Parse
+// surfaces the refusal as a usage error, so a colliding name is rejected at the
+// command line, before any verb mutates anything.
+func ResolveAccount(name string) (string, error) { return account.ResolveAccount(name) }
+
+// installingVerbs are the verbs that CREATE or RE-APPLY an account's forcing, and
+// therefore the ones that would bring a new per-account nftables table into
+// existence. They are the verbs that REFUSE an account name anonctl cannot name
+// unambiguously in the kernel.
+//
+// The gate is per-verb rather than global for a reason that only shows up on an
+// UPGRADE. An older anonctl accepted `anon-a_b` and installed forcing for it, so
+// the refusal must not apply to `rm` - a naming rule that makes an existing
+// account impossible to tear down has turned a bug into a trap - nor to the read
+// verbs an operator would use to look at it first. Those resolve through
+// account.ResolveAccountLegacy and carry a WARNING instead.
+//
+// This does not weaken the guarantee that no colliding ruleset is ever installed:
+// nftables.Generate refuses an ambiguous account name itself, so every path that
+// would load rules is closed, including one that never went through argv.
+var installingVerbs = map[string]bool{
+	"add":         true,
+	"update":      true,
+	"reconfigure": true,
+}
+
+// resolveFor resolves an account name for a verb: STRICTLY for the verbs that
+// install forcing (a refusal, before anything is mutated), LENIENTLY plus a
+// warning for the read/teardown verbs, so an account an older build created stays
+// inspectable and removable.
+func resolveFor(verb, name string) (account_ string, warning string, err error) {
+	resolved, verr := account.ResolveAccount(name)
+	if verr == nil {
+		return resolved, "", nil
+	}
+	if installingVerbs[verb] {
+		return "", "", verr
+	}
+	legacy := account.ResolveAccountLegacy(name)
+	return legacy, fmt.Sprintf("%v.\nProceeding anyway because `%s` only reads or tears down: an account an older anonctl created under this name must stay inspectable and removable. `anonctl add`/`update` refuse it.", verr, verb), nil
+}
 
 // ShimAccount returns the dedicated shim service-account name for an anon
 // account: `anon` -> `anon-shim`, `anon-<name>` -> `anon-<name>-shim`. Each anon

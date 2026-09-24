@@ -62,7 +62,10 @@ func TestRealRmDisablesShimBeforeUserdelLeavesNoResidue(t *testing.T) {
 
 	ctx := context.Background()
 	r := provision.ExecRunner{}
-	account := cli.ResolveAccount("rmteardown-" + strconv.Itoa(os.Getpid()))
+	account, rerr := cli.ResolveAccount("rmteardown-" + strconv.Itoa(os.Getpid()))
+	if rerr != nil {
+		t.Fatalf("resolve account: %v", rerr)
+	}
 	shim := cli.ShimAccount(account)
 	instance := systemd.InstanceName(account)
 

@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/wighawag/anoncore/accountconfig"
+	"github.com/wighawag/anoncore/configroot"
 	"github.com/wighawag/anonctl/internal/lanexempt"
 	"github.com/wighawag/anonctl/internal/nftables"
 )
@@ -49,6 +50,12 @@ type Store struct {
 	// LegacyUnitDir (the package const) when empty. Behind a field so the migration is
 	// testable against a scratch dir instead of the host's real /etc/systemd/system.
 	LegacyUnitDir string
+	// RootDir is the SHARED config root (`/etc/anonctl`) that EnvDir and RulesDir live
+	// under, and whose mode is owned by configroot rather than by whichever store
+	// happens to create it. Empty is resolved by configroot.RootFor: the real root when
+	// EnvDir is at its default (production), and NO root when it has been repointed at
+	// a scratch dir, so a test can never make this package chmod a scratch dir's parent.
+	RootDir string
 }
 
 // UnitDirEnv lets an operator repoint the unit dir on a host whose layout does not
@@ -91,7 +98,7 @@ func DefaultStore() Store {
 			}
 		}
 	}
-	return Store{UnitDir: unitDir, EnvDir: DefaultEnvDir, RulesDir: DefaultRulesDir, LegacyUnitDir: LegacyUnitDir}
+	return Store{UnitDir: unitDir, EnvDir: DefaultEnvDir, RulesDir: DefaultRulesDir, LegacyUnitDir: LegacyUnitDir, RootDir: configroot.DefaultDir}
 }
 
 // isKnownUnitSearchDir reports whether dir is one of systemd's standard system unit
@@ -103,6 +110,20 @@ func isKnownUnitSearchDir(dir string) bool {
 		}
 	}
 	return false
+}
+
+// rootDir resolves the shared config root for ONE of this store's directories.
+//
+// It is per-directory rather than resolved once from EnvDir, because EnvDir and
+// RulesDir can be configured independently. Deriving the root from EnvDir alone
+// and reusing it for RulesDir is safe in the mixed case one way round (a scratch
+// RulesDir under the real root is refused loudly by EnsureUnder) and NOT safe the
+// other: a scratch EnvDir would yield "no root", and the real `/etc/anonctl/nftables`
+// would then be created with the shared parent never ensured - the exact side-effect
+// this whole mechanism exists to prevent. Asking per directory removes the coupling
+// instead of relying on every caller setting both.
+func (s Store) rootDirFor(dir, defaultDir string) string {
+	return configroot.RootFor(s.RootDir, dir, defaultDir)
 }
 
 func (s Store) unitDir() string   { return orDefault(s.UnitDir, DefaultUnitDir) }
@@ -420,14 +441,20 @@ func (s Store) WriteAccount(c accountconfig.Config, ruleset string) error {
 	if err != nil {
 		return fmt.Errorf("systemd: generate baseline default-deny: %w", err)
 	}
-	if err := os.MkdirAll(s.envDir(), dirModePrivate); err != nil {
+	// Both the env dir and the rules dir live UNDER the shared config root
+	// (`/etc/anonctl`), so they are created through configroot: it ensures the root at
+	// the root's own mode FIRST, so this store's private 0700 can never become the
+	// mode of the shared parent as a side effect of MkdirAll creating a missing
+	// ancestor. anonctl has three writers under that one directory and "whichever
+	// touches it first decides its mode" is exactly the defect being closed.
+	if err := configroot.EnsureUnder(s.rootDirFor(s.EnvDir, DefaultEnvDir), s.envDir(), dirModePrivate); err != nil {
 		return fmt.Errorf("systemd: create env dir %q: %w", s.envDir(), err)
 	}
 	envPath := filepath.Join(s.envDir(), c.Account+".env")
 	if err := writeFileMode(envPath, []byte(EnvFile(c)), envMode); err != nil {
 		return fmt.Errorf("systemd: write env file: %w", err)
 	}
-	if err := os.MkdirAll(s.rulesDir(), dirModePrivate); err != nil {
+	if err := configroot.EnsureUnder(s.rootDirFor(s.RulesDir, DefaultRulesDir), s.rulesDir(), dirModePrivate); err != nil {
 		return fmt.Errorf("systemd: create rules dir %q: %w", s.rulesDir(), err)
 	}
 	// The baseline is named `<account>.baseline.nft` and the forcing rules

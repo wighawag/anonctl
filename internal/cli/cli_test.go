@@ -1,6 +1,7 @@
 package cli_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/wighawag/anonctl/internal/cli"
@@ -512,5 +513,70 @@ func TestParseAllowNSSBypass(t *testing.T) {
 	}
 	if cmd.AllowNSSBypass {
 		t.Error("AllowNSSBypass must default to FALSE: the safe default is to refuse a host that resolves out of process")
+	}
+}
+
+// Name resolution REFUSES an account name anonctl cannot name unambiguously in the
+// kernel. `add a_b` and `add a-b` would both derive the nft table `anonctl_anon_a_b`
+// (nft identifiers cannot contain `-`, so anonctl rewrites `-` to `_`), and since the
+// ruleset is loaded as an atomic table REPLACE, adding the second would silently
+// replace the first account's forcing. The refusal happens at PARSE time, before any
+// verb touches the box.
+func TestParseRefusesAnAccountNameThatCollidesInTheNftTableName(t *testing.T) {
+	// The verbs that CREATE or RE-APPLY forcing refuse it outright, before any mutation.
+	for _, verb := range []string{"add", "update", "reconfigure"} {
+		if _, err := cli.Parse([]string{verb, "a_b"}); err == nil {
+			t.Errorf("%s a_b: parsed with no error; a verb that installs forcing must refuse an ambiguous name", verb)
+		}
+	}
+	// The legal twin still parses, so the guard rejects the ambiguity and nothing else.
+	cmd, err := cli.Parse([]string{"add", "a-b"})
+	if err != nil {
+		t.Fatalf("add a-b must still parse: %v", err)
+	}
+	if cmd.Account != "anon-a-b" {
+		t.Errorf("Account = %q, want anon-a-b", cmd.Account)
+	}
+	if cmd.NameWarning != "" {
+		t.Errorf("a well-formed name must carry no warning; got %q", cmd.NameWarning)
+	}
+}
+
+// ...but the READ and TEARDOWN verbs still accept it, WITH A WARNING. An OLDER
+// anonctl accepted `a_b` and installed forcing for it, so a blanket refusal would
+// leave that account with no `status` to inspect it and - the real trap - no `rm`
+// to remove it. A naming rule must not turn an existing account into one the tool
+// can no longer tear down.
+func TestReadAndTeardownVerbsStillReachAnAccountAnOlderBuildCreated(t *testing.T) {
+	for _, verb := range []string{"rm", "status", "probe", "verify", "use", "seed-home"} {
+		cmd, err := cli.Parse([]string{verb, "a_b"})
+		if err != nil {
+			t.Errorf("%s a_b: refused (%v); a read/teardown verb must still reach an account an older anonctl created", verb, err)
+			continue
+		}
+		if cmd.Account != "anon-a_b" {
+			t.Errorf("%s a_b: Account = %q, want anon-a_b", verb, cmd.Account)
+		}
+		if cmd.NameWarning == "" {
+			t.Errorf("%s a_b: proceeding on an ambiguous name must WARN; got no warning", verb)
+		}
+	}
+	if _, err := cli.Parse([]string{"exec", "--as", "a_b", "true"}); err != nil {
+		t.Errorf("exec --as a_b: refused (%v); exec installs no forcing", err)
+	}
+}
+
+// The refusal must EXPLAIN ITSELF in nft terms: an operator who is told only
+// "invalid account name" learns nothing about why a perfectly ordinary Unix name
+// was rejected.
+func TestTheNameRefusalExplainsTheNftReason(t *testing.T) {
+	_, err := cli.Parse([]string{"add", "a_b"})
+	if err == nil {
+		t.Fatal("expected a refusal")
+	}
+	for _, want := range []string{"nftables", "table", "underscore"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal must mention %q; got: %v", want, err)
+		}
 	}
 }

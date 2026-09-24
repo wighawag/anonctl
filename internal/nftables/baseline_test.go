@@ -243,6 +243,28 @@ func TestGenerateBaselineRejectsBadParams(t *testing.T) {
 	}
 }
 
+// The BASELINE generator must refuse an ambiguous account name too, and this is the
+// HIGHER-stakes half of that rule, not an afterthought. BaselineTableName does the
+// same `-` -> `_` rewrite, the load is an atomic table REPLACE, and the baseline is
+// the standing DROP - so a colliding name replaces one account's resting default-deny
+// with one keyed on another account's uid, leaving the first fail-OPEN whenever its
+// forcing is absent. Relying on Generate being called first inside forcing.Install
+// would make that guarantee a property of CALL ORDERING; this makes it a property of
+// the generator, which is where it has to live.
+func TestGenerateBaselineRefusesAnAmbiguousAccountName(t *testing.T) {
+	_, err := nftables.GenerateBaseline("anon-a_b", 8801, nil)
+	if err == nil {
+		t.Fatal("GenerateBaseline accepted an account name whose baseline table name is ambiguous; it must refuse")
+	}
+	if !strings.Contains(err.Error(), "underscore") {
+		t.Errorf("the refusal must name the reason; got: %v", err)
+	}
+	// The legal twin still generates, so the guard rejects the ambiguity and nothing else.
+	if _, err := nftables.GenerateBaseline("anon-a-b", 8801, nil); err != nil {
+		t.Errorf("a legal account name must still generate a baseline: %v", err)
+	}
+}
+
 // THE BOOT-INVARIANT HOLE A LOOPBACK RESOLVER WOULD OTHERWISE OPEN.
 //
 // The baseline RETURNS loopback because forcing rewrites the account's traffic to
