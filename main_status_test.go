@@ -342,3 +342,87 @@ func TestStatusJSONIsVersionedAdditively(t *testing.T) {
 		}
 	}
 }
+
+// THE REGRESSION THE DOWNSTREAM CONSUMER REPORTED.
+//
+// `status --json` used to exit 1 and print NOTHING when the marker could not be
+// read, while `list` degraded to an honest `unknown` - so the verb carrying the
+// most detail was the one a consumer could get no partial truth from, over a single
+// field whose usual cause is simply running without privilege. It was inconsistent
+// with `status`'s own handling of the LEDGER too, where `record-unreadable` has
+// always been a named state rather than an absence.
+func TestStatusJSONDegradesInsteadOfRefusingOnAnUnreadableMarker(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("models an unprivileged caller; root can read anything")
+	}
+	swapStatusSeams(t)
+	// Make the marker genuinely unreadable, the way an unprivileged caller meets it.
+	if err := os.Chmod(markerStore.BaseDir, 0o000); err != nil {
+		t.Fatalf("chmod marker dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(markerStore.BaseDir, 0o755) })
+
+	r := &declaredFakeRunner{uids: map[string]int{"anon-01": 1500, "anon-01-shim": 412}}
+	var code int
+	out := captureStdout(t, func() {
+		code = runStatus(context.Background(), r, mustParse(t, []string{"status", "01", "--json"}))
+	})
+	if code != 0 {
+		t.Fatalf("status --json exited %d on an unreadable marker; it must still emit its document.\n%s", code, out)
+	}
+
+	var got struct {
+		SchemaVersion int    `json:"schemaVersion"`
+		Account       string `json:"account"`
+		Exists        bool   `json:"exists"`
+		UID           string `json:"uid"`
+		Forced        *bool  `json:"forced"`
+		Forcing       struct {
+			State  string `json:"state"`
+			Reason string `json:"reason"`
+		} `json:"forcing"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("status --json must still be valid JSON (%v):\n%s", err, out)
+	}
+	if got.Forced != nil {
+		t.Errorf("forced = %v for an UNREADABLE marker; want null (undetermined), never a bool", *got.Forced)
+	}
+	if got.Forcing.State != "unknown" || got.Forcing.Reason == "" {
+		t.Errorf("forcing = %+v; want state unknown with a reason", got.Forcing)
+	}
+	// The whole point: everything that WAS established is still reported.
+	if got.Account != "anon-01" || !got.Exists || got.UID != "1500" {
+		t.Errorf("the established fields must survive an unreadable marker; got %+v", got)
+	}
+	if got.SchemaVersion != statusSchemaVersion {
+		t.Errorf("schemaVersion = %d, want %d", got.SchemaVersion, statusSchemaVersion)
+	}
+}
+
+// ...and the human form says UNKNOWN rather than "no", so an unprivileged operator
+// cannot read a confident negative off a marker nobody could open.
+func TestStatusHumanFormSaysUnknownNotNoForAnUnreadableMarker(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("models an unprivileged caller")
+	}
+	swapStatusSeams(t)
+	if err := os.Chmod(markerStore.BaseDir, 0o000); err != nil {
+		t.Fatalf("chmod marker dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(markerStore.BaseDir, 0o755) })
+
+	r := &declaredFakeRunner{uids: map[string]int{"anon-01": 1500, "anon-01-shim": 412}}
+	out := captureStdout(t, func() {
+		runStatus(context.Background(), r, mustParse(t, []string{"status", "01"}))
+	})
+	if !strings.Contains(out, "forced: UNKNOWN") {
+		t.Errorf("the forcing line must read UNKNOWN for an unreadable marker:\n%s", out)
+	}
+	if strings.Contains(out, "forced: no") {
+		t.Errorf("an unreadable marker must never render as a confident 'no':\n%s", out)
+	}
+	if !strings.Contains(out, "UNDETERMINED") {
+		t.Errorf("the line must say why it is not a no:\n%s", out)
+	}
+}

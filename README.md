@@ -127,7 +127,7 @@ anonctl add    [--endpoint <socks5h://host:port>] [--allow <IP|CIDR:port>]... [<
 anonctl rm     [--purge-account] [<name>]                    remove forcing; --purge-account also deletes the account (root)
 anonctl seed-home [--from <dir>] [--force] [<name>]          copy a template dir into the account's home (root)
 anonctl list   [--json]                                      list the anon accounts: passwd existence + managed-ness + a tri-state forcing verdict
-anonctl status [<name>] [--json]                             show one account's state
+anonctl status [<name>] [--json]                             show one account's state (never refuses over a field it could not read)
 anonctl probe  [<name>] [--json]                             cheap live "is it jailed RIGHT NOW" (no network; non-zero exit when not)
 anonctl verify [<name>] [--json]                             PROVE the account is anonymized (non-zero exit on failure)
 anonctl use    [<name>]                                      verify, then open a shell as the account ONLY on green (root)

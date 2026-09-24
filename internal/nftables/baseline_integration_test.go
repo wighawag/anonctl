@@ -146,8 +146,14 @@ func TestBaselineDropsWhenForcingAbsent(t *testing.T) {
 // setprivDialReachedNft dials addr AS the given UID via a tiny inline helper run
 // under setpriv, so the connection egresses from the anon UID and exercises the
 // real nft `meta skuid` rules. It returns whether the dial REACHED its target (true
-// == a leak). A helper-build or setpriv failure yields reached=false (the
-// fail-closed reading), never a false REACHED. It mirrors the systemd
+// == a leak).
+//
+// A PROBE THAT COULD NOT RUN IS NOT A PASS. The callers here all assert reached ==
+// false, so inferring the verdict from the ABSENCE of a `REACHED` token would make
+// "setpriv refused the uid" indistinguishable from "the packet was dropped" and the
+// baseline default-deny would certify itself without a single packet being sent.
+// The helper always prints `REACHED` or `DROPPED:<reason>`; require one and fail
+// loudly on neither, as verify's runSetprivProbe does. It mirrors the systemd
 // boot-invariant test's setprivDialReached (kept local to this package's tag).
 func setprivDialReachedNft(t *testing.T, ctx context.Context, uid int, network, addr string) bool {
 	t.Helper()
@@ -172,6 +178,20 @@ func main(){
 		t.Fatalf("build probe helper: %v: %s", err, out)
 	}
 	cmd := exec.CommandContext(ctx, "setpriv", "--reuid", strconv.Itoa(uid), "--clear-groups", bin, network, addr)
-	out, _ := cmd.CombinedOutput()
-	return strings.Contains(string(out), "REACHED")
+	out, runErr := cmd.CombinedOutput()
+	s := string(out)
+	switch {
+	case strings.Contains(s, "REACHED"):
+		return true
+	case strings.Contains(s, "DROPPED"):
+		return false
+	case ctx.Err() == context.DeadlineExceeded:
+		t.Fatalf("the anon-UID probe timed out before printing a verdict (dial to %s %s outran the deadline); "+
+			"this is NOT a drop and must not be read as one: %q", network, addr, strings.TrimSpace(s))
+	default:
+		t.Fatalf("the anon-UID probe COULD NOT RUN (setpriv could not drop to uid %d, or the helper did not execute): %v: %q. "+
+			"A probe that never ran is not a pass: these assertions expect reached==false, so returning false "+
+			"would certify the baseline default-deny without testing it.", uid, runErr, strings.TrimSpace(s))
+	}
+	return false
 }

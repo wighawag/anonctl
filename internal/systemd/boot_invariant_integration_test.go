@@ -266,8 +266,22 @@ func listLoadedTable(t *testing.T, r nftExec, table string) string {
 // setprivDialReached dials addr AS the given UID via a tiny inline helper run under
 // setpriv, so the connection egresses from the anon UID and exercises the real nft
 // `meta skuid` rules. It returns whether the dial REACHED its target (true == a
-// leak). A helper-build or setpriv failure yields reached=false (the fail-closed
-// reading), never a false REACHED. It mirrors verify's runSetprivProbe.
+// leak).
+//
+// A PROBE THAT COULD NOT RUN IS NOT A PASS, and getting that wrong here is
+// specifically dangerous because of the POLARITY: every caller asserts reached ==
+// false, so "the probe never ran" and "the packet was dropped" produce the same
+// verdict and the boot invariant certifies itself without being tested. This used
+// to discard the exit status and read the verdict from the ABSENCE of a token
+// (`out, _ := cmd.CombinedOutput(); return strings.Contains(out, "REACHED")`), so
+// setpriv refusing the uid, the helper failing to exec, or the deadline firing all
+// read as a clean DROP. Demonstrated under `unshare -rn`, where the uid is unmapped
+// and `setpriv --reuid` fails outright: the test passed having dialled nothing.
+//
+// The helper ALWAYS prints exactly `REACHED` or `DROPPED:<reason>`, so the honest
+// contract is to REQUIRE one of them and fail loudly on neither, which is what
+// verify's runSetprivProbe already does. Do not weaken this back into an
+// absence-of-token inference.
 func setprivDialReached(t *testing.T, ctx context.Context, uid int, network, addr string) bool {
 	t.Helper()
 	if _, err := exec.LookPath("go"); err != nil {
@@ -291,6 +305,30 @@ func main(){
 		t.Fatalf("build probe helper: %v: %s", err, out)
 	}
 	cmd := exec.CommandContext(ctx, "setpriv", "--reuid", strconv.Itoa(uid), "--clear-groups", bin, network, addr)
-	out, _ := cmd.CombinedOutput()
-	return strings.Contains(string(out), "REACHED")
+	out, runErr := cmd.CombinedOutput()
+	return readProbeVerdict(t, ctx, uid, network, addr, string(out), runErr)
+}
+
+// readProbeVerdict turns a probe helper's output into a verdict, REFUSING to infer
+// one from the absence of a token. Neither sentinel means the probe did not run to
+// completion under the anon UID, which is an un-runnable probe, not a dropped
+// connection: it fails the test loudly rather than handing back the value every
+// caller reads as a pass. The two ways that happens are distinguished so the
+// failure names the real cause instead of sending diagnosis down the wrong path.
+func readProbeVerdict(t *testing.T, ctx context.Context, uid int, network, addr, out string, runErr error) bool {
+	t.Helper()
+	switch {
+	case strings.Contains(out, "REACHED"):
+		return true
+	case strings.Contains(out, "DROPPED"):
+		return false
+	case ctx.Err() == context.DeadlineExceeded:
+		t.Fatalf("the anon-UID probe timed out before printing a verdict (dial to %s %s outran the deadline); "+
+			"this is NOT a drop and must not be read as one: %q", network, addr, strings.TrimSpace(out))
+	default:
+		t.Fatalf("the anon-UID probe COULD NOT RUN (setpriv could not drop to uid %d, or the helper did not execute): %v: %q. "+
+			"A probe that never ran is not a pass: the assertions here all expect reached==false, so returning false "+
+			"would certify the boot invariant without testing it.", uid, runErr, strings.TrimSpace(out))
+	}
+	return false
 }

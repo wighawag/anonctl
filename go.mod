@@ -3,7 +3,7 @@ module github.com/wighawag/anonctl
 go 1.26
 
 require (
-	github.com/wighawag/anoncore v0.3.0
+	github.com/wighawag/anoncore v0.4.0
 	golang.org/x/net v0.52.0
 )
 

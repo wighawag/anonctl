@@ -911,10 +911,16 @@ type statusReport struct {
 	Identity statusIdentity `json:"identity"`
 }
 
-// statusSchemaVersion is the version of the `status --json` document. It starts at
-// 1: unlike `list`, this document's shape is UNCHANGED (the version is purely
-// additive), so there is no earlier broken shape to number around.
-const statusSchemaVersion = 1
+// statusSchemaVersion is the version of the `status --json` document.
+//
+// It is 2. Version 1 was this same document with `forced` as a plain bool - and,
+// more importantly, with NO DOCUMENT AT ALL when the marker could not be read (the
+// verb exited 1 and printed an error). `forced` is now null when undetermined, and
+// there is a `forcing` object carrying the tri-state and its reason, identical in
+// shape to the one `list` emits so the two verbs cannot disagree about how they say
+// "I could not tell". A consumer that treated a non-zero exit as "not forced" was
+// already wrong; one that read `forced` as a bool must now handle null.
+const statusSchemaVersion = 2
 
 // statusIdentity is the machine-readable identity verdict: the same classification
 // `verify`'s account-identity precondition gates on (verify.AccountIdentity.State),
@@ -956,13 +962,15 @@ func runStatus(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 		errorf("status: %v", err)
 		return 1
 	}
-	// Read the marker (the same dependency-free truth a sibling tool reads). A
-	// missing marker is a clean "not forced", not an error.
-	st, err = st.WithMarker(markerStore)
-	if err != nil {
-		errorf("status: reading marker: %v", err)
-		return 1
-	}
+	// Read the marker (the same dependency-free truth a sibling tool reads). A missing
+	// marker is a clean "not forced"; an UNREADABLE one is `unknown` WITH ITS REASON,
+	// and neither aborts the verb. This used to exit 1 with no document at all, which
+	// made the richest verb the one a consumer could get no partial truth from - over a
+	// single field, whose usual cause is just running without privilege, while the
+	// eight other things `status` had already established went unreported. It was also
+	// inconsistent with this verb's own handling of the LEDGER right below, where an
+	// unreadable record has always been a named state rather than an absence.
+	st = st.WithMarker(markerStore)
 	// The identity comparison: the live uids (above) against the uids anonctl recorded
 	// when it installed the forcing (the ledger). accountIdentity holds the two apart;
 	// State classifies the disagreement.
@@ -1041,12 +1049,40 @@ func runStatus(ctx context.Context, r provision.Runner, cmd *cli.Command) int {
 	} else {
 		fmt.Printf("  sudo: %s (could not determine sudo rights from `sudo -l -U`; not confirmed absent)\n", outStyle.Yellow("UNKNOWN"))
 	}
-	if st.Forced && st.Marker != nil {
-		fmt.Printf("  forced: %s (endpoint class %s, marked %s)\n", outStyle.Green("yes"), st.Marker.EndpointClass, st.Marker.CreatedAt)
-	} else {
+	// The forcing line is a TRI-STATE, like every other undetermined answer anonctl
+	// reports: yes / no / UNKNOWN-with-its-reason. An unprivileged operator must not
+	// read "no" off a marker nobody could open.
+	switch st.Forcing.State {
+	case provision.StateForced:
+		if st.Marker != nil {
+			fmt.Printf("  forced: %s (endpoint class %s, marked %s)\n", outStyle.Green("yes"), st.Marker.EndpointClass, st.Marker.CreatedAt)
+		} else {
+			fmt.Printf("  forced: %s\n", outStyle.Green("yes"))
+		}
+	case provision.StateUnforced:
 		fmt.Printf("  forced: %s (no marker)\n", outStyle.Yellow("no"))
+	default:
+		fmt.Printf("  forced: %s (the marker could not be read, so this is UNDETERMINED - not a \"no\": %s)\n",
+			outStyle.Yellow("UNKNOWN"), st.Forcing.Reason)
+		fmt.Printf("    the marker lives at %s; re-run as root, or check the mode of /etc/anonctl\n", markerPathHint(st.Account))
+	}
+	// The boot-freshness hint belongs with the forcing line: a marker is a claim that
+	// verify passed at SOME point, and `probe` is what answers "right now".
+	if st.Forcing.State == provision.StateForced {
+		fmt.Printf("    this is a CLAIM that `verify` passed, not a live proof; `%s` checks the rules are loaded right now\n",
+			outStyle.Cyan("anonctl probe "+accountArg(st.Account)))
 	}
 	return 0
+}
+
+// markerPathHint names the marker file for an account, for an error/UNKNOWN line.
+// A malformed name (which cannot produce a path) degrades to the directory rather
+// than printing nothing.
+func markerPathHint(account string) string {
+	if p, err := markerStore.Path(account); err == nil {
+		return p
+	}
+	return marker.DefaultBaseDir
 }
 
 // probeNftRun is the seam `probe` reads the live ruleset through (`nft list table
