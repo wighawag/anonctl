@@ -142,18 +142,31 @@ func TestBootInvariantAnonUIDHasNoDirectEgressBeforeShim(t *testing.T) {
 		t.Fatalf("persisted baseline did not load the baseline table %q", baselineTable)
 	}
 
-	// THE BOOT INVARIANT: with the rules up but the shim NOT running, the anon UID's
-	// direct outbound connection must be DROPPED. We probe a direct dial to a public
-	// address AS the anon UID; the worst acceptable outcome is DROPPED (fail-closed),
-	// never REACHED (a leak). A public dst is used so a REACHED would be a real
-	// external leak; the default-DROP (no shim to redirect into) guarantees it drops.
-	reached := setprivDialReached(t, ctx, anonUID, "tcp", "1.1.1.1:443")
-	if reached {
-		t.Errorf("BOOT INVARIANT VIOLATED: the anon UID reached 1.1.1.1:443 directly with the shim NOT running (a leak); at boot, before the shim is up, egress must be DROPPED")
-	}
-
-	// Also assert the persisted ruleset actually carries the fail-closed drops (so the
-	// drop above is by an EXPLICIT RULE, not by a missing route).
+	// ORDER IS LOAD-BEARING HERE, AND IT IS ABOUT CAPABILITIES, NOT TIDINESS.
+	//
+	// The assertions below need only `nft` (the rules are already loaded). The DIAL
+	// PROBE after them additionally needs `setpriv` to actually assume the anon uid,
+	// which a constrained environment cannot always do - inside `unshare -rn` the uid
+	// is unmapped and setpriv fails outright - and that probe now FAILS LOUDLY when it
+	// cannot run, because a probe that could not run must never be read as a pass.
+	//
+	// Those two facts combine badly in the other order: the probe aborts the test and
+	// takes the ruleset assertions down with it, so a host loses the results of the
+	// capability it HAS because of the one it lacks. Running the portable half first
+	// means such a host still verifies the ruleset shape and reports only the boot
+	// invariant as untestable. That is the same principle as the loud-probe fix itself:
+	// one unavailable capability must not hide the answers you could have had.
+	//
+	// It matters most for the terminal-drop assertion below, whose whole point is that
+	// it catches a regression the dial probe CANNOT (the baseline drops that traffic
+	// too, so the probe stays green while the closure chain rots). Losing precisely
+	// that assertion to a missing setpriv would be the worst trade available.
+	//
+	// These assertions must also stay BEFORE the forcing-table flush further down,
+	// which destroys the table they read.
+	//
+	// Assert the persisted ruleset actually carries the fail-closed drops (so the
+	// drop probed afterwards is by an EXPLICIT RULE, not by a missing route).
 	//
 	// This used to assert `policy drop` on the base chain. It no longer can, and the
 	// reason matters to this test specifically: that drop policy was adjudicating
@@ -190,6 +203,16 @@ func TestBootInvariantAnonUIDHasNoDirectEgressBeforeShim(t *testing.T) {
 	// scope to exactly the account's own table.
 	if !tableLoaded(t, r, sentinel) {
 		t.Errorf("loading the persisted boot ruleset clobbered the host's other rules (sentinel gone)")
+	}
+
+	// THE BOOT INVARIANT ITSELF (needs setpriv, see the ordering note above): with the
+	// rules up but the shim NOT running, the anon UID's direct outbound connection must
+	// be DROPPED. We probe a direct dial to a public address AS the anon UID; the worst
+	// acceptable outcome is DROPPED (fail-closed), never REACHED (a leak). A public dst
+	// is used so a REACHED would be a real external leak; the default-DROP (no shim to
+	// redirect into) guarantees it drops.
+	if setprivDialReached(t, ctx, anonUID, "tcp", "1.1.1.1:443") {
+		t.Errorf("BOOT INVARIANT VIOLATED: the anon UID reached 1.1.1.1:443 directly with the shim NOT running (a leak); at boot, before the shim is up, egress must be DROPPED")
 	}
 
 	// REPRODUCE THE ORIGINAL FAILURE'S STATE, PROVE THE FIX: the finding observed that
@@ -311,10 +334,22 @@ func main(){
 
 // readProbeVerdict turns a probe helper's output into a verdict, REFUSING to infer
 // one from the absence of a token. Neither sentinel means the probe did not run to
-// completion under the anon UID, which is an un-runnable probe, not a dropped
-// connection: it fails the test loudly rather than handing back the value every
-// caller reads as a pass. The two ways that happens are distinguished so the
-// failure names the real cause instead of sending diagnosis down the wrong path.
+// completion under the anon UID, which is an un-runnable probe and not a dropped
+// connection, so it FAILS THE TEST rather than handing back the value every caller
+// reads as a pass. The two ways that happens are distinguished so the failure names
+// the real cause instead of sending diagnosis down the wrong path.
+//
+// It marks the failure with Errorf and RETURNS, deliberately, rather than aborting
+// with Fatalf. Loudness is the requirement; killing the test run is not, and the two
+// are easy to conflate. A host that cannot `setpriv` into the anon uid can still run
+// every nft-only assertion in this file, and several of those catch regressions the
+// dial probe cannot see at all - the terminal-drop check most of all, which exists
+// precisely because the probe stays green while the closure chain rots. Aborting
+// would throw away the answers such a host COULD have had in order to report the one
+// it could not, which is the same mistake in a different costume: one unavailable
+// capability must not hide the results of the ones that are available. The test
+// still FAILS, so nothing is certified untested; returning false merely avoids a
+// second, redundant complaint from the caller's own `if reached` check.
 func readProbeVerdict(t *testing.T, ctx context.Context, uid int, network, addr, out string, runErr error) bool {
 	t.Helper()
 	switch {
@@ -323,12 +358,14 @@ func readProbeVerdict(t *testing.T, ctx context.Context, uid int, network, addr,
 	case strings.Contains(out, "DROPPED"):
 		return false
 	case ctx.Err() == context.DeadlineExceeded:
-		t.Fatalf("the anon-UID probe timed out before printing a verdict (dial to %s %s outran the deadline); "+
+		t.Errorf("the anon-UID probe timed out before printing a verdict (dial to %s %s outran the deadline); "+
 			"this is NOT a drop and must not be read as one: %q", network, addr, strings.TrimSpace(out))
 	default:
-		t.Fatalf("the anon-UID probe COULD NOT RUN (setpriv could not drop to uid %d, or the helper did not execute): %v: %q. "+
-			"A probe that never ran is not a pass: the assertions here all expect reached==false, so returning false "+
-			"would certify the boot invariant without testing it.", uid, runErr, strings.TrimSpace(out))
+		t.Errorf("the anon-UID probe COULD NOT RUN (setpriv could not drop to uid %d, or the helper did not execute): %v: %q.\n"+
+			"A probe that never ran is not a pass: every assertion using it expects reached==false, so a silent "+
+			"false would certify the boot invariant without testing it. The nft-only assertions in this test are "+
+			"unaffected and their results above still stand; only the invariant itself is untested here.",
+			uid, runErr, strings.TrimSpace(out))
 	}
 	return false
 }

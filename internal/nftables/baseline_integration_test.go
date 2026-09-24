@@ -72,11 +72,15 @@ func TestBaselineDropsWhenForcingAbsent(t *testing.T) {
 	if !tableExists(t, r, baselineTable) {
 		t.Fatalf("ApplyBaseline did not load the baseline table %q", baselineTable)
 	}
-	if reached := setprivDialReachedNft(t, ctx, anonUID, "tcp", "1.1.1.1:443"); reached {
-		t.Errorf("INVERTED INVARIANT VIOLATED: with forcing ABSENT (only the baseline loaded) the anon UID reached 1.1.1.1:443 directly (a leak); the resting state must be DROPPED")
-	}
-	// The baseline carries the real-egress drop (so the drop above is by the standing
-	// deny, not a missing route).
+	// ORDER IS LOAD-BEARING: the ruleset assertion needs only `nft`, the dial probe
+	// additionally needs `setpriv` to assume the anon uid - and that probe now FAILS
+	// LOUDLY when it cannot run (a probe that could not run is not a pass). Probing
+	// first would abort the test on a host that cannot setpriv and take this structural
+	// check down with it, losing the answer a constrained host COULD have had. See the
+	// matching note in internal/systemd/boot_invariant_integration_test.go.
+	//
+	// The baseline carries the real-egress drop (so the drop probed next is by the
+	// standing deny, not a missing route).
 	listedBaseline := listTable(t, r, baselineTable)
 	for _, want := range []string{
 		"policy accept",
@@ -86,6 +90,9 @@ func TestBaselineDropsWhenForcingAbsent(t *testing.T) {
 		if !strings.Contains(listedBaseline, want) {
 			t.Errorf("baseline table missing the resting-deny line %q:\n%s", want, listedBaseline)
 		}
+	}
+	if reached := setprivDialReachedNft(t, ctx, anonUID, "tcp", "1.1.1.1:443"); reached {
+		t.Errorf("INVERTED INVARIANT VIOLATED: with forcing ABSENT (only the baseline loaded) the anon UID reached 1.1.1.1:443 directly (a leak); the resting state must be DROPPED")
 	}
 
 	// PART 2 - FORCING PRESENT: layer the forcing table ON TOP of the baseline. The
@@ -133,13 +140,17 @@ func TestBaselineDropsWhenForcingAbsent(t *testing.T) {
 	if !tableExists(t, r, baselineTable) {
 		t.Fatalf("Deleting the forcing table wrongly removed the baseline table")
 	}
-	if reached := setprivDialReachedNft(t, ctx, anonUID, "tcp", "1.1.1.1:443"); reached {
-		t.Errorf("INVERTED INVARIANT VIOLATED after flushing forcing: the anon UID reached 1.1.1.1:443 directly; with forcing flushed the standing baseline must still DROP")
-	}
-
-	// The sentinel (a stand-in for the host's own rules) is untouched throughout.
+	// The sentinel (a stand-in for the host's own rules) is untouched throughout. Like
+	// the structural checks above, this needs only `nft`, so it runs BEFORE the final
+	// dial probe rather than after it: the probe fails loudly where setpriv cannot
+	// assume the uid, and a host that cannot run the probe should still learn whether
+	// anonctl clobbered its firewall.
 	if !tableExists(t, r, sentinel) {
 		t.Errorf("the baseline/forcing loads clobbered the host's other rules (sentinel gone)")
+	}
+
+	if reached := setprivDialReachedNft(t, ctx, anonUID, "tcp", "1.1.1.1:443"); reached {
+		t.Errorf("INVERTED INVARIANT VIOLATED after flushing forcing: the anon UID reached 1.1.1.1:443 directly; with forcing flushed the standing baseline must still DROP")
 	}
 }
 
@@ -155,6 +166,12 @@ func TestBaselineDropsWhenForcingAbsent(t *testing.T) {
 // The helper always prints `REACHED` or `DROPPED:<reason>`; require one and fail
 // loudly on neither, as verify's runSetprivProbe does. It mirrors the systemd
 // boot-invariant test's setprivDialReached (kept local to this package's tag).
+//
+// An un-runnable probe marks the test FAILED and returns, rather than aborting it:
+// PART 1's probe must run while only the baseline is loaded, so it cannot simply be
+// moved after PART 2's and PART 3's structural checks, and aborting there would
+// discard every later nft-only assertion on a host that merely lacks setpriv. Loud,
+// not fatal.
 func setprivDialReachedNft(t *testing.T, ctx context.Context, uid int, network, addr string) bool {
 	t.Helper()
 	if _, err := exec.LookPath("go"); err != nil {
@@ -186,12 +203,14 @@ func main(){
 	case strings.Contains(s, "DROPPED"):
 		return false
 	case ctx.Err() == context.DeadlineExceeded:
-		t.Fatalf("the anon-UID probe timed out before printing a verdict (dial to %s %s outran the deadline); "+
+		t.Errorf("the anon-UID probe timed out before printing a verdict (dial to %s %s outran the deadline); "+
 			"this is NOT a drop and must not be read as one: %q", network, addr, strings.TrimSpace(s))
 	default:
-		t.Fatalf("the anon-UID probe COULD NOT RUN (setpriv could not drop to uid %d, or the helper did not execute): %v: %q. "+
-			"A probe that never ran is not a pass: these assertions expect reached==false, so returning false "+
-			"would certify the baseline default-deny without testing it.", uid, runErr, strings.TrimSpace(s))
+		t.Errorf("the anon-UID probe COULD NOT RUN (setpriv could not drop to uid %d, or the helper did not execute): %v: %q.\n"+
+			"A probe that never ran is not a pass: these assertions expect reached==false, so a silent false "+
+			"would certify the baseline default-deny without testing it. The nft-only assertions in this test "+
+			"are unaffected and still stand; only the drop itself is untested here.",
+			uid, runErr, strings.TrimSpace(s))
 	}
 	return false
 }
