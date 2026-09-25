@@ -156,10 +156,12 @@ func dnsEvidence(ctx context.Context, p LiveParams) (DNSEvidence, error) {
 	// It cannot make a broken path pass: a path that does not answer does not answer
 	// twice, and each attempt is a FULL re-measurement (its own counters, its own
 	// control window), so the evidence a verdict rests on always belongs to the attempt
-	// that produced it. On a healthy path it costs nothing at all, because the first
-	// attempt answers and the loop stops. What it costs on a broken one is one more
-	// window, which is the right way round.
-	var prevDetail string
+	// that produced it. And it retries ONLY what a second attempt can tell apart
+	// (forcedRetryWarranted): an answer from off the forced path, a redirect not in
+	// effect, or an unreachable endpoint is judged on the first attempt, so none of them
+	// can be hidden behind a second-attempt pass. An earlier version retried on anything
+	// but a non-SERVFAIL answer, which let exactly that happen. On a healthy path it
+	// costs nothing, because the first attempt answers and the loop stops.
 	for attempt := 1; attempt <= forcedRoundTripAttempts; attempt++ {
 		// A FRESH unique name per attempt, for the same reason the probe name is unique at
 		// all, and now for a second reason as well: the shim's own forwarder caches answers
@@ -177,16 +179,17 @@ func dnsEvidence(ctx context.Context, p LiveParams) (DNSEvidence, error) {
 			// retrying a missing setpriv or an unplantable counter would only hide it.
 			return ev, err
 		}
-		if attempt > 1 {
-			ev.ForcedEarlier = append(ev.ForcedEarlier, fmt.Sprintf("attempt %d: %s", attempt-1, prevDetail))
-		}
-		prevDetail = ev.ForcedDetail
 		ev.ForcedAttempts = attempt
 		ev.ForcedReachedShim = counterKeyMoved(counters, dnsCounterTowardShimUDP, dnsCounterTowardShimTCP)
 		ev.ShimReplied = counterKeyMoved(counters, dnsCounterShimReply)
-		if ev.ForcedAnswered && ev.ForcedRcode != dnsRcodeServfail {
+		this := ForcedAttempt{
+			Answered: ev.ForcedAnswered, ReachedShim: ev.ForcedReachedShim, ShimReplied: ev.ShimReplied,
+			Rcode: ev.ForcedRcode, Detail: ev.ForcedDetail,
+		}
+		if attempt == forcedRoundTripAttempts || !forcedRetryWarranted(this) {
 			break
 		}
+		ev.ForcedEarlier = append(ev.ForcedEarlier, this)
 	}
 	return ev, nil
 }

@@ -65,6 +65,57 @@ const (
 	dnsCounterShimReply = "shim-reply"
 )
 
+// ForcedAttempt is one measured forced round trip: what the probe got back, and
+// what the counters say happened to the packets.
+type ForcedAttempt struct {
+	Answered    bool
+	ReachedShim bool
+	ShimReplied bool
+	Rcode       int
+	Detail      string
+}
+
+// forcedRetryWarranted decides whether a second measurement can tell this attempt's
+// outcome apart from a broken path. It is the whole retry policy, pure so it is
+// tested directly (the loop that applies it runs only as root).
+//
+// A retry is warranted ONLY for outcomes a cold circuit or one lost answer can
+// explain: the query reached the shim and got no answer, or the shim answered
+// SERVFAIL because the upstream was slow, refused, or broke. Everything else is
+// structural, and retrying it could only hide it behind a second-attempt pass:
+//   - answered WITHOUT reaching the shim: clear DNS, the most serious outcome here;
+//   - never reached the shim: the redirect is not in effect;
+//   - the endpoint is unreachable: a second try in the same second will not find it
+//     running, and if it does, the operator should hear about the first.
+func forcedRetryWarranted(a ForcedAttempt) bool {
+	if !a.ReachedShim {
+		return false
+	}
+	if !a.Answered {
+		return true
+	}
+	if a.Rcode != dnsRcodeServfail {
+		return false
+	}
+	return !strings.Contains(a.Detail, shimFailEndpointUnreachable)
+}
+
+// describeAttempt states what one attempt MEASURED, in the terms the counters and
+// the probe support and no further.
+func describeAttempt(n int, a ForcedAttempt) string {
+	switch {
+	case a.Answered && !a.ReachedShim:
+		return fmt.Sprintf("attempt %d was answered WITHOUT reaching the shim (%s)", n, a.Detail)
+	case !a.ReachedShim:
+		return fmt.Sprintf("attempt %d never reached the shim (%s)", n, a.Detail)
+	case !a.Answered:
+		return fmt.Sprintf("attempt %d reached the shim and got no answer (%s)", n, a.Detail)
+	case a.Rcode == dnsRcodeServfail:
+		return fmt.Sprintf("attempt %d reached the shim and was answered SERVFAIL (%s)", n, a.Detail)
+	}
+	return fmt.Sprintf("attempt %d reached the shim and was answered (%s)", n, a.Detail)
+}
+
 // dnsRcodeServfail is the rcode the shim's forwarder returns when it could not
 // resolve over the endpoint. It is called out by name because it is the one answered
 // rcode that must NOT pass `dns-forced-path-answers`.
@@ -126,9 +177,12 @@ type DNSEvidence struct {
 	// (see forcedRoundTripAttempts). It is reported in the detail, because "this failed
 	// twice" and "this failed once" justify different next steps.
 	ForcedAttempts int
-	// ForcedEarlier holds the probe detail of each attempt BEFORE the last, so a
-	// verdict drawn from the last attempt still reports what the earlier ones saw.
-	ForcedEarlier []string
+	// ForcedEarlier holds each attempt BEFORE the last, with its packet-level fate and
+	// not only the probe's text, so a verdict drawn from the last attempt still reports
+	// what the earlier ones measured (an attempt answered off the forced path, or one that
+	// never reached the shim, is a different fact from a lost answer, and an earlier
+	// version recorded only the text and called all of them "a cold circuit").
+	ForcedEarlier []ForcedAttempt
 	// NameserverDefaulted records that the host declares no nameserver, so Nameserver
 	// is glibc's 127.0.0.1 fallback rather than a configured value. It is reported,
 	// not failed: that host's account DNS works, and loopback is the shape the
@@ -433,7 +487,7 @@ func DNSForcedPathAnswersAssertion(ev DNSEvidence) Assertion {
 			// reason a path passes. A healthy path passes on attempt 1, so an operator who
 			// sees this line on every run has a path failing its first query every time, and
 			// that is a finding, not a pass to be glad of.
-			a.Detail += fmt.Sprintf(". It passed on attempt %d, NOT the first: one answer was lost or one circuit was cold. If this appears on every run, the first query is failing for a reason worth finding%s", ev.ForcedAttempts, earlierPhrase(ev.ForcedEarlier))
+			a.Detail += fmt.Sprintf(". It passed on attempt %d, NOT the first: %s. If this appears on every run, the first query is failing for a reason worth finding", ev.ForcedAttempts, earlierList(ev.ForcedEarlier))
 		}
 		return a
 	case ev.ForcedAnswered:
@@ -495,9 +549,12 @@ func servfailDetail(server string, ev DNSEvidence) string {
 		why = "the shim could not open a connection to the ENDPOINT at all, so the anonymizer (e.g. Tor) is DOWN or is not listening at the address this account's shim is configured with. Start it or correct the address, then re-run verify"
 	case strings.Contains(ev.ForcedDetail, shimFailDeadline):
 		why = "the endpoint accepted the shim's connection and the lookup RAN OUT OF TIME, so the anonymizer is up and its circuit was SLOW, which a cold circuit after idle routinely is"
-		if ev.ForcedAttempts >= 2 {
+		switch {
+		case ev.ForcedAttempts >= 2 && everyEarlier(ev.ForcedEarlier, shimFailDeadline):
 			why += ". It happened on every attempt, which is more than one cold circuit: look at the endpoint's own health (for Tor, its log: bootstrap state, circuit build failures, clock skew)"
-		} else {
+		case ev.ForcedAttempts >= 2:
+			why += ". That was the LAST attempt; the earlier one failed differently (below), so this is not one repeated slow circuit. Re-run verify"
+		default:
 			why += ". Re-run verify"
 		}
 	case strings.Contains(ev.ForcedDetail, shimFailEndpointRefused):
@@ -510,14 +567,32 @@ func servfailDetail(server string, ev DNSEvidence) string {
 	return head + why + earlierPhrase(ev.ForcedEarlier)
 }
 
-// earlierPhrase reports what the earlier attempts saw, when there were any, so a
-// verdict built on the last attempt does not hide a DIFFERENT failure on the first
-// (a slow circuit, then a dead endpoint, is two problems).
-func earlierPhrase(earlier []string) string {
+// earlierPhrase reports what the earlier attempts measured, when there were any, so
+// a verdict built on the last attempt does not hide a DIFFERENT outcome on the first.
+func earlierPhrase(earlier []ForcedAttempt) string {
 	if len(earlier) == 0 {
 		return ""
 	}
-	return ". Earlier attempt(s): " + strings.Join(earlier, "; ")
+	return ". Earlier: " + earlierList(earlier)
+}
+
+// earlierList is the earlier attempts, described, joined.
+func earlierList(earlier []ForcedAttempt) string {
+	parts := make([]string, len(earlier))
+	for i, a := range earlier {
+		parts[i] = describeAttempt(i+1, a)
+	}
+	return strings.Join(parts, "; ")
+}
+
+// everyEarlier reports that every earlier attempt carried the given shim reason.
+func everyEarlier(earlier []ForcedAttempt, token string) bool {
+	for _, a := range earlier {
+		if !strings.Contains(a.Detail, token) {
+			return false
+		}
+	}
+	return len(earlier) > 0
 }
 
 // attemptsPhrase reports how many times the round trip was measured, because the
@@ -528,7 +603,7 @@ func attemptsPhrase(attempts int) string {
 	if attempts < 2 {
 		return ""
 	}
-	return fmt.Sprintf(", on %d separate attempts (so this is not one lost answer or one cold circuit)", attempts)
+	return fmt.Sprintf(", on %d separate attempts", attempts)
 }
 
 // nameserverFamilyHint names the v6 case, where the forced DNS path cannot work

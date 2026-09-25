@@ -218,40 +218,82 @@ func TestDNSForcedPathAnswers_NamesTheServfailReason(t *testing.T) {
 }
 
 // A slow circuit on every attempt is more than a cold circuit, and the text must say
-// so rather than telling the operator to re-run what already ran twice. And an
-// earlier attempt's DIFFERENT failure must not vanish behind the last one's.
+// so rather than telling the operator to re-run what already ran twice. But "every
+// attempt" must rest on every attempt, not on the last one alone.
 func TestDNSForcedPathAnswers_ReportsEveryAttempt(t *testing.T) {
+	deadline := "rcode=2 answers=0 ede=22:anonctl:deadline-expired"
 	ev := healthyDNS()
-	ev.ForcedDetail, ev.ForcedRcode = "rcode=2 answers=0 ede=22:anonctl:deadline-expired", 2
-	ev.ForcedAttempts = 2
-	ev.ForcedEarlier = []string{"attempt 1: rcode=2 answers=0 ede=23:anonctl:endpoint-unreachable"}
+	ev.ForcedDetail, ev.ForcedRcode, ev.ForcedAttempts = deadline, 2, 2
+	ev.ForcedEarlier = []ForcedAttempt{{Answered: true, ReachedShim: true, ShimReplied: true, Rcode: 2, Detail: deadline}}
 	a := DNSForcedPathAnswersAssertion(ev)
-	for _, want := range []string{"2 separate attempts", "every attempt", "attempt 1:", "endpoint-unreachable"} {
+	for _, want := range []string{"2 separate attempts", "every attempt", "attempt 1 reached the shim and was answered SERVFAIL"} {
 		if !strings.Contains(a.Detail, want) {
 			t.Errorf("detail lacks %q: %q", want, a.Detail)
 		}
 	}
+
+	// The earlier attempt got no answer at all: the deadline was the LAST attempt's
+	// only, and "every attempt" would be a claim the evidence does not support.
+	ev.ForcedEarlier = []ForcedAttempt{{ReachedShim: true, ShimReplied: true, Rcode: -1, Detail: "no answer: i/o timeout"}}
+	a = DNSForcedPathAnswersAssertion(ev)
+	if strings.Contains(a.Detail, "every attempt") {
+		t.Errorf("claimed every attempt ran out of time when the first got no answer: %q", a.Detail)
+	}
+	if !strings.Contains(a.Detail, "attempt 1 reached the shim and got no answer") {
+		t.Errorf("the earlier attempt's fate must be reported: %q", a.Detail)
+	}
 }
 
-// A PASS THAT NEEDED THE RETRY MUST SAY SO. The retry may separate one lost answer
-// from a broken path; it may not be the invisible reason a path passes. A pass on the
-// first attempt stays quiet about attempts, so the phrase is a signal, not noise.
+// A PASS THAT NEEDED THE RETRY MUST SAY SO, in the terms the first attempt measured
+// and not as a guess ("a cold circuit"). A pass on the first attempt stays quiet
+// about attempts, so the phrase is a signal, not noise.
 func TestDNSForcedPathAnswers_APassOnTheRetryIsReported(t *testing.T) {
 	ev := healthyDNS()
 	ev.ForcedAttempts = 2
-	ev.ForcedEarlier = []string{"attempt 1: rcode=2 answers=0 ede=22:anonctl:deadline-expired"}
+	ev.ForcedEarlier = []ForcedAttempt{{ReachedShim: true, ShimReplied: true, Rcode: -1, Detail: "no answer: i/o timeout"}}
 	a := DNSForcedPathAnswersAssertion(ev)
 	if !a.Ok {
 		t.Fatalf("an answered second attempt is a pass; got %+v", a)
 	}
-	for _, want := range []string{"attempt 2, NOT the first", "deadline-expired"} {
+	for _, want := range []string{"attempt 2, NOT the first", "attempt 1 reached the shim and got no answer"} {
 		if !strings.Contains(a.Detail, want) {
-			t.Errorf("a pass on the retry must report it; detail lacks %q: %q", want, a.Detail)
+			t.Errorf("a pass on the retry must report what the first attempt measured; detail lacks %q: %q", want, a.Detail)
 		}
+	}
+	if strings.Contains(a.Detail, "cold circuit") {
+		t.Errorf("the pass text guessed at a cause the evidence does not show: %q", a.Detail)
 	}
 	ev.ForcedAttempts, ev.ForcedEarlier = 1, nil
 	if a := DNSForcedPathAnswersAssertion(ev); strings.Contains(a.Detail, "attempt") {
 		t.Errorf("a first-attempt pass must not mention attempts; got %q", a.Detail)
+	}
+}
+
+// THE RETRY POLICY, pure. It may retry only what a second attempt can tell apart
+// from a broken path. The three structural outcomes must be judged on the FIRST
+// attempt, or a second-attempt pass can hide them: an earlier version retried on
+// anything but a non-SERVFAIL answer, so an answer from OFF the forced path (clear
+// DNS answered SERVFAIL by the host's resolver) followed by a good second attempt
+// passed, described as a cold circuit.
+func TestForcedRetryWarranted(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		a    ForcedAttempt
+		want bool
+	}{
+		{"answered off the forced path (clear DNS), SERVFAIL", ForcedAttempt{Answered: true, Rcode: 2, Detail: "rcode=2 answers=0"}, false},
+		{"answered off the forced path, NOERROR", ForcedAttempt{Answered: true, Rcode: 0, Detail: "rcode=0 answers=1"}, false},
+		{"never reached the shim", ForcedAttempt{Rcode: -1, Detail: "no answer: i/o timeout"}, false},
+		{"endpoint unreachable", ForcedAttempt{Answered: true, ReachedShim: true, ShimReplied: true, Rcode: 2, Detail: "rcode=2 answers=0 ede=23:anonctl:endpoint-unreachable"}, false},
+		{"answered through the shim", ForcedAttempt{Answered: true, ReachedShim: true, ShimReplied: true, Rcode: 3, Detail: "rcode=3 answers=0"}, false},
+		{"reached the shim, no answer", ForcedAttempt{ReachedShim: true, Rcode: -1, Detail: "no answer: i/o timeout"}, true},
+		{"deadline expired", ForcedAttempt{Answered: true, ReachedShim: true, ShimReplied: true, Rcode: 2, Detail: "rcode=2 answers=0 ede=22:anonctl:deadline-expired"}, true},
+		{"endpoint refused", ForcedAttempt{Answered: true, ReachedShim: true, ShimReplied: true, Rcode: 2, Detail: "rcode=2 answers=0 ede=23:anonctl:endpoint-refused"}, true},
+		{"SERVFAIL with no reason", ForcedAttempt{Answered: true, ReachedShim: true, ShimReplied: true, Rcode: 2, Detail: "rcode=2 answers=0"}, true},
+	} {
+		if got := forcedRetryWarranted(tc.a); got != tc.want {
+			t.Errorf("%s: retry warranted = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 
