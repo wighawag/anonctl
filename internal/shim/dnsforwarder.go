@@ -28,7 +28,8 @@ import (
 // carried on the dial via ProxyAuth (the Tor IsolateSOCKSAuth knob), the same
 // username the relay uses, so the account's DNS shares its circuit class.
 
-// DefaultDNSExchangeTimeout bounds ONE upstream DNS exchange.
+// DefaultDNSExchangeTimeout bounds ONE attempt at an upstream DNS exchange, dial
+// included (the dial used to have no bound at all; see dialUpstream).
 //
 // MEASURED SHAPE OF ITS EXPIRY (telemaque, 0.9.0, work/notes/observations/dns-forced-path-answers-is-single-shot-on-a-path-with-tenfold-variance.md):
 // the expiry is SILENT. resolveViaSOCKS returns an error, both serve loops drop the
@@ -42,6 +43,10 @@ import (
 // circuit build little room. TestForwarder_ExchangeDeadlineExpiryIsSilent pins the
 // shape before anything changes it.
 const DefaultDNSExchangeTimeout = 5 * time.Second
+
+// DefaultDNSUpstreamIdle is how long a stream with nothing in flight is held open
+// before the forwarder tears it down. See dnsupstream.go for the tradeoff.
+const DefaultDNSUpstreamIdle = 30 * time.Second
 
 // ForwarderConfig configures the DNS-over-SOCKS-TCP forwarder.
 type ForwarderConfig struct {
@@ -58,12 +63,15 @@ type ForwarderConfig struct {
 	// Upstream is the DNS resolver addressed BY HOSTNAME so the proxy resolves it
 	// (socks5h), reached as DNS-over-TCP. Defaults to a public resolver name.
 	Upstream string
-	// ExchangeTimeout bounds one upstream exchange; zero means
-	// DefaultDNSExchangeTimeout. The shim leaves it at the default. It is settable PER
-	// FORWARDER so the unit suite can drive the expiry path in milliseconds, rather than
-	// through a package var, because a forwarder's goroutines outlive the test that
-	// started it and a shared knob is a data race.
+	// ExchangeTimeout bounds one upstream attempt (the dial plus the exchange); zero
+	// means DefaultDNSExchangeTimeout. IdleTimeout is how long an idle upstream stream
+	// is held open; zero means DefaultDNSUpstreamIdle. The shim leaves both at their
+	// defaults: they are settable so the unit suite can drive the expiry and idle paths
+	// in milliseconds, PER FORWARDER rather than through a package var, because a
+	// forwarder's goroutines outlive the test that started it and a shared knob is a
+	// data race (found by `go test -race`).
 	ExchangeTimeout time.Duration
+	IdleTimeout     time.Duration
 }
 
 // Forwarder is a running DNS-to-SOCKS-TCP bridge, serving UDP and TCP.
@@ -72,6 +80,7 @@ type Forwarder struct {
 	pc     net.PacketConn
 	ln     net.Listener
 	dialer proxy.Dialer
+	up     *dnsUpstream
 }
 
 // StartForwarder binds the UDP and TCP listeners and serves in the background
@@ -83,6 +92,9 @@ func StartForwarder(ctx context.Context, cfg ForwarderConfig) (*Forwarder, error
 	}
 	if cfg.ExchangeTimeout <= 0 {
 		cfg.ExchangeTimeout = DefaultDNSExchangeTimeout
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = DefaultDNSUpstreamIdle
 	}
 	dialer, err := proxy.SOCKS5("tcp", cfg.ProxyAddr, cfg.ProxyAuth, proxy.Direct)
 	if err != nil {
@@ -98,14 +110,34 @@ func StartForwarder(ctx context.Context, cfg ForwarderConfig) (*Forwarder, error
 		return nil, fmt.Errorf("dns forwarder: listen tcp %s: %w", cfg.Listen, err)
 	}
 	f := &Forwarder{cfg: cfg, pc: pc, ln: ln, dialer: dialer}
+	// The upstream stream is per-FORWARDER, and the shim is per-account, so it is
+	// per-account by construction: nothing here is shared between accounts, and the
+	// dial below carries this account's isolation username on every dial and re-dial.
+	f.up = &dnsUpstream{dial: f.dialUpstream, exchangeTimeout: cfg.ExchangeTimeout, idle: cfg.IdleTimeout}
 	go f.serveUDP()
 	go f.serveTCP()
 	go func() {
 		<-ctx.Done()
 		_ = pc.Close()
 		_ = ln.Close()
+		f.up.close()
 	}()
 	return f, nil
+}
+
+// dialUpstream opens ONE SOCKS stream to the upstream resolver. It is the only way
+// out of this file, which is what makes fail-closed structural: there is no code
+// path from a query to any resolver other than this dial, so a dead endpoint can
+// only ever produce a failure, never a plaintext lookup.
+//
+// The context bound is load-bearing and it was missing: proxy.SOCKS5 is built over
+// proxy.Direct, which has NO timeout, so an endpoint that accepted the TCP
+// connection and then went quiet parked the query with no deadline to fire.
+func (f *Forwarder) dialUpstream(ctx context.Context) (net.Conn, error) {
+	if cd, ok := f.dialer.(proxy.ContextDialer); ok {
+		return cd.DialContext(ctx, "tcp", f.cfg.Upstream)
+	}
+	return f.dialer.Dial("tcp", f.cfg.Upstream)
 }
 
 // Addr returns the bound UDP address.
@@ -179,32 +211,11 @@ func (f *Forwarder) handleTCPConn(conn net.Conn) {
 	}
 }
 
-// resolveViaSOCKS forwards a DNS message to the upstream resolver over a SOCKS5
-// TCP connection using DNS-over-TCP framing (RFC 1035 2-byte length prefix). The
-// dial carries the isolation username; if the endpoint is unreachable it returns
-// an error and the caller drops the query (fail-closed).
+// resolveViaSOCKS forwards a DNS message to the upstream resolver over the
+// account's persistent, pipelined DNS-over-TCP stream (dnsupstream.go), dialling one
+// when there is none. Everything it can return is a failure or an upstream answer:
+// if the endpoint is unreachable the caller has nothing to send, which is the
+// fail-closed property.
 func (f *Forwarder) resolveViaSOCKS(query []byte) ([]byte, error) {
-	conn, err := f.dialer.Dial("tcp", f.cfg.Upstream)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(f.cfg.ExchangeTimeout))
-
-	framed := make([]byte, 2+len(query))
-	binary.BigEndian.PutUint16(framed[:2], uint16(len(query)))
-	copy(framed[2:], query)
-	if _, err := conn.Write(framed); err != nil {
-		return nil, err
-	}
-
-	var lenBuf [2]byte
-	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-		return nil, err
-	}
-	resp := make([]byte, binary.BigEndian.Uint16(lenBuf[:]))
-	if _, err := io.ReadFull(conn, resp); err != nil {
-		return nil, err
-	}
-	return resp, nil
+	return f.up.exchange(query)
 }
