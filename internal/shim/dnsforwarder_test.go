@@ -151,6 +151,96 @@ func TestForwarder_FailsClosedWhenProxyDown(t *testing.T) {
 	}
 }
 
+// TestForwarder_ExchangeDeadlineExpiryIsSilent pins the MEASURED failure shape the
+// field report could not explain, and it is the hypothesis the DNS work that follows
+// rests on: when the upstream exchange outruns its deadline, the forwarder emits
+// NOTHING. Not SERVFAIL, not a close on the UDP leg: silence, which the client can
+// only discover by waiting out its own timeout.
+//
+// Why that matters beyond tidiness. On the reporting host `dns-forced-path-answers`
+// went red once with "the shim ANSWERED and the answer never arrived", which asserts
+// a conntrack un-NAT drop and sends the operator to nft. This shape produces the same
+// observable (a query provably reached the shim, no answer came back) with no kernel
+// involvement at all, from inside anonctl's own forwarder. The upstream here is
+// deliberately SILENT rather than slow, because what is under test is what the
+// forwarder does when the deadline wins, not how long it waited.
+//
+// This test documents today's behaviour so the change that fixes it shows up as a
+// flipped assertion rather than a new one.
+func TestForwarder_ExchangeDeadlineExpiryIsSilent(t *testing.T) {
+	silent := startSilentDNSOverTCP(t)
+	fx := socks5hfixture.New(socks5hfixture.Options{
+		KnownHosts:     map[string]string{upstreamName: hostOf(silent)},
+		RedirectTarget: silent,
+	})
+	if err := fx.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("start fixture: %v", err)
+	}
+	defer fx.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fwd, err := StartForwarder(ctx, ForwarderConfig{
+		Listen:    "127.0.0.1:0",
+		ProxyAddr: fx.Addr(),
+		Upstream:  upstreamName + ":53",
+		// The shape under test is deadline-INDEPENDENT (what the forwarder emits when the
+		// deadline wins), so shrinking it encodes no production timing.
+		ExchangeTimeout: 300 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("start forwarder: %v", err)
+	}
+	defer fwd.Close()
+
+	conn, err := net.Dial("udp", fwd.Addr())
+	if err != nil {
+		t.Fatalf("dial forwarder: %v", err)
+	}
+	defer conn.Close()
+	// The client's window is far longer than the exchange deadline, so anything the
+	// forwarder wanted to say about the expiry would have arrived by now.
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write(buildAQuery(uniqueName)); err != nil {
+		t.Fatalf("write query: %v", err)
+	}
+	buf := make([]byte, 512)
+	n, rerr := conn.Read(buf)
+	if rerr == nil {
+		t.Fatalf("the deadline expiry produced a %d-byte answer; this test documents that today it produces SILENCE", n)
+	}
+	if !strings.Contains(rerr.Error(), "timeout") {
+		t.Fatalf("expected the client to time out with nothing (the measured shape); got %v", rerr)
+	}
+}
+
+// startSilentDNSOverTCP accepts DNS-over-TCP connections, reads the query and never
+// answers: a stand-in for an upstream (or a circuit) slower than the deadline.
+func startSilentDNSOverTCP(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("silent resolver listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		var held []net.Conn
+		defer func() {
+			for _, c := range held {
+				c.Close()
+			}
+		}()
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			held = append(held, c) // held open, deliberately unanswered
+		}
+	}()
+	return ln.Addr().String()
+}
+
 // ---- in-test DNS-over-TCP resolver + wire helpers (A only) ----
 
 type dnsResolver struct {

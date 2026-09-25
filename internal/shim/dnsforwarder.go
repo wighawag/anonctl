@@ -28,6 +28,21 @@ import (
 // carried on the dial via ProxyAuth (the Tor IsolateSOCKSAuth knob), the same
 // username the relay uses, so the account's DNS shares its circuit class.
 
+// DefaultDNSExchangeTimeout bounds ONE upstream DNS exchange.
+//
+// MEASURED SHAPE OF ITS EXPIRY (telemaque, 0.9.0, work/notes/observations/dns-forced-path-answers-is-single-shot-on-a-path-with-tenfold-variance.md):
+// the expiry is SILENT. resolveViaSOCKS returns an error, both serve loops drop the
+// query fail-closed, and the client is left waiting out its own timeout with nothing
+// to tell it why; the shim logs nothing either. Confirmed against the released 0.9.0
+// binary through an endpoint that accepts a connection and then goes quiet. That is
+// the same observable a verify probe reports as "the shim answered and the answer
+// never arrived", for an event inside this forwarder. On that host a forced lookup,
+// measured inside the account's session, had a ~2.2s median and a 3.6s warm-path
+// maximum, so this deadline sits within sight of a warm sample and leaves a cold
+// circuit build little room. TestForwarder_ExchangeDeadlineExpiryIsSilent pins the
+// shape before anything changes it.
+const DefaultDNSExchangeTimeout = 5 * time.Second
+
 // ForwarderConfig configures the DNS-over-SOCKS-TCP forwarder.
 type ForwarderConfig struct {
 	// Listen is the loopback address to serve DNS on (the account's per-account
@@ -43,6 +58,12 @@ type ForwarderConfig struct {
 	// Upstream is the DNS resolver addressed BY HOSTNAME so the proxy resolves it
 	// (socks5h), reached as DNS-over-TCP. Defaults to a public resolver name.
 	Upstream string
+	// ExchangeTimeout bounds one upstream exchange; zero means
+	// DefaultDNSExchangeTimeout. The shim leaves it at the default. It is settable PER
+	// FORWARDER so the unit suite can drive the expiry path in milliseconds, rather than
+	// through a package var, because a forwarder's goroutines outlive the test that
+	// started it and a shared knob is a data race.
+	ExchangeTimeout time.Duration
 }
 
 // Forwarder is a running DNS-to-SOCKS-TCP bridge, serving UDP and TCP.
@@ -59,6 +80,9 @@ type Forwarder struct {
 func StartForwarder(ctx context.Context, cfg ForwarderConfig) (*Forwarder, error) {
 	if cfg.Upstream == "" {
 		cfg.Upstream = "1.1.1.1:53"
+	}
+	if cfg.ExchangeTimeout <= 0 {
+		cfg.ExchangeTimeout = DefaultDNSExchangeTimeout
 	}
 	dialer, err := proxy.SOCKS5("tcp", cfg.ProxyAddr, cfg.ProxyAuth, proxy.Direct)
 	if err != nil {
@@ -165,7 +189,7 @@ func (f *Forwarder) resolveViaSOCKS(query []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(f.cfg.ExchangeTimeout))
 
 	framed := make([]byte, 2+len(query))
 	binary.BigEndian.PutUint16(framed[:2], uint16(len(query)))
