@@ -127,6 +127,24 @@ func TestServfail_CarriesTheReasonOnlyToAnEDNSClient(t *testing.T) {
 	if _, ok := servfail([]byte{1, 2, 3}, dnsFailOther); ok {
 		t.Error("a message shorter than a header cannot be answered and must be dropped")
 	}
+
+	// A query without exactly one question (here two, with trailing record bytes) gets
+	// a bare header: no undeclared trailing bytes, and counts that describe the message.
+	two := buildAQuery(uniqueName)
+	binary.BigEndian.PutUint16(two[4:6], 2)
+	two = append(two, 0xde, 0xad, 0xbe, 0xef)
+	bare, ok := servfail(two, dnsFailOther)
+	if !ok {
+		t.Fatal("a query with a header is answerable")
+	}
+	if len(bare) != 12 {
+		t.Errorf("SERVFAIL for an unparseable question is %d bytes; want a bare 12-byte header", len(bare))
+	}
+	for i, name := range []string{"QDCOUNT", "ANCOUNT", "NSCOUNT", "ARCOUNT"} {
+		if n := binary.BigEndian.Uint16(bare[4+2*i : 6+2*i]); n != 0 {
+			t.Errorf("%s = %d in a bare SERVFAIL; want 0", name, n)
+		}
+	}
 }
 
 // The operator-facing reason names the NEXT MOVE, which is the point of splitting

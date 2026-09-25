@@ -34,9 +34,11 @@ const (
 	// dnsFailEndpointUnreachable: nothing accepted a TCP connection at the SOCKS
 	// endpoint's own address. The anonymizer is down or not listening there.
 	dnsFailEndpointUnreachable
-	// dnsFailEndpointRefused: the endpoint accepted the connection and then failed
-	// the CONNECT to the upstream resolver. The endpoint is up; for Tor this is a
-	// circuit or exit that could not reach the resolver.
+	// dnsFailEndpointRefused: the endpoint accepted the connection and then refused or
+	// failed the request: most often the CONNECT to the upstream resolver (for Tor, a
+	// circuit or exit that could not reach it), but also a SOCKS-level rejection such as
+	// failed authentication, which the SOCKS client reports in the same shape. Either
+	// way the endpoint is up.
 	dnsFailEndpointRefused
 	// dnsFailDeadline: the attempt (dial, SOCKS handshake and exchange together) ran
 	// out of time. The endpoint accepted us; the circuit was too slow.
@@ -82,7 +84,7 @@ func (k dnsFailureKind) logReason(proxyAddr, upstream string, err error) string 
 	case dnsFailEndpointUnreachable:
 		return fmt.Sprintf("endpoint unreachable: nothing accepted a connection at %s (is the anonymizer, e.g. Tor, running and listening there?): %v", proxyAddr, err)
 	case dnsFailEndpointRefused:
-		return fmt.Sprintf("endpoint refused: %s accepted the connection but could not reach the upstream resolver %s (a circuit or exit failure; the endpoint itself is up): %v", proxyAddr, upstream, err)
+		return fmt.Sprintf("endpoint refused: %s accepted the connection but refused or failed the request for the upstream resolver %s (a circuit or exit failure, or a SOCKS-level rejection; the endpoint itself is up): %v", proxyAddr, upstream, err)
 	case dnsFailDeadline:
 		return fmt.Sprintf("deadline expired: no answer from %s via %s in time (the endpoint is up and the circuit was slow, typically a cold one after idle): %v", upstream, proxyAddr, err)
 	case dnsFailStreamBroken:
@@ -162,7 +164,11 @@ func servfail(query []byte, kind dnsFailureKind) ([]byte, bool) {
 	if len(query) < 12 {
 		return nil, false
 	}
-	end := len(query)
+	// Echo the one question and nothing after it. A query without exactly one parseable
+	// question gets a bare header (QDCOUNT 0): echoing it whole, as an earlier version
+	// did, left its records behind as trailing bytes the zeroed counts no longer
+	// declared, which is a malformed message.
+	end := 12
 	edns := false
 	if qend, ok := questionEnd(query); ok {
 		end = qend
@@ -170,6 +176,9 @@ func servfail(query []byte, kind dnsFailureKind) ([]byte, bool) {
 	}
 	resp := make([]byte, end)
 	copy(resp, query[:end])
+	if end == 12 {
+		binary.BigEndian.PutUint16(resp[4:6], 0) // QDCOUNT: no question is echoed
+	}
 	flags := binary.BigEndian.Uint16(resp[2:4])
 	flags |= 0x8000             // QR: this is a response
 	flags = flags&^0x000F | 0x2 // rcode 2, SERVFAIL

@@ -158,7 +158,10 @@ func TestForwarder_FailsClosedWhenProxyDown(t *testing.T) {
 	buf := make([]byte, 512)
 	n, err := conn.Read(buf)
 	if err != nil {
-		return // nothing at all is also fail-closed
+		// Silence would still be fail-CLOSED, but it is the defect this forwarder was
+		// changed to remove (it is what sent an operator to nft for an event inside it),
+		// so it fails this test rather than passing it.
+		t.Fatalf("the endpoint was down and the client got nothing (%v); it must get a visible SERVFAIL", err)
 	}
 	resp := buf[:n]
 	if ip := parseFirstA(resp); ip != "" {
