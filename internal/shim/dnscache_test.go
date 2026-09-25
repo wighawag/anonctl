@@ -43,6 +43,22 @@ func TestDNSCache_HitRespectsTTLAndCountsItDown(t *testing.T) {
 	if ttl := firstAnswerTTL(t, got); ttl > 60 || ttl == 0 {
 		t.Errorf("served TTL %d, want a remaining TTL in (0,60]", ttl)
 	}
+	// Ten seconds on, the served TTL must have come DOWN by ten. The bound above cannot
+	// tell a countdown from a replay of the full 60, so this is the assertion that does.
+	for k, e := range c.entries {
+		e.stored = e.stored.Add(-10 * time.Second)
+		c.entries[k] = e
+	}
+	if later, ok := c.get(q2); !ok {
+		t.Fatal("the entry vanished before its TTL")
+	} else if ttl := firstAnswerTTL(t, later); ttl > 50 {
+		t.Errorf("served TTL %d ten seconds after storing a 60s record; want at most 50 (the TTL was replayed, not counted down)", ttl)
+	}
+	// Undo the backdating so the expiry step below starts from the same point as before.
+	for k, e := range c.entries {
+		e.stored = e.stored.Add(10 * time.Second)
+		c.entries[k] = e
+	}
 
 	// Backdate the entry past its TTL: the entry must be gone, not merely stale.
 	for k, e := range c.entries {
@@ -82,6 +98,64 @@ func TestDNSCache_KeyedOnQuestionAndProfile(t *testing.T) {
 	// that varies case (0x20 encoding) must not miss every time.
 	if _, ok := c.get(buildAQuery(strings.ToUpper(uniqueName))); !ok {
 		t.Error("the same name in different case missed the cache")
+	}
+}
+
+// TestDNSCache_ALabelContainingADotIsADifferentName: a label may legally contain a
+// dot, so the one-label name `example.com` and the two-label `example`+`com` are
+// DIFFERENT names that spell the same dotted string. Keyed on that string, a local
+// uid could plant the NXDOMAIN for the one-label name under the key the account's
+// real lookups use (the port answers any local uid), blocking the name for as long
+// as it kept re-planting. The key is the wire form, so they cannot collide.
+func TestDNSCache_ALabelContainingADotIsADifferentName(t *testing.T) {
+	c := newDNSCache()
+	oneLabel := []byte{0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0}
+	oneLabel = append(oneLabel, 11)
+	oneLabel = append(oneLabel, "example.com"...)
+	oneLabel = append(oneLabel, 0, 0, 1, 0, 1)
+	c.put(oneLabel, nxdomainResponse(oneLabel, "", 86400, 86400))
+	if c.len() != 1 {
+		t.Fatal("setup: the planted NXDOMAIN was not cached at all")
+	}
+	if _, ok := c.get(buildAQuery("example.com")); ok {
+		t.Fatal("the two-label example.com hit an entry planted for the ONE-label name; a local uid can block any name the account uses")
+	}
+}
+
+// TestDNSCache_ServesTheAskersOwnQuestion: an answer from the cache carries the
+// question exactly as THIS asker spelled it, so a stub resolver comparing it (0x20
+// case randomisation does) accepts it.
+func TestDNSCache_ServesTheAskersOwnQuestion(t *testing.T) {
+	c := newDNSCache()
+	q := buildAQuery(uniqueName)
+	c.put(q, aResponse(q, uniqueName, answerIP, 60))
+	mixed := buildAQuery("UnIqUe.AnOnCtL.TeSt")
+	got, ok := c.get(mixed)
+	if !ok {
+		t.Fatal("a case variant of a cached name missed")
+	}
+	qend, _ := questionEnd(mixed)
+	if string(got[12:qend]) != string(mixed[12:qend]) {
+		t.Errorf("served question %q, want the asker's %q", got[12:qend], mixed[12:qend])
+	}
+}
+
+// TestDNSCache_ACNAMEToNothingIsANegativeAnswer: a CNAME to a name with no record of
+// the asked type is a NEGATIVE answer (RFC 2308), however long the CNAME's own TTL.
+// An earlier version held it for the CNAME's TTL, up to an hour, against the five-
+// minute negative cap.
+func TestDNSCache_ACNAMEToNothingIsANegativeAnswer(t *testing.T) {
+	q := buildAQuery(uniqueName)
+	resp := cnameOnlyResponse(q, 3600, true, 30)
+	ttl, _, ok := dnsResponseTTL(resp)
+	if !ok {
+		t.Fatal("a CNAME-to-nothing with an SOA must be cacheable as a negative answer")
+	}
+	if ttl != 30*time.Second {
+		t.Errorf("held for %s; want 30s (the SOA's negative TTL, not the CNAME's 3600s)", ttl)
+	}
+	if _, _, ok := dnsResponseTTL(cnameOnlyResponse(q, 3600, false, 0)); ok {
+		t.Error("a CNAME-to-nothing with no SOA was cached; nothing authorises holding a negative answer")
 	}
 }
 
@@ -202,6 +276,12 @@ func TestForwarder_CacheExpiryGoesUpstreamAgain(t *testing.T) {
 // It also asserts the converse, which is correct rather than a leak: an answer
 // already in the cache CAME from the endpoint, so serving it after the endpoint dies
 // discloses nothing new and is exactly what a TTL is for.
+//
+// "Down" means down. An earlier version only closed the SOCKS fixture, which closes
+// its listener and leaves the stream already relayed through it running, so the
+// "miss" was answered over the live stream and the "hit" would have been too with the
+// cache switched off: neither half was tested. Here the resolver is killed as well,
+// so nothing is left that could answer.
 func TestForwarder_FailsClosedOnACacheMissWithTheEndpointDown(t *testing.T) {
 	res := startPipelinedResolver(t, resolverOptions{answers: map[string]string{uniqueName: answerIP}, ttl: 600})
 	fx := socks5hfixture.New(socks5hfixture.Options{
@@ -228,20 +308,24 @@ func TestForwarder_FailsClosedOnACacheMissWithTheEndpointDown(t *testing.T) {
 	if ip := queryAWithTimeout(t, fwd.Addr(), uniqueName, 5*time.Second); ip != answerIP {
 		t.Fatalf("priming lookup resolved to %q, want %q", ip, answerIP)
 	}
-	fx.Close() // the endpoint is gone
+	fx.Close() // no new streams
+	res.kill() // and the one already open is gone
 
-	// A MISS: nothing may answer it, and in particular nothing may answer it with an
-	// address, which is what a host-resolver fallback would look like.
-	if resp, ok := rawQuery(t, fwd.Addr(), "never-asked-before.anonctl.test", 2*time.Second); ok {
-		if ip := parseFirstA(resp); ip != "" {
-			t.Fatalf("a cache MISS with the endpoint down was answered with %q: that can only have come from somewhere other than the endpoint", ip)
-		}
-		if rcode := resp[3] & 0x0F; rcode == 0 {
-			t.Fatalf("a cache miss with the endpoint down got a NOERROR answer; want no answer or a failure rcode")
-		}
+	// A MISS: it must come back as a visible failure, and must carry no address, which
+	// is what a fallback to any other resolver would look like.
+	resp, ok := rawQuery(t, fwd.Addr(), "localhost", 3*time.Second)
+	if !ok {
+		t.Fatal("a cache miss with the endpoint down got silence; it must get a visible SERVFAIL")
 	}
-	// A HIT: still served, from an answer that came over the endpoint while it was up.
-	if ip := queryAWithTimeout(t, fwd.Addr(), uniqueName, 5*time.Second); ip != answerIP {
+	if ip := parseFirstA(resp); ip != "" {
+		t.Fatalf("a cache MISS with the endpoint down was answered with %q: that can only have come from somewhere other than the endpoint", ip)
+	}
+	if rcode := resp[3] & 0x0F; rcode != 2 {
+		t.Fatalf("a cache miss with the endpoint down got rcode %d; want SERVFAIL (2)", rcode)
+	}
+	// A HIT: still served, and with nothing upstream left alive, only the cache can have
+	// served it.
+	if ip := queryAWithTimeout(t, fwd.Addr(), uniqueName, 3*time.Second); ip != answerIP {
 		t.Fatalf("a cached answer resolved to %q after the endpoint died, want %q", ip, answerIP)
 	}
 }
@@ -317,6 +401,32 @@ func nxdomainResponse(query []byte, name string, soaTTL, soaMinimum uint32) []by
 	rr = append(rr, rdLen[:]...)
 	rr = append(rr, rdata...)
 	return append(resp, rr...)
+}
+
+// cnameOnlyResponse renders a NOERROR answer whose only answer record is a CNAME
+// (to a target with no A record), optionally with an SOA in the authority section.
+func cnameOnlyResponse(query []byte, cnameTTL uint32, withSOA bool, soaMinimum uint32) []byte {
+	resp := make([]byte, len(query))
+	copy(resp, query)
+	resp[2], resp[3] = 0x81, 0x80
+	binary.BigEndian.PutUint16(resp[6:8], 1)
+	rr := []byte{0xc0, 0x0c, 0, 5, 0, 1} // CNAME/IN
+	rr = binary.BigEndian.AppendUint32(rr, cnameTTL)
+	target := encodeName("target.anonctl.test")
+	rr = binary.BigEndian.AppendUint16(rr, uint16(len(target)))
+	resp = append(resp, append(rr, target...)...)
+	if !withSOA {
+		return resp
+	}
+	binary.BigEndian.PutUint16(resp[8:10], 1)
+	soa := []byte{0xc0, 0x0c, 0, 6, 0, 1}
+	soa = binary.BigEndian.AppendUint32(soa, 3600)
+	rdata := append(encodeName("ns.anonctl.test"), encodeName("hostmaster.anonctl.test")...)
+	var nums [20]byte
+	binary.BigEndian.PutUint32(nums[16:20], soaMinimum)
+	rdata = append(rdata, nums[:]...)
+	soa = binary.BigEndian.AppendUint16(soa, uint16(len(rdata)))
+	return append(resp, append(soa, rdata...)...)
 }
 
 // withEDNS appends an OPT RR, optionally with the DO bit set.

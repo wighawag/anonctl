@@ -348,6 +348,7 @@ type pipelinedResolver struct {
 	conns  int
 	open   int
 	seened []string
+	live   []net.Conn
 }
 
 func startPipelinedResolver(t *testing.T, opts resolverOptions) *pipelinedResolver {
@@ -368,6 +369,18 @@ func (r *pipelinedResolver) connCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.conns
+}
+
+// kill takes the resolver down completely: no new connections, and every open one
+// dropped. Closing the SOCKS fixture alone does not do this, because it only closes
+// the fixture's listener and leaves the stream already relayed through it running.
+func (r *pipelinedResolver) kill() {
+	_ = r.ln.Close()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, c := range r.live {
+		_ = c.Close()
+	}
 }
 
 func (r *pipelinedResolver) openConns() int {
@@ -393,6 +406,7 @@ func (r *pipelinedResolver) accept() {
 		r.mu.Lock()
 		r.conns++
 		r.open++
+		r.live = append(r.live, c)
 		r.mu.Unlock()
 		go r.serve(c)
 	}

@@ -105,6 +105,15 @@ func (c *dnsCache) get(query []byte) (resp []byte, ok bool) {
 	out := make([]byte, len(e.resp))
 	copy(out, e.resp)
 	copy(out[:2], query[:2]) // the asker's own ID, not the one the answer arrived with
+	// And the asker's own QUESTION, byte for byte, so the answer always matches what was
+	// asked even in letter case (a stub resolver using 0x20 randomisation compares it).
+	// The key guarantees the two questions are the same name; only their spelling of it
+	// may differ, and only when neither is compressed are they the same length.
+	if qend, ok := questionEnd(query); ok {
+		if _, rend, err := dnsName(out, 12); err == nil && rend+4 == qend {
+			copy(out[12:qend], query[12:qend])
+		}
+	}
 	elapsed := uint32(now.Sub(e.stored) / time.Second)
 	for _, off := range e.ttlOffsets {
 		orig := binary.BigEndian.Uint32(out[off : off+4])
@@ -187,7 +196,7 @@ func dnsCacheKey(query []byte) (string, bool) {
 	if binary.BigEndian.Uint16(query[4:6]) != 1 {
 		return "", false
 	}
-	name, off, err := dnsName(query, 12)
+	wire, off, err := dnsWireName(query, 12)
 	if err != nil || off+4 > len(query) {
 		return "", false
 	}
@@ -195,7 +204,65 @@ func dnsCacheKey(query []byte) (string, bool) {
 	qclass := binary.BigEndian.Uint16(query[off+2 : off+4])
 	cd := flags & 0x0010
 	edns, do := ednsProfile(query, off+4)
-	return fmt.Sprintf("%s|%d|%d|%d|%t|%t", strings.ToLower(name), qtype, qclass, cd, edns, do), true
+	return fmt.Sprintf("%x|%d|%d|%d|%t|%t", wire, qtype, qclass, cd, edns, do), true
+}
+
+// dnsWireName renders the name at off in its canonical WIRE form (length-prefixed
+// labels, ASCII letters lowercased, compression pointers followed) for use as a cache
+// key, and returns the offset just past the name in the message.
+//
+// WHY THE WIRE FORM AND NOT THE DOTTED STRING. A label may legally contain a dot, so
+// the single label `example.com` and the two labels `example` + `com` render to the
+// same dotted string and would share an entry. Anyone who can reach the forwarder's
+// DNS port (any local uid, measured) could then plant the NXDOMAIN for the one-label
+// name, capped at five minutes and renewable at will, under the key the account's
+// real lookups use, and the account could not resolve that name at all. The wire
+// form cannot collide: two names share a key only if they ARE the same name.
+func dnsWireName(msg []byte, off int) ([]byte, int, error) {
+	var wire []byte
+	jumps := 0
+	cur := off
+	end := -1
+	for {
+		if cur >= len(msg) {
+			return nil, 0, fmt.Errorf("dns: name runs past the message")
+		}
+		l := int(msg[cur])
+		switch {
+		case l == 0:
+			if end < 0 {
+				end = cur + 1
+			}
+			return append(wire, 0), end, nil
+		case l&0xC0 == 0xC0:
+			if cur+1 >= len(msg) {
+				return nil, 0, fmt.Errorf("dns: truncated compression pointer")
+			}
+			ptr := int(binary.BigEndian.Uint16(msg[cur:cur+2]) & 0x3FFF)
+			if end < 0 {
+				end = cur + 2
+			}
+			jumps++
+			if jumps > 16 || ptr >= len(msg) {
+				return nil, 0, fmt.Errorf("dns: bad compression pointer")
+			}
+			cur = ptr
+		case l&0xC0 != 0:
+			return nil, 0, fmt.Errorf("dns: reserved label type")
+		default:
+			if cur+1+l > len(msg) {
+				return nil, 0, fmt.Errorf("dns: label runs past the message")
+			}
+			wire = append(wire, byte(l))
+			for _, b := range msg[cur+1 : cur+1+l] {
+				if b >= 'A' && b <= 'Z' {
+					b += 'a' - 'A'
+				}
+				wire = append(wire, b)
+			}
+			cur += 1 + l
+		}
+	}
 }
 
 // ednsProfile reports whether the query carried an OPT RR and whether DO is set.
@@ -266,6 +333,7 @@ func dnsResponseTTL(resp []byte) (time.Duration, []int, bool) {
 	if err != nil || off+4 > len(resp) {
 		return 0, nil, false
 	}
+	qtype := binary.BigEndian.Uint16(resp[off : off+2])
 	off += 4
 
 	answers := int(binary.BigEndian.Uint16(resp[6:8]))
@@ -275,6 +343,11 @@ func dnsResponseTTL(resp []byte) (time.Duration, []int, bool) {
 	var offsets []int
 	minTTL := uint32(0)
 	haveTTL := false
+	// answersQuestion: some answer record is of the type ASKED (or the question asked
+	// for the CNAME itself, or for everything). Without one, the answer section is at
+	// most a CNAME chain to a name with no such record, which RFC 2308 treats as a
+	// NEGATIVE answer, and an earlier version held for the CNAME's TTL, up to an hour.
+	answersQuestion := false
 	// ANSWER section: the TTL is the smallest TTL in it (RFC 2181's reading of a
 	// record set's lifetime), and every TTL is remembered so it can be counted down.
 	for i := 0; i < answers; i++ {
@@ -288,6 +361,9 @@ func dnsResponseTTL(resp []byte) (time.Duration, []int, bool) {
 				minTTL, haveTTL = ttl, true
 			}
 			offsets = append(offsets, ttlOff)
+			if rrType == qtype || qtype == 5 || qtype == 255 {
+				answersQuestion = true
+			}
 		}
 		off = next
 	}
@@ -333,21 +409,25 @@ func dnsResponseTTL(resp []byte) (time.Duration, []int, bool) {
 
 	var ttl time.Duration
 	switch {
-	case haveTTL:
+	case rcode == 0 && answersQuestion:
 		ttl = time.Duration(minTTL) * time.Second
 		if ttl > dnsCacheMaxTTL {
 			ttl = dnsCacheMaxTTL
 		}
 	case haveNeg:
-		// A NEGATIVE answer (NXDOMAIN, or NOERROR with no answers) is held only as far as
-		// the zone's own SOA allows, and never longer than the negative cap.
+		// A NEGATIVE answer (NXDOMAIN, or NOERROR with no record of the asked type, with or
+		// without a CNAME chain in front) is held only as far as the zone's own SOA allows,
+		// never longer than any CNAME in the chain, and never longer than the negative cap.
 		ttl = time.Duration(negTTL) * time.Second
+		if haveTTL && time.Duration(minTTL)*time.Second < ttl {
+			ttl = time.Duration(minTTL) * time.Second
+		}
 		if ttl > dnsCacheMaxNegativeTTL {
 			ttl = dnsCacheMaxNegativeTTL
 		}
 	default:
-		// No answer RRs and no SOA to authorise negative caching: nothing says how long
-		// this may be held, so it is not held at all.
+		// No record of the asked type and no SOA to authorise negative caching: nothing
+		// says how long this may be held, so it is not held at all.
 		return 0, nil, false
 	}
 	return ttl, offsets, true
