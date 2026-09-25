@@ -72,6 +72,11 @@ type ForwarderConfig struct {
 	// data race (found by `go test -race`).
 	ExchangeTimeout time.Duration
 	IdleTimeout     time.Duration
+	// NoCache disables the per-account answer cache (dnscache.go). The shim leaves it
+	// off (so the cache is ON); it exists so a test can assert what happens on a path
+	// with no cache in the way, and so an operator-facing switch has somewhere to land
+	// if the cache's timing side channel ever matters more than the latency.
+	NoCache bool
 }
 
 // Forwarder is a running DNS-to-SOCKS-TCP bridge, serving UDP and TCP.
@@ -81,6 +86,7 @@ type Forwarder struct {
 	ln     net.Listener
 	dialer proxy.Dialer
 	up     *dnsUpstream
+	cache  *dnsCache
 }
 
 // StartForwarder binds the UDP and TCP listeners and serves in the background
@@ -114,6 +120,12 @@ func StartForwarder(ctx context.Context, cfg ForwarderConfig) (*Forwarder, error
 	// per-account by construction: nothing here is shared between accounts, and the
 	// dial below carries this account's isolation username on every dial and re-dial.
 	f.up = &dnsUpstream{dial: f.dialUpstream, exchangeTimeout: cfg.ExchangeTimeout, idle: cfg.IdleTimeout}
+	if !cfg.NoCache {
+		// Per-account by construction: a field of this forwarder, in this account's own
+		// shim process, never written to disk and gone when the process ends. See
+		// dnscache.go for what it holds and for the timing side channel it creates.
+		f.cache = newDNSCache()
+	}
 	go f.serveUDP()
 	go f.serveTCP()
 	go func() {
@@ -211,11 +223,27 @@ func (f *Forwarder) handleTCPConn(conn net.Conn) {
 	}
 }
 
-// resolveViaSOCKS forwards a DNS message to the upstream resolver over the
-// account's persistent, pipelined DNS-over-TCP stream (dnsupstream.go), dialling one
-// when there is none. Everything it can return is a failure or an upstream answer:
-// if the endpoint is unreachable the caller has nothing to send, which is the
-// fail-closed property.
+// resolveViaSOCKS answers a DNS message from this account's cache, or forwards it to
+// the upstream resolver over the account's persistent, pipelined DNS-over-TCP stream
+// (dnsupstream.go), dialling one when there is none.
+//
+// FAIL-CLOSED, INCLUDING ON A CACHE MISS. The only route to an answer other than the
+// cache is the SOCKS dial, and the cache is only ever filled from an answer that
+// came back through it. So a miss with a dead endpoint yields a failure, never a
+// lookup that leaves the box in the clear, and there is no host-resolver path in
+// this file to fall back to even if something wanted one.
 func (f *Forwarder) resolveViaSOCKS(query []byte) ([]byte, error) {
-	return f.up.exchange(query)
+	if f.cache != nil {
+		if resp, ok := f.cache.get(query); ok {
+			return resp, nil
+		}
+	}
+	resp, err := f.up.exchange(query)
+	if err != nil {
+		return nil, err
+	}
+	if f.cache != nil {
+		f.cache.put(query, resp)
+	}
+	return resp, nil
 }

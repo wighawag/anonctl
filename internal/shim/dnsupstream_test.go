@@ -36,7 +36,9 @@ func TestForwarder_ReusesOneStreamForManyQueriesWithInterleavedIDs(t *testing.T)
 		batch:       2, // hold two queries, then answer the SECOND one first
 		answerFirst: false,
 	})
-	fwd := startForwarderVia(t, res, ForwarderConfig{})
+	// NoCache: this test is about the STREAM, and a cache hit would answer the repeat
+	// lookup below without going near it.
+	fwd := startForwarderVia(t, res, ForwarderConfig{NoCache: true})
 
 	type got struct {
 		name string
@@ -81,7 +83,7 @@ func TestForwarder_RedialsAfterThePeerClosesTheStream(t *testing.T) {
 		answers:         map[string]string{uniqueName: answerIP},
 		closeAfterFirst: true,
 	})
-	fwd := startForwarderVia(t, res, ForwarderConfig{})
+	fwd := startForwarderVia(t, res, ForwarderConfig{NoCache: true})
 
 	if ip := queryAWithTimeout(t, fwd.Addr(), uniqueName, 5*time.Second); ip != answerIP {
 		t.Fatalf("first query resolved to %q, want %q", ip, answerIP)
@@ -103,7 +105,7 @@ func TestForwarder_RedialsAfterThePeerClosesTheStream(t *testing.T) {
 func TestForwarder_ClosesAnIdleStreamAndDialsAgain(t *testing.T) {
 	res := startPipelinedResolver(t, resolverOptions{answers: map[string]string{uniqueName: answerIP}})
 	const idle = 200 * time.Millisecond
-	fwd := startForwarderVia(t, res, ForwarderConfig{IdleTimeout: idle})
+	fwd := startForwarderVia(t, res, ForwarderConfig{IdleTimeout: idle, NoCache: true})
 
 	if ip := queryAWithTimeout(t, fwd.Addr(), uniqueName, 5*time.Second); ip != answerIP {
 		t.Fatalf("first query resolved to %q, want %q", ip, answerIP)
@@ -150,6 +152,7 @@ func TestForwarder_ReusedStreamStillCarriesTheIsolationUsername(t *testing.T) {
 		ProxyAddr: fx.Addr(),
 		ProxyAuth: &proxy.Auth{User: "anon-01"},
 		Upstream:  upstreamName + ":53",
+		NoCache:   true, // the second lookup must reach the endpoint, so it can be observed
 	})
 	if err != nil {
 		t.Fatalf("start forwarder: %v", err)
@@ -189,6 +192,11 @@ type resolverOptions struct {
 	// closeAfterFirst makes the resolver hang up after answering one query on a
 	// connection, the way an upstream or a Tor exit reaps a stream.
 	closeAfterFirst bool
+	// ttl is the TTL on every answer record; zero means 60 seconds.
+	ttl uint32
+	// servfail answers EVERY query with SERVFAIL: an upstream resolver that is up and
+	// failing, as distinct from an endpoint that is down.
+	servfail bool
 }
 
 type pipelinedResolver struct {
@@ -225,6 +233,14 @@ func (r *pipelinedResolver) openConns() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.open
+}
+
+// queryCount is how many queries reached the UPSTREAM, which is the observable a
+// cache assertion needs: a hit must not produce one.
+func (r *pipelinedResolver) queryCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.seened)
 }
 
 func (r *pipelinedResolver) accept() {
@@ -297,13 +313,25 @@ func (r *pipelinedResolver) answer(query []byte) []byte {
 	resp := make([]byte, len(query))
 	copy(resp, query)
 	resp[2], resp[3] = 0x81, 0x80
+	if r.opts.servfail {
+		resp[3] = 0x82 // SERVFAIL
+		return resp
+	}
 	ip, ok := r.opts.answers[strings.ToLower(strings.TrimSuffix(name, "."))]
 	if !ok {
 		resp[3] = 0x83 // NXDOMAIN
 		return resp
 	}
 	resp[6], resp[7] = 0, 1
-	ans := []byte{0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4}
+	ttl := r.opts.ttl
+	if ttl == 0 {
+		ttl = 60
+	}
+	ans := []byte{0xc0, 0x0c, 0, 1, 0, 1}
+	var t [4]byte
+	binary.BigEndian.PutUint32(t[:], ttl)
+	ans = append(ans, t[:]...)
+	ans = append(ans, 0, 4)
 	ans = append(ans, net.ParseIP(ip).To4()...)
 	return append(resp, ans...)
 }
@@ -332,6 +360,28 @@ func startForwarderVia(t *testing.T, res *pipelinedResolver, cfg ForwarderConfig
 	}
 	t.Cleanup(func() { fwd.Close() })
 	return fwd
+}
+
+// rawQuery sends one A query and returns the response bytes, reporting whether
+// ANYTHING came back. Unlike queryAWithTimeout it does not fail the test on silence,
+// because several assertions here are about what silence means.
+func rawQuery(t *testing.T, forwarder, name string, timeout time.Duration) ([]byte, bool) {
+	t.Helper()
+	conn, err := net.Dial("udp", forwarder)
+	if err != nil {
+		t.Fatalf("dial forwarder: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	if _, err := conn.Write(buildAQuery(name)); err != nil {
+		t.Fatalf("write query: %v", err)
+	}
+	buf := make([]byte, 1500)
+	n, rerr := conn.Read(buf)
+	if rerr != nil {
+		return nil, false
+	}
+	return buf[:n], true
 }
 
 func queryAWithTimeout(t *testing.T, forwarder, name string, timeout time.Duration) string {
