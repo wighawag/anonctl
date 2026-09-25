@@ -246,11 +246,14 @@ func dnsResponseTTL(resp []byte) (time.Duration, []int, bool) {
 	}
 	rcode := flags & 0x000F
 	if rcode == 2 {
-		// SERVFAIL IS NEVER CACHED. An upstream resolver's failure is a statement about that
-		// moment, and holding it would turn one bad second into minutes of an account that
-		// cannot resolve a name. Named here, ahead of the general rule below that also
-		// excludes it, because this is the one exclusion whose absence would be a fail-closed
-		// bug dressed as a performance one: a cached "could not resolve" outlives the outage.
+		// SERVFAIL IS NEVER CACHED, in either direction. Not an UPSTREAM SERVFAIL (the
+		// resolver's failure is a statement about that moment, and holding it would turn one
+		// bad second into minutes of an account that cannot resolve a name), and not the
+		// forwarder's OWN SERVFAIL either, which structurally never reaches put: it is made
+		// after resolveViaSOCKS returns an error, and only answers that came back through the
+		// endpoint are stored. Named here, ahead of the general rule below that also excludes
+		// it, because this is the one exclusion whose absence would be a fail-closed bug
+		// dressed as a performance one: a cached "could not resolve" outlives the outage.
 		return 0, nil, false
 	}
 	if rcode != 0 && rcode != 3 { // otherwise NOERROR and NXDOMAIN only

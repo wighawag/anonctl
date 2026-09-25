@@ -67,7 +67,8 @@ func TestForwarder_ResolvesThroughProxyWithIsolationUsername(t *testing.T) {
 }
 
 // TestForwarder_ResolvesOverTCP proves the TCP listener (RFC 7766 DNS-over-TCP),
-// the path glibc's `use-vc` clients take (egress UDP is dropped by the ruleset).
+// the path a truncation retry and a `use-vc` client take (see the forwarder's WHY
+// BOTH LISTENERS).
 func TestForwarder_ResolvesOverTCP(t *testing.T) {
 	resolver := startDNSOverTCP(t)
 	fx := socks5hfixture.New(socks5hfixture.Options{
@@ -121,8 +122,17 @@ func TestForwarder_ResolvesOverTCP(t *testing.T) {
 	}
 }
 
-// TestForwarder_FailsClosedWhenProxyDown asserts fail-closed: proxy unreachable
-// means NO answer (never a local/plaintext fallback).
+// TestForwarder_FailsClosedWhenProxyDown asserts the load-bearing property: with the
+// endpoint unreachable, NOTHING RESOLVES. The query is not answered from the host
+// resolver, from /etc/hosts, or from anywhere else, for any reason.
+//
+// What it no longer asserts is SILENCE, and the difference is deliberate: a failure
+// the client can see (SERVFAIL, carrying no records) is not a fallback and discloses
+// nothing, while silence was indistinguishable from a kernel-level drop and cost a
+// real operator an hour in `nft`. So the assertion is about CONTENT: whatever comes
+// back must carry no address and must not be a successful answer. The name asked for
+// is one the HOST could resolve trivially, so a leak would be visible as an address
+// rather than having to be inferred.
 func TestForwarder_FailsClosedWhenProxyDown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -142,32 +152,50 @@ func TestForwarder_FailsClosedWhenProxyDown(t *testing.T) {
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-	if _, err := conn.Write(buildAQuery(uniqueName)); err != nil {
+	if _, err := conn.Write(buildAQuery("localhost")); err != nil {
 		t.Fatalf("write query: %v", err)
 	}
 	buf := make([]byte, 512)
-	if _, err := conn.Read(buf); err == nil {
-		t.Fatal("got a DNS answer with the proxy down; want fail-closed (no answer)")
+	n, err := conn.Read(buf)
+	if err != nil {
+		return // nothing at all is also fail-closed
+	}
+	resp := buf[:n]
+	if ip := parseFirstA(resp); ip != "" {
+		t.Fatalf("the endpoint was down and the forwarder answered with %q: that address can only have come from a local resolver, which is the leak this whole design exists to prevent", ip)
+	}
+	if rcode := resp[3] & 0x0F; rcode != 2 {
+		t.Fatalf("rcode %d with the endpoint down; want 2 (SERVFAIL): anything else claims a result nobody produced", rcode)
+	}
+	if ancount := binary.BigEndian.Uint16(resp[6:8]); ancount != 0 {
+		t.Fatalf("the failure carried %d answer records; it must carry none", ancount)
+	}
+
+	// And an EDNS client is told WHY, in the words that tell the operator what to do:
+	// the endpoint is down, not slow.
+	edns, ok := rawMsg(t, fwd.Addr(), withEDNS(buildAQuery("localhost"), false), 2*time.Second)
+	if !ok {
+		t.Fatal("an EDNS client got nothing with the endpoint down")
+	}
+	if _, text, ok := ExtendedDNSError(edns); !ok || text != dnsFailEndpointUnreachable.token() {
+		t.Fatalf("EDE %q (present=%v), want %q: a dead endpoint must be named as unreachable, not as slow", text, ok, dnsFailEndpointUnreachable.token())
 	}
 }
 
-// TestForwarder_ExchangeDeadlineExpiryIsSilent pins the MEASURED failure shape the
-// field report could not explain, and it is the hypothesis the DNS work that follows
-// rests on: when the upstream exchange outruns its deadline, the forwarder emits
-// NOTHING. Not SERVFAIL, not a close on the UDP leg: silence, which the client can
-// only discover by waiting out its own timeout.
+// TestForwarder_ExchangeDeadlineExpiryIsVisible pins the fix for the defect this work
+// started from. When the upstream exchange outruns the deadline, the forwarder now
+// answers SERVFAIL, immediately, carrying no records.
 //
-// Why that matters beyond tidiness. On the reporting host `dns-forced-path-answers`
-// went red once with "the shim ANSWERED and the answer never arrived", which asserts
-// a conntrack un-NAT drop and sends the operator to nft. This shape produces the same
-// observable (a query provably reached the shim, no answer came back) with no kernel
-// involvement at all, from inside anonctl's own forwarder. The upstream here is
+// WHAT IT USED TO DO, MEASURED. It emitted NOTHING: the query was dropped and the
+// client waited out its own timeout with no signal, and the shim logged nothing
+// either (confirmed against the released 0.9.0 binary through an endpoint that
+// accepts a connection and then goes quiet). On the reporting host that produced
+// `dns-forced-path-answers` red with "the shim ANSWERED and the answer never
+// arrived", a message that asserts a conntrack un-NAT drop and sends the operator to
+// `nft`, for an event inside anonctl's own forwarder. The upstream here is
 // deliberately SILENT rather than slow, because what is under test is what the
 // forwarder does when the deadline wins, not how long it waited.
-//
-// This test documents today's behaviour so the change that fixes it shows up as a
-// flipped assertion rather than a new one.
-func TestForwarder_ExchangeDeadlineExpiryIsSilent(t *testing.T) {
+func TestForwarder_ExchangeDeadlineExpiryIsVisible(t *testing.T) {
 	silent := startSilentDNSOverTCP(t)
 	fx := socks5hfixture.New(socks5hfixture.Options{
 		KnownHosts:     map[string]string{upstreamName: hostOf(silent)},
@@ -204,13 +232,131 @@ func TestForwarder_ExchangeDeadlineExpiryIsSilent(t *testing.T) {
 	if _, err := conn.Write(buildAQuery(uniqueName)); err != nil {
 		t.Fatalf("write query: %v", err)
 	}
+	start := time.Now()
 	buf := make([]byte, 512)
 	n, rerr := conn.Read(buf)
-	if rerr == nil {
-		t.Fatalf("the deadline expiry produced a %d-byte answer; this test documents that today it produces SILENCE", n)
+	if rerr != nil {
+		t.Fatalf("the deadline expiry produced nothing (%v): an operator can only discover that by timing out, which is the defect this fixes", rerr)
 	}
-	if !strings.Contains(rerr.Error(), "timeout") {
-		t.Fatalf("expected the client to time out with nothing (the measured shape); got %v", rerr)
+	resp := buf[:n]
+	if rcode := resp[3] & 0x0F; rcode != 2 {
+		t.Fatalf("rcode %d after a deadline expiry; want 2 (SERVFAIL)", rcode)
+	}
+	if ancount := binary.BigEndian.Uint16(resp[6:8]); ancount != 0 {
+		t.Fatalf("the failure carried %d answer records; it must carry none", ancount)
+	}
+	if id := binary.BigEndian.Uint16(resp[:2]); id != 0x1234 {
+		t.Fatalf("the failure carried id %#04x, want the asker's own %#04x (a client discards anything else)", id, 0x1234)
+	}
+	// It must arrive when the deadline fires, not when the client gives up: the whole
+	// point is that the client stops waiting.
+	if waited := time.Since(start); waited > time.Second {
+		t.Fatalf("the failure took %s to arrive on a 300ms deadline; a client cannot fail fast on that", waited)
+	}
+
+	edns, ok := rawMsg(t, fwd.Addr(), withEDNS(buildAQuery(uniqueName), false), 2*time.Second)
+	if !ok {
+		t.Fatal("an EDNS client got nothing after a deadline expiry")
+	}
+	if _, text, ok := ExtendedDNSError(edns); !ok || text != dnsFailDeadline.token() {
+		t.Fatalf("EDE %q (present=%v), want %q: a slow circuit must be named as slow, not as a dead endpoint", text, ok, dnsFailDeadline.token())
+	}
+}
+
+// TestForwarder_ItsOwnServfailIsNeverCached is the other direction of "never cache
+// SERVFAIL": the forwarder's OWN failure (here a deadline expiry) must not be
+// remembered, so the first query after the upstream recovers is answered for real.
+// A cached "could not resolve" would outlive the outage that produced it.
+func TestForwarder_ItsOwnServfailIsNeverCached(t *testing.T) {
+	res := startPipelinedResolver(t, resolverOptions{answers: map[string]string{uniqueName: answerIP}, ttl: 600, dropFirst: 1})
+	fwd := startForwarderVia(t, res, ForwarderConfig{ExchangeTimeout: 300 * time.Millisecond})
+
+	first, ok := rawQuery(t, fwd.Addr(), uniqueName, 3*time.Second)
+	if !ok || first[3]&0x0F != 2 {
+		t.Fatalf("the first query (upstream silent) should have produced SERVFAIL; got ok=%v", ok)
+	}
+	if ip := queryAWithTimeout(t, fwd.Addr(), uniqueName, 5*time.Second); ip != answerIP {
+		t.Fatalf("after the upstream recovered the name resolved to %q, want %q: the forwarder's own SERVFAIL was served from the cache", ip, answerIP)
+	}
+	if n := res.queryCount(); n != 2 {
+		t.Fatalf("the upstream saw %d queries; want 2 (the failure must not have been cached)", n)
+	}
+}
+
+// rawMsg sends an arbitrary pre-built message and returns whatever comes back.
+func rawMsg(t *testing.T, forwarder string, msg []byte, timeout time.Duration) ([]byte, bool) {
+	t.Helper()
+	conn, err := net.Dial("udp", forwarder)
+	if err != nil {
+		t.Fatalf("dial forwarder: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, 1500)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, false
+	}
+	return buf[:n], true
+}
+
+// TestForwarder_TCPClientAlsoGetsAVisibleFailure covers the leg the forwarder's header
+// explains is not optional (a truncation retry, or glibc under `use-vc`). That client
+// used to get a bare connection close when the upstream exchange failed, which
+// reaches getaddrinfo as a generic try-again with no reason attached. It must get the
+// same SERVFAIL the UDP client gets, correctly length-prefixed.
+func TestForwarder_TCPClientAlsoGetsAVisibleFailure(t *testing.T) {
+	silent := startSilentDNSOverTCP(t)
+	fx := socks5hfixture.New(socks5hfixture.Options{
+		KnownHosts:     map[string]string{upstreamName: hostOf(silent)},
+		RedirectTarget: silent,
+	})
+	if err := fx.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("start fixture: %v", err)
+	}
+	defer fx.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fwd, err := StartForwarder(ctx, ForwarderConfig{
+		Listen:          "127.0.0.1:0",
+		ProxyAddr:       fx.Addr(),
+		Upstream:        upstreamName + ":53",
+		ExchangeTimeout: 300 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("start forwarder: %v", err)
+	}
+	defer fwd.Close()
+
+	conn, err := net.Dial("tcp", fwd.TCPAddr())
+	if err != nil {
+		t.Fatalf("dial forwarder tcp: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	q := buildAQuery(uniqueName)
+	framed := make([]byte, 2+len(q))
+	binary.BigEndian.PutUint16(framed[:2], uint16(len(q)))
+	copy(framed[2:], q)
+	if _, err := conn.Write(framed); err != nil {
+		t.Fatalf("write tcp query: %v", err)
+	}
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+		t.Fatalf("the TCP client got no answer at all (%v): a use-vc client must see the failure", err)
+	}
+	resp := make([]byte, binary.BigEndian.Uint16(lenBuf[:]))
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		t.Fatalf("read tcp failure body: %v", err)
+	}
+	if rcode := resp[3] & 0x0F; rcode != 2 {
+		t.Fatalf("TCP rcode %d, want 2 (SERVFAIL)", rcode)
+	}
+	if ancount := binary.BigEndian.Uint16(resp[6:8]); ancount != 0 {
+		t.Fatalf("the TCP failure carried %d answer records; it must carry none", ancount)
 	}
 }
 

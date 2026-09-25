@@ -35,18 +35,25 @@ import (
 // healthy forced path here is a full DNS round trip over the endpoint, not a
 // loopback dial.
 //
-// IT MUST EXCEED THE SHIM'S OWN BUDGET FOR THE SAME QUERY, which is an UNBOUNDED
-// SOCKS dial (dnsforwarder.go builds its dialer over proxy.Direct, which has no
-// timeout, and a COLD Tor circuit build is seconds) PLUS the forwarder's own 5s
-// deadline on the upstream exchange. At 5s the client gave up no later than the
-// server's first leg, so the first `verify` after a reboot could report a
-// perfectly healthy path as "the shim never answered" -- a wrong diagnosis, and a
-// red that makes `use`/`exec` refuse a shell. Measured on a warm circuit the whole
-// round trip is ~0.5s; the margin here is for the cold one. It mirrors the
-// generous window the other Tor-round-trip probes take (curlAsAnon's 25s) and the
-// same margin rule probeExecBudget states for the dial probes. A genuinely dropped
-// answer burns the whole window, which is why `verify` runs its checks
-// concurrently.
+// IT MUST EXCEED THE SHIM'S OWN BUDGET FOR THE SAME QUERY, which is now a BOUNDED
+// one: DefaultDNSExchangeTimeout covers the dial and the exchange together, and a
+// re-dial retry happens inside that same deadline rather than adding another. So
+// this window has to exceed that one constant, with room for the query's two
+// loopback hops on either side of it. It did not always: at 5s the client gave up no
+// later than the server's first leg, so the first `verify` after a reboot could
+// report a perfectly healthy path as "the shim never answered" -- a wrong diagnosis,
+// and a red that makes `use`/`exec` refuse a shell.
+//
+// The shim's budget used to be UNBOUNDED (the SOCKS dial had no timeout at all, and
+// a cold Tor circuit build is seconds), which is why the margin here was picked
+// rather than derived. Measured inside the account's session on the reporting host, a
+// forced lookup's median was ~2.2s with a 3.6s warm-path maximum (see
+// work/notes/observations/dns-forced-path-answers-is-single-shot-on-a-path-with-tenfold-variance.md),
+// so the margin over the shim's own deadline is for a cold circuit build on top of
+// that. It mirrors the generous window
+// the other Tor-round-trip probes take (curlAsAnon's 25s) and the same margin rule
+// probeExecBudget states for the dial probes. A genuinely dropped answer burns the
+// whole window, which is why `verify` runs its checks concurrently.
 const DNSProbeTimeout = 20 * time.Second
 
 // dnsProbeDeadline is the deadline DNSProbe actually applies. It is a package var
@@ -134,6 +141,13 @@ const dnsProbeID = 0x4131
 // and returned a reply). A timeout, an EPERM on the send (the fail-closed drop),
 // or a malformed reply is NOT answered, and the detail carries the reason so the
 // caller can tell "nothing came back" from "the kernel refused to send it".
+//
+// THE RCODE IS IN THE DETAIL AND THE CALLER MUST READ IT. This polarity measures the
+// PATH, which is the right subject here, but one rcode says the path worked and the
+// lookup did not: the forwarder answers SERVFAIL when it could not resolve over the
+// endpoint (dnsforwarder.go), precisely so that failure is visible rather than
+// silent. `dns-forced-path-answers` therefore fails on a SERVFAIL while still
+// reporting that the round trip happened.
 func DNSProbe(server, name string) (answered bool, detail string) {
 	if server == "" || name == "" {
 		return false, "usage: -dns-probe <server-ip:port> <name>"

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"time"
 
@@ -18,35 +19,60 @@ import (
 // ordinary DNS query and resolves it over the endpoint via TCP: a SOCKS CONNECT
 // to an upstream resolver addressed BY HOSTNAME (resolved proxy-side, i.e.
 // socks5h), carrying DNS-over-TCP framing. The query never leaves the box in
-// plaintext, the host resolver never sees the name, and if the endpoint is down
-// the query is dropped (fail-closed, no host fallback).
+// plaintext, the host resolver never sees the name, and if the endpoint cannot
+// answer, the client gets a SERVFAIL naming why (fail-closed, no host fallback,
+// and never silence: see answer below).
 //
-// It serves on BOTH UDP and TCP. TCP is load-bearing: with egress UDP dropped by
-// the nft ruleset, resolv.conf carries `options use-vc` and glibc's getaddrinfo
-// then queries over TCP (RFC 7766); a UDP-only forwarder would leave glibc
-// clients with EAI_AGAIN. The per-account `<account>@` isolation username is
-// carried on the dial via ProxyAuth (the Tor IsolateSOCKSAuth knob), the same
-// username the relay uses, so the account's DNS shares its circuit class.
+// WHY BOTH LISTENERS. UDP is what every stub resolver sends by default, glibc as
+// much as musl (the reporting host's glibc queries over UDP; its resolv.conf has no
+// `use-vc`), and the account's nft redirect carries `udp dport 53` here. TCP is not
+// optional either, for two reasons that do not depend on the host: RFC 7766 makes TCP
+// support mandatory for DNS servers because a client RETRIES OVER TCP when a UDP
+// answer comes back truncated, and a host configured with `options use-vc` (the
+// netcage recipe this is mirrored from, where UDP egress was dropped) sends
+// everything over TCP. A UDP-only forwarder would leave either client with EAI_AGAIN.
+//
+// WHY THE ISOLATION USERNAME ON EVERY DIAL. The per-account `<account>@` username
+// (Tor IsolateSOCKSAuth) is what puts this account's DNS in the SAME circuit class
+// as its own TCP (the relay dials with the same username) and in a DIFFERENT one from
+// every other account's. Without it, two accounts' lookups could share a circuit, and
+// a shared circuit is a link between them that no amount of per-account forcing
+// undoes.
 
 // DefaultDNSExchangeTimeout bounds ONE attempt at an upstream DNS exchange, dial
-// included (the dial used to have no bound at all; see dialUpstream).
+// included, and its EXPIRY IS REPORTED rather than dropped (dnsfailure.go).
 //
-// MEASURED SHAPE OF ITS EXPIRY (telemaque, 0.9.0, work/notes/observations/dns-forced-path-answers-is-single-shot-on-a-path-with-tenfold-variance.md):
-// the expiry is SILENT. resolveViaSOCKS returns an error, both serve loops drop the
-// query fail-closed, and the client is left waiting out its own timeout with nothing
-// to tell it why; the shim logs nothing either. Confirmed against the released 0.9.0
-// binary through an endpoint that accepts a connection and then goes quiet. That is
-// the same observable a verify probe reports as "the shim answered and the answer
-// never arrived", for an event inside this forwarder. On that host a forced lookup,
-// measured inside the account's session, had a ~2.2s median and a 3.6s warm-path
-// maximum, so this deadline sits within sight of a warm sample and leaves a cold
-// circuit build little room. TestForwarder_ExchangeDeadlineExpiryIsSilent pins the
-// shape before anything changes it.
-const DefaultDNSExchangeTimeout = 5 * time.Second
+// WHY IT WAS 5s AND WHY THAT WAS WRONG (telemaque, 0.9.0, work/notes/observations/dns-forced-path-answers-is-single-shot-on-a-path-with-tenfold-variance.md).
+// A forced lookup there, measured inside the account's session, had a ~2.2s median
+// and a 3.6s warm-path maximum. How much of that the forwarder's own exchange accounts
+// for is not established, but a deadline of 5s within sight of a 3.6s WARM sample
+// leaves a cold circuit build little room. Worse, it fired SILENTLY, which produced
+// exactly the shape that sent an operator to nft and conntrack (`dns-forced-path-answers`
+// red with "the shim ANSWERED and the answer never arrived"), for an event inside
+// anonctl's own forwarder. Measured against the 0.9.0 binary through an endpoint that
+// accepts a connection and then goes quiet: the client got nothing at all and the
+// shim logged nothing either.
+//
+// WHY 10s NOW. The per-query cost this deadline used to govern was a circuit connect
+// PLUS an exchange, paid for every name; with the stream held open (dnsupstream.go)
+// the connect is paid once per idle period, so the deadline can afford room for the
+// one legitimately slow case left, a cold circuit build, without that room being
+// spent per name. It stays well inside DNSProbeTimeout, which verify sizes from it.
+// Note what a client does meanwhile: glibc's own per-query timeout is 5s, so a client
+// may retry before this fires, and that retry rides the SAME stream rather than
+// starting another circuit connect.
+const DefaultDNSExchangeTimeout = 10 * time.Second
 
 // DefaultDNSUpstreamIdle is how long a stream with nothing in flight is held open
 // before the forwarder tears it down. See dnsupstream.go for the tradeoff.
 const DefaultDNSUpstreamIdle = 30 * time.Second
+
+// dnsTCPClientIdle is how long a CLIENT's DNS-over-TCP connection is held with
+// nothing asked on it. It is about this loopback connection only, not about the
+// endpoint, and it is short because a TCP client (a truncation retry, or glibc under
+// `use-vc`) opens a connection per lookup:
+// a held-open idle client connection costs a goroutine and buys nothing.
+const dnsTCPClientIdle = 10 * time.Second
 
 // ForwarderConfig configures the DNS-over-SOCKS-TCP forwarder.
 type ForwarderConfig struct {
@@ -90,8 +116,7 @@ type Forwarder struct {
 }
 
 // StartForwarder binds the UDP and TCP listeners and serves in the background
-// until ctx is done. Both listeners are required (UDP for musl clients, TCP for
-// glibc `use-vc` clients).
+// until ctx is done. Both listeners are required (see WHY BOTH LISTENERS above).
 func StartForwarder(ctx context.Context, cfg ForwarderConfig) (*Forwarder, error) {
 	if cfg.Upstream == "" {
 		cfg.Upstream = "1.1.1.1:53"
@@ -102,7 +127,10 @@ func StartForwarder(ctx context.Context, cfg ForwarderConfig) (*Forwarder, error
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = DefaultDNSUpstreamIdle
 	}
-	dialer, err := proxy.SOCKS5("tcp", cfg.ProxyAddr, cfg.ProxyAuth, proxy.Direct)
+	// The forward dialer is proxy.Direct in all but one respect: a failure to reach the
+	// endpoint's own address is TAGGED, so a dead anonymizer can be reported as such and
+	// not as a slow one (dnsfailure.go).
+	dialer, err := proxy.SOCKS5("tcp", cfg.ProxyAddr, cfg.ProxyAuth, reachabilityDialer{})
 	if err != nil {
 		return nil, fmt.Errorf("dns forwarder: build SOCKS5 dialer: %w", err)
 	}
@@ -177,9 +205,9 @@ func (f *Forwarder) serveUDP() {
 		query := make([]byte, n)
 		copy(query, buf[:n])
 		go func() {
-			resp, err := f.resolveViaSOCKS(query)
-			if err != nil {
-				return // fail-closed: drop, never fall back to a host resolver
+			resp, ok := f.answer(query)
+			if !ok {
+				return
 			}
 			_, _ = f.pc.WriteTo(resp, addr)
 		}()
@@ -187,7 +215,7 @@ func (f *Forwarder) serveUDP() {
 }
 
 // serveTCP accepts DNS-over-TCP connections (RFC 7766), each carrying one or more
-// 2-byte-length-prefixed queries. Required for glibc `use-vc` clients.
+// 2-byte-length-prefixed queries: truncation retries and `use-vc` clients.
 func (f *Forwarder) serveTCP() {
 	for {
 		conn, err := f.ln.Accept()
@@ -201,7 +229,14 @@ func (f *Forwarder) serveTCP() {
 func (f *Forwarder) handleTCPConn(conn net.Conn) {
 	defer conn.Close()
 	for {
-		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		// TWO DIFFERENT DEADLINES, and conflating them was a bug worth naming. This one is
+		// how long an IDLE client connection is held while nothing is asked on it (RFC 7766
+		// leaves it to the server, and glibc opens a connection per lookup anyway). The
+		// per-query one below is how long the ANSWER may take. They used to be one 5s
+		// deadline covering both, which meant an upstream attempt allowed to run longer than
+		// 5s would have its answer written to a connection whose deadline had already
+		// expired: the client got a bare close instead of the answer or the SERVFAIL.
+		_ = conn.SetDeadline(time.Now().Add(dnsTCPClientIdle))
 		var lenBuf [2]byte
 		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
 			return // EOF or timeout: done with this connection
@@ -210,9 +245,10 @@ func (f *Forwarder) handleTCPConn(conn net.Conn) {
 		if _, err := io.ReadFull(conn, query); err != nil {
 			return
 		}
-		resp, err := f.resolveViaSOCKS(query)
-		if err != nil {
-			return // fail-closed: drop, never fall back
+		_ = conn.SetDeadline(time.Now().Add(f.cfg.ExchangeTimeout + 2*time.Second))
+		resp, ok := f.answer(query)
+		if !ok {
+			return
 		}
 		framed := make([]byte, 2+len(resp))
 		binary.BigEndian.PutUint16(framed[:2], uint16(len(resp)))
@@ -221,6 +257,26 @@ func (f *Forwarder) handleTCPConn(conn net.Conn) {
 			return
 		}
 	}
+}
+
+// answer is the one place a query becomes a reply, for BOTH listeners, so the UDP leg
+// and the TCP leg (truncation retries, `use-vc` clients) cannot drift apart on the
+// rule that matters: an upstream failure is a SERVFAIL with a logged, classified
+// reason, and never an answer from anywhere else.
+//
+// FAIL-CLOSED, AND SAID OUT LOUD. There is no host-resolver fallback here and never
+// may be. What changed is that the client is TOLD, instead of discovering the failure
+// by waiting out its own timeout on a query nobody will ever answer (the UDP leg used
+// to emit nothing; the TCP leg used to close the connection, which reaches glibc as a
+// reasonless try-again). ok=false only for a message too short to answer at all.
+func (f *Forwarder) answer(query []byte) ([]byte, bool) {
+	resp, err := f.resolveViaSOCKS(query)
+	if err == nil {
+		return resp, true
+	}
+	kind := classifyDNSFailure(err)
+	log.Printf("dns: %s (SERVFAIL, fail-closed)", kind.logReason(f.cfg.ProxyAddr, f.cfg.Upstream, err))
+	return servfail(query, kind)
 }
 
 // resolveViaSOCKS answers a DNS message from this account's cache, or forwards it to

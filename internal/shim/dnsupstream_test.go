@@ -197,6 +197,10 @@ type resolverOptions struct {
 	// servfail answers EVERY query with SERVFAIL: an upstream resolver that is up and
 	// failing, as distinct from an endpoint that is down.
 	servfail bool
+	// dropFirst reads and silently ignores the first this-many queries this resolver
+	// receives (across all connections): an upstream slower than the deadline, then a
+	// healthy one.
+	dropFirst int
 }
 
 type pipelinedResolver struct {
@@ -279,7 +283,11 @@ func (r *pipelinedResolver) serve(c net.Conn) {
 		name := decodeName(msg[12:])
 		r.mu.Lock()
 		r.seened = append(r.seened, name)
+		drop := len(r.seened) <= r.opts.dropFirst
 		r.mu.Unlock()
+		if drop {
+			continue // read, never answered
+		}
 		held = append(held, msg)
 		if batch > 1 && len(held) < batch {
 			continue // keep it in flight: the point is several outstanding at once

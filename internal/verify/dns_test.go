@@ -151,6 +151,47 @@ func TestDNSForcedPathAnswers_FailsWhenTheShimAnsweredAndTheReplyVanished(t *tes
 	}
 }
 
+// A SERVFAIL FROM THE SHIM IS NOT A WORKING PATH, and this is the assertion that
+// would quietly have started lying the moment the forwarder learned to report its own
+// failures: dns-forced-path-answers would otherwise have started PASSING on a dead
+// endpoint, because any rcode counted as ANSWERED. The probe's polarity ("an answer
+// of any rcode means the path carried a query and returned a reply") is the right
+// measurement of the PATH and stays; the verdict must still read the rcode.
+func TestDNSForcedPathAnswers_FailsOnAServfailFromTheShim(t *testing.T) {
+	ev := healthyDNS()
+	ev.ForcedDetail = "rcode=2 answers=0"
+	ev.ForcedRcode = 2
+	a := DNSForcedPathAnswersAssertion(ev)
+	if a.Ok {
+		t.Fatalf("a SERVFAIL from the shim must FAIL: the shim is reporting that it could not resolve; got %+v", a)
+	}
+	if strings.Contains(a.Detail, "un-NAT") {
+		t.Errorf("a SERVFAIL is not a dropped reply: the detail must not describe the un-NAT mechanism; got %q", a.Detail)
+	}
+	// And the ordinary case must still pass, or the fix above is just a red everywhere.
+	if a := DNSForcedPathAnswersAssertion(healthyDNS()); !a.Ok {
+		t.Fatalf("an ordinary answered query must still PASS; got %+v", a)
+	}
+}
+
+func TestProbeRcode_ReadsTheRcodeOrAdmitsItCannot(t *testing.T) {
+	for _, tc := range []struct {
+		detail string
+		want   int
+	}{
+		{"rcode=0 answers=1", 0},
+		{"rcode=2 answers=0", 2},
+		{"rcode=3 answers=0", 3},
+		{"no answer: i/o timeout", -1},
+		{"rcode=notanumber answers=0", -1},
+		{"", -1},
+	} {
+		if got := probeRcode(tc.detail); got != tc.want {
+			t.Errorf("probeRcode(%q) = %d, want %d", tc.detail, got, tc.want)
+		}
+	}
+}
+
 // The same failure with a nameserver OUTSIDE that range must not claim Tailscale
 // is at fault: the hint is evidence-driven, not decoration.
 func TestDNSForcedPathAnswers_DoesNotBlameTailscaleForAnOrdinaryNameserver(t *testing.T) {

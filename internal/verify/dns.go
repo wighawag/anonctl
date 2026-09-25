@@ -65,6 +65,11 @@ const (
 	dnsCounterShimReply = "shim-reply"
 )
 
+// dnsRcodeServfail is the rcode the shim's forwarder returns when it could not
+// resolve over the endpoint. It is called out by name because it is the one answered
+// rcode that must NOT pass `dns-forced-path-answers`.
+const dnsRcodeServfail = 2
+
 // DNSEvidence is the MEASURED evidence behind the three DNS assertions. Every
 // boolean here is an observation (a counter that moved, a probe that answered),
 // never an inference from the installed ruleset.
@@ -100,6 +105,13 @@ type DNSEvidence struct {
 	// socket to Nameserver came back with an answer of any rcode.
 	ForcedAnswered bool
 	ForcedDetail   string
+	// ForcedRcode is that answer's rcode, or -1 when it could not be read. It is
+	// recorded separately because ONE rcode is not evidence of a working path: the shim
+	// answers SERVFAIL when it could not resolve over the endpoint (a dead endpoint, or
+	// an exchange that outran its deadline). That is the fail-closed path REPORTING
+	// itself, and counting it as "the account has working, anonymized DNS" would be the
+	// same class of error as the inferred verdict this file was built to remove.
+	ForcedRcode int
 	// ForcedReachedShim / ShimReplied: the same query's packet-level fate.
 	ForcedReachedShim bool
 	ShimReplied       bool
@@ -379,6 +391,16 @@ func DNSForcedPathAnswersAssertion(ev DNSEvidence) Assertion {
 		server += " (glibc's default: the host declares no nameserver)"
 	}
 	switch {
+	case ev.ForcedAnswered && ev.ForcedReachedShim && ev.ForcedRcode == dnsRcodeServfail:
+		// THE SHIM ITSELF SAID IT COULD NOT RESOLVE. Without this case,
+		// dns-forced-path-answers would have started PASSING on a dead endpoint, because any
+		// rcode counted as ANSWERED: the shim now answers SERVFAIL instead of dropping a
+		// query it cannot resolve, and "an answer came back" would have turned that honesty
+		// into a green light for an account whose anonymizer is down. A SERVFAIL does prove
+		// the packet path works in both directions, which is worth saying; it also proves
+		// the lookup did not succeed.
+		a.Detail = fmt.Sprintf("a query from the account to %s went through the redirect into the shim, and the shim answered SERVFAIL (%s). The redirect and the shim are working and the account's DNS failed CLOSED, not open: the shim could not resolve over the endpoint. Check that the endpoint is up and reachable, then re-run verify", server, ev.ForcedDetail)
+		return a
 	case ev.ForcedAnswered && ev.ForcedReachedShim:
 		a.Ok = true
 		a.Detail = fmt.Sprintf("a query from the account to %s went through the redirect into the shim and was ANSWERED (%s): the account has working, anonymized DNS", server, ev.ForcedDetail)

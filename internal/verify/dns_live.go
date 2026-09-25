@@ -147,6 +147,7 @@ func dnsEvidence(ctx context.Context, p LiveParams) (DNSEvidence, error) {
 	counters, err = measureWithDNSCounters(ctx, p, func(pctx context.Context) error {
 		answered, detail, rerr := forcedDNSRoundTripAsAnon(pctx, p, ev.Nameserver, roundTrip)
 		ev.ForcedAnswered, ev.ForcedDetail = answered, detail
+		ev.ForcedRcode = probeRcode(detail)
 		return rerr
 	})
 	if err != nil {
@@ -430,6 +431,24 @@ func forcedDNSRoundTripAsAnon(ctx context.Context, p LiveParams, nameserver, nam
 		return false, s, fmt.Errorf("the installed shim at %s does not support -dns-probe (it predates this anonctl): reinstall anonctl-shim alongside anonctl, then re-run verify: %s", shimPath, s)
 	}
 	return false, s, fmt.Errorf("the DNS round-trip probe could not run (setpriv could not drop to uid %d, or the shim probe did not execute): %v: %s", p.AnonUID, runErr, s)
+}
+
+// probeRcode reads the rcode out of a DNSProbe detail (`rcode=<n> answers=<m>`), or
+// -1 when there is none to read. It is the one part of the probe's answer that the
+// verdict depends on beyond "something came back", because the shim answers SERVFAIL
+// to report that it could not resolve over the endpoint.
+func probeRcode(detail string) int {
+	for _, field := range strings.Fields(detail) {
+		if !strings.HasPrefix(field, "rcode=") {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimPrefix(field, "rcode="))
+		if err != nil {
+			return -1
+		}
+		return n
+	}
+	return -1
 }
 
 // nameserverAddr renders a bare nameserver address as the host:port the probe
