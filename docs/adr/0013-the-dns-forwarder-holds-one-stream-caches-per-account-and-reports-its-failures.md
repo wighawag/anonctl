@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (unreleased, after 0.9.0).
+Accepted (0.10.0).
 
 ## Context
 
