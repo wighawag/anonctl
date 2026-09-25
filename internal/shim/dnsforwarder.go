@@ -186,12 +186,14 @@ func (f *Forwarder) Addr() string { return f.pc.LocalAddr().String() }
 // TCPAddr returns the bound TCP address.
 func (f *Forwarder) TCPAddr() string { return f.ln.Addr().String() }
 
-// Close stops the forwarder.
+// Close stops the forwarder, including its upstream stream: without that, the
+// stream and its reader outlived Close until their idle timeout.
 func (f *Forwarder) Close() error {
 	err := f.pc.Close()
 	if e := f.ln.Close(); e != nil && err == nil {
 		err = e
 	}
+	f.up.close()
 	return err
 }
 

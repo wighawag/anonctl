@@ -47,27 +47,42 @@ import (
 // THE IDLE TRADEOFF (DefaultDNSUpstreamIdle) has one honest term on each side:
 // longer keeps more lookups off a cold circuit (a page load, a `git fetch`, a
 // package update are all bursts of names with gaps of seconds), shorter holds a Tor
-// stream open for less wall time. The default is comfortably longer than one
-// exchange deadline, so a stream is never reaped from under a query still waiting.
+// stream open for less wall time. The idle teardown only ever takes a stream with
+// NOTHING in flight (checked and marked in one step, failIfIdle), so a stream is
+// never reaped from under a query still waiting; with queries in flight, their own
+// deadlines govern. An earlier version killed the stream on any read timeout with a
+// waiter present, and restarted the idle clock only when a frame arrived, so a query
+// written just before the timer fired died with it. The clock now also restarts on
+// every query written, so idleness means no traffic in either direction.
 
-// errUpstreamBroken marks a CONNECTION-level failure (write error, EOF, a short or
-// unreadable frame): the stream is unusable and the query may be retried once on a
-// fresh one. It is deliberately distinct from a deadline expiry, which says
-// nothing is wrong with the connection and must NOT be retried behind the client's
-// back: the client asked for an answer within a bounded window, and quietly
-// spending a second window is how a bounded wait becomes an unbounded one.
+// errUpstreamBroken marks a STREAM-level failure that is not this query's own fault
+// (EOF, a write error, a short or unreadable frame, a stream abandoned because it
+// stopped answering, an idle teardown that raced this query): the stream is unusable
+// and the query is retried once on a fresh one, within its OWN deadline. It is
+// deliberately distinct from errUpstreamTimeout, which is never retried: the client
+// asked for an answer within a bounded window, and quietly spending a second window
+// is how a bounded wait becomes an unbounded one.
 var errUpstreamBroken = errors.New("dns upstream: stream broken")
 
-// errUpstreamTimeout marks the exchange deadline firing: the query was written and
-// no answer arrived in time. It is kept distinct from errUpstreamBroken because the
-// two mean different things to an operator (a slow circuit, not a dead stream), and
-// because it is never retried here.
+// errUpstreamTimeout means THIS query's own deadline expired. It is returned only to
+// the query whose deadline it was: an earlier version handed it to every query in
+// flight on the stream when any one of them timed out, so a query with most of its
+// budget left was reported as "deadline expired" when its deadline never had.
 var errUpstreamTimeout = errors.New("dns upstream: exchange deadline expired")
 
-// errUpstreamIdle marks the idle teardown, which is a normal, healthy end of life
-// for a stream and never reaches a client: any waiter has long since been answered
-// or timed out.
-var errUpstreamIdle = errors.New("dns upstream: closed after idle")
+// errStreamAbandoned: a query's deadline expired with NOTHING received on the stream
+// since that query was written, so the stream has stopped answering and is torn
+// down. Every other query in flight on it is retried on a fresh stream.
+var errStreamAbandoned = fmt.Errorf("%w: abandoned, it stopped answering", errUpstreamBroken)
+
+// errUpstreamIdle marks the idle teardown, a normal end of life for a stream. It is
+// retryable (it wraps errUpstreamBroken) because a query can be handed a stream in
+// the instant the teardown claims it; retried, it reaches a client only if the retry
+// fails as well, and then as that failure's own reason.
+var errUpstreamIdle = fmt.Errorf("%w: closed after idle", errUpstreamBroken)
+
+// errUpstreamClosed: the forwarder is shutting down. Not retried.
+var errUpstreamClosed = errors.New("dns upstream: forwarder closed")
 
 // dnsUpstream owns at most one live stream and re-dials as needed. Its dial func
 // is the SOCKS dial, so the isolation username is carried on every dial including
@@ -80,8 +95,9 @@ type dnsUpstream struct {
 	exchangeTimeout time.Duration
 	idle            time.Duration
 
-	mu  sync.Mutex
-	cur *dnsStream
+	mu     sync.Mutex
+	cur    *dnsStream
+	closed bool
 }
 
 // exchange sends one DNS message upstream and returns the response, reusing the
@@ -98,7 +114,12 @@ func (u *dnsUpstream) exchange(query []byte) ([]byte, error) {
 	}
 	deadline := time.Now().Add(u.exchangeTimeout)
 	for attempt := 0; ; attempt++ {
-		s, fresh, err := u.stream(deadline)
+		if !time.Now().Before(deadline) {
+			// Out of budget before (re)trying, e.g. after queueing behind a slow dial: this
+			// query's own deadline, reported as such, and no write into a shared stream.
+			return nil, errUpstreamTimeout
+		}
+		s, err := u.stream(deadline)
 		if err != nil {
 			return nil, err
 		}
@@ -106,42 +127,50 @@ func (u *dnsUpstream) exchange(query []byte) ([]byte, error) {
 		if rerr == nil {
 			return resp, nil
 		}
-		u.retire(s)
-		// RE-DIAL ONCE, and only for the case that actually needs it: a stream we found
-		// already open turned out to be dead. An idle DNS-over-TCP connection is closed by
-		// the peer routinely (RFC 7766 lets either end do it, and a Tor exit will), and the
-		// close is often only observable when we write into it, so without this retry every
-		// such close would cost one client a dropped query.
-		if attempt == 0 && !fresh && errors.Is(rerr, errUpstreamBroken) && time.Now().Before(deadline) {
+		if !s.live() {
+			// Only a DEAD stream is retired. A query whose own answer was slow leaves a
+			// stream that is still answering others, and dropping it would make the next query
+			// dial a second stream while the first lingers until its idle timeout.
+			u.retire(s)
+		}
+		// RETRY ONCE on a fresh stream when the failure was the STREAM's and not this
+		// query's: the peer closed it (RFC 7766 lets either end, and a Tor exit will),
+		// another query found it had stopped answering, or the idle teardown claimed it as
+		// this query arrived. Without this, each of those costs a client a SERVFAIL for a
+		// failure that says nothing about the path. Bounded by the SAME deadline, and never
+		// for errUpstreamTimeout, so a retry can never extend a client's wait.
+		if attempt == 0 && errors.Is(rerr, errUpstreamBroken) {
 			continue
 		}
 		return nil, rerr
 	}
 }
 
-// stream returns the live stream, or dials a new one. It reports whether the
-// stream is FRESH (dialled by this call), which is what makes the re-dial above
-// safe: retrying on a stream we just created would retry a real failure.
+// stream returns the live stream, or dials a new one.
 //
 // The dial happens under the mutex on purpose: a burst of queries (getaddrinfo's
 // A and AAAA, a page load's worth of names) then pays for ONE circuit connect and
-// pipelines the rest onto it, instead of racing N connects.
-func (u *dnsUpstream) stream(deadline time.Time) (*dnsStream, bool, error) {
+// pipelines the rest onto it, instead of racing N connects. A query queued behind a
+// slow dial keeps its own deadline, which exchange checks before it writes.
+func (u *dnsUpstream) stream(deadline time.Time) (*dnsStream, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if u.closed {
+		return nil, errUpstreamClosed
+	}
 	if u.cur != nil && u.cur.live() {
-		return u.cur, false, nil
+		return u.cur, nil
 	}
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	conn, err := u.dial(ctx)
 	if err != nil {
 		u.cur = nil
-		return nil, false, err
+		return nil, err
 	}
 	s := newDNSStream(conn, u.idle)
 	u.cur = s
-	return s, true, nil
+	return s, nil
 }
 
 // retire drops a stream if it is still the current one, so the next query dials.
@@ -153,14 +182,17 @@ func (u *dnsUpstream) retire(s *dnsStream) {
 	}
 }
 
-// close tears down the live stream (shim shutdown).
+// close tears down the live stream and refuses any further dial (forwarder
+// shutdown). Without the refusal, a query still in flight at shutdown would dial a
+// fresh stream that nothing ever closes.
 func (u *dnsUpstream) close() {
 	u.mu.Lock()
 	s := u.cur
 	u.cur = nil
+	u.closed = true
 	u.mu.Unlock()
 	if s != nil {
-		s.fail(errUpstreamIdle)
+		s.fail(errUpstreamClosed)
 	}
 }
 
@@ -179,14 +211,20 @@ type dnsStream struct {
 	nextID  uint16
 	dead    error
 	done    chan struct{}
+	// lastRecv is when the last frame arrived (or the stream was opened). A query whose
+	// deadline expires with nothing received since it was written proves the stream has
+	// stopped answering; one that expires while other answers keep arriving proves only
+	// that ITS answer was slow.
+	lastRecv time.Time
 }
 
 func newDNSStream(conn net.Conn, idle time.Duration) *dnsStream {
 	s := &dnsStream{
-		conn:    conn,
-		idle:    idle,
-		waiters: make(map[uint16]chan []byte),
-		done:    make(chan struct{}),
+		conn:     conn,
+		idle:     idle,
+		waiters:  make(map[uint16]chan []byte),
+		done:     make(chan struct{}),
+		lastRecv: time.Now(),
 	}
 	go s.read()
 	return s
@@ -217,9 +255,21 @@ func (s *dnsStream) roundTrip(query []byte, deadline time.Time) ([]byte, error) 
 	s.wmu.Lock()
 	_ = s.conn.SetWriteDeadline(deadline)
 	_, werr := s.conn.Write(frame)
+	writtenAt := time.Now()
+	if werr == nil {
+		// A written query restarts the idle clock, so the teardown can never claim a
+		// stream with a query on it that was written moments before the timer fired.
+		_ = s.conn.SetReadDeadline(writtenAt.Add(s.idle))
+	}
 	s.wmu.Unlock()
 	if werr != nil {
+		// A failed or partial write corrupts the framing for everyone, so the stream goes
+		// either way. What THIS query is told depends on why: its own deadline, or a
+		// broken stream it may retry.
 		s.fail(fmt.Errorf("%w: write: %v", errUpstreamBroken, werr))
+		if isTimeout(werr) {
+			return nil, errUpstreamTimeout
+		}
 		return nil, s.reason()
 	}
 
@@ -227,18 +277,42 @@ func (s *dnsStream) roundTrip(query []byte, deadline time.Time) ([]byte, error) 
 	defer timer.Stop()
 	select {
 	case resp := <-ch:
-		// Hand the client back its OWN message ID: the one on the wire was this stream's.
-		copy(resp[:2], query[:2])
-		return resp, nil
+		return withClientID(resp, query), nil
 	case <-s.done:
+		// The answer may have landed in ch in the same instant the stream died (the peer
+		// answered and closed at once): select picks at random between two ready cases, so
+		// look before discarding an answer that has already arrived.
+		select {
+		case resp := <-ch:
+			return withClientID(resp, query), nil
+		default:
+		}
 		return nil, s.reason()
 	case <-timer.C:
-		// An upstream that accepted a query and did not answer it inside the window is
-		// not a connection worth keeping: tear it down so the next query starts clean
-		// rather than pipelining onto a stream that has stopped answering.
-		s.fail(fmt.Errorf("%w", errUpstreamTimeout))
+		if s.silentSince(writtenAt) {
+			// Nothing at all has arrived since this query was written: the stream has stopped
+			// answering, so tear it down and let every other query in flight retry on a fresh
+			// one, each within its own deadline.
+			s.fail(errStreamAbandoned)
+		}
+		// Otherwise answers are still arriving and only THIS one was slow: the stream stays,
+		// and a late answer for this ID is dropped by the reader as unmatched.
 		return nil, errUpstreamTimeout
 	}
+}
+
+// withClientID hands the client back its OWN message ID: the one on the wire was
+// this stream's.
+func withClientID(resp, query []byte) []byte {
+	copy(resp[:2], query[:2])
+	return resp
+}
+
+// silentSince reports that no frame has arrived since t.
+func (s *dnsStream) silentSince(t time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.lastRecv.After(t)
 }
 
 // register allocates an ID unique among the queries CURRENTLY OUTSTANDING on this
@@ -299,10 +373,15 @@ func (s *dnsStream) read() {
 		// idle period, so the stream is torn down and the next query dials a new one.
 		_ = s.conn.SetReadDeadline(time.Now().Add(s.idle))
 		var lenBuf [2]byte
-		if _, err := readFull(s.conn, lenBuf[:]); err != nil {
-			if isTimeout(err) && s.idleOnly() {
-				s.fail(errUpstreamIdle)
-				return
+		if n, err := readFull(s.conn, lenBuf[:]); err != nil {
+			if isTimeout(err) && n == 0 {
+				if s.failIfIdle() {
+					return
+				}
+				// Queries are in flight, so this is not idleness and the idle clock has no
+				// business killing the stream: their own deadlines govern, and a query that
+				// times out with nothing received since it was written abandons the stream.
+				continue
 			}
 			s.fail(fmt.Errorf("%w: read length: %v", errUpstreamBroken, err))
 			return
@@ -320,16 +399,26 @@ func (s *dnsStream) read() {
 	}
 }
 
-// idleOnly reports that nothing is in flight, which is what makes a read timeout
-// an idle teardown rather than an upstream that stopped answering.
-func (s *dnsStream) idleOnly() bool {
+// failIfIdle tears the stream down as idle if, and only if, nothing is in flight,
+// checking and marking under one lock so a query cannot register in between. A query
+// that was handed this stream just before still loses the race at register, and gets
+// errUpstreamIdle, which is retryable.
+func (s *dnsStream) failIfIdle() bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.waiters) == 0
+	if s.dead != nil || len(s.waiters) != 0 {
+		s.mu.Unlock()
+		return s.dead != nil
+	}
+	s.dead = errUpstreamIdle
+	close(s.done)
+	s.mu.Unlock()
+	_ = s.conn.Close()
+	return true
 }
 
 func (s *dnsStream) deliver(id uint16, resp []byte) {
 	s.mu.Lock()
+	s.lastRecv = time.Now()
 	ch, ok := s.waiters[id]
 	if ok {
 		delete(s.waiters, id)

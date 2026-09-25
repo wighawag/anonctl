@@ -73,12 +73,11 @@ func TestForwarder_ReusesOneStreamForManyQueriesWithInterleavedIDs(t *testing.T)
 	}
 }
 
-// TestForwarder_RedialsAfterThePeerClosesTheStream covers the cost of holding a
-// connection open: the peer can close it at any time (RFC 7766 lets either end,
-// and an idle Tor stream will), and the close is frequently only observable when we
-// write into it. A client must not lose a query to that, so the forwarder re-dials
-// once and the second query is answered on the new stream.
-func TestForwarder_RedialsAfterThePeerClosesTheStream(t *testing.T) {
+// TestForwarder_NextQueryDialsAfterThePeerClosed: the peer closes the stream after
+// answering (an upstream or a Tor exit reaping it). The stream's reader sees the
+// close at once, so the NEXT query simply finds no live stream and dials a new one;
+// no retry is involved. This is the common case, and it must cost nothing.
+func TestForwarder_NextQueryDialsAfterThePeerClosed(t *testing.T) {
 	res := startPipelinedResolver(t, resolverOptions{
 		answers:         map[string]string{uniqueName: answerIP},
 		closeAfterFirst: true,
@@ -88,14 +87,140 @@ func TestForwarder_RedialsAfterThePeerClosesTheStream(t *testing.T) {
 	if ip := queryAWithTimeout(t, fwd.Addr(), uniqueName, 5*time.Second); ip != answerIP {
 		t.Fatalf("first query resolved to %q, want %q", ip, answerIP)
 	}
-	// Let the peer's close land, so the next query finds a stream that looks live and
-	// is not: the exact case the re-dial exists for.
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond) // let the reader see the close
 	if ip := queryAWithTimeout(t, fwd.Addr(), uniqueName, 5*time.Second); ip != answerIP {
-		t.Fatalf("query after the peer closed the stream resolved to %q, want %q (the re-dial did not happen)", ip, answerIP)
+		t.Fatalf("query after the peer closed the stream resolved to %q, want %q", ip, answerIP)
 	}
 	if n := res.connCount(); n != 2 {
-		t.Fatalf("upstream saw %d connections; want 2 (one, then one re-dial)", n)
+		t.Fatalf("upstream saw %d connections; want 2 (one, then a fresh dial)", n)
+	}
+}
+
+// TestForwarder_RetriesAQueryWhoseStreamDiesUnderIt is the retry itself: the peer
+// drops the connection while a query is OUTSTANDING on it, which is not that
+// query's fault and says nothing about the path. The query must be retried on a
+// fresh stream within its own deadline and answered, not turned into a SERVFAIL.
+// (An earlier version of this test slept until the reader had noticed the close, so
+// the next query dialled fresh and the retry never ran; it passed with the retry
+// deleted.)
+func TestForwarder_RetriesAQueryWhoseStreamDiesUnderIt(t *testing.T) {
+	res := startPipelinedResolver(t, resolverOptions{
+		answers:      map[string]string{uniqueName: answerIP},
+		closeOnQuery: 2, // the second query overall kills its connection unanswered
+	})
+	fwd := startForwarderVia(t, res, ForwarderConfig{NoCache: true})
+
+	if ip := queryAWithTimeout(t, fwd.Addr(), uniqueName, 5*time.Second); ip != answerIP {
+		t.Fatalf("first query resolved to %q, want %q", ip, answerIP)
+	}
+	if ip := queryAWithTimeout(t, fwd.Addr(), uniqueName, 5*time.Second); ip != answerIP {
+		t.Fatalf("the query whose stream died under it resolved to %q, want %q: it was not retried", ip, answerIP)
+	}
+	if n := res.connCount(); n != 2 {
+		t.Fatalf("upstream saw %d connections; want 2 (the stream that died, then the retry's)", n)
+	}
+}
+
+// TestForwarder_OneQuerysDeadlineDoesNotFailTheOthers: query A goes unanswered, and
+// query B, written later with most of its budget left, is in flight when A's
+// deadline fires. Nothing has arrived since A was written, so the stream has stopped
+// answering and is abandoned; B must be RETRIED on a fresh stream and answered. An
+// earlier version handed B A's "deadline expired", so B was reported as having hit a
+// deadline it never reached.
+func TestForwarder_OneQuerysDeadlineDoesNotFailTheOthers(t *testing.T) {
+	const slowName = "slow.anonctl.test"
+	res := startPipelinedResolver(t, resolverOptions{
+		answers: map[string]string{uniqueName: answerIP, slowName: "203.0.113.9"},
+		silent:  map[string]bool{"silent.anonctl.test": true},
+		delay:   map[string]time.Duration{slowName: 150 * time.Millisecond},
+	})
+	fwd := startForwarderVia(t, res, ForwarderConfig{NoCache: true, ExchangeTimeout: 400 * time.Millisecond})
+
+	aDone := make(chan []byte, 1)
+	go func() {
+		resp, _ := rawQuery(t, fwd.Addr(), "silent.anonctl.test", 3*time.Second)
+		aDone <- resp
+	}()
+	time.Sleep(250 * time.Millisecond)
+	if ip := queryAWithTimeout(t, fwd.Addr(), slowName, 3*time.Second); ip != "203.0.113.9" {
+		t.Fatalf("query B resolved to %q: another query's deadline failed it", ip)
+	}
+	if a := <-aDone; a == nil || a[3]&0x0F != 2 {
+		t.Fatalf("query A (never answered) should have got SERVFAIL; got %v", a)
+	}
+}
+
+// TestForwarder_ASlowAnswerDoesNotKillALiveStream is the other half: when answers
+// ARE still arriving, one slow answer proves nothing about the stream. The slow
+// query gets its own deadline expiry, and the stream stays up for everyone else.
+func TestForwarder_ASlowAnswerDoesNotKillALiveStream(t *testing.T) {
+	const slowName = "slow.anonctl.test"
+	res := startPipelinedResolver(t, resolverOptions{
+		answers: map[string]string{uniqueName: answerIP, slowName: "203.0.113.9"},
+		delay:   map[string]time.Duration{slowName: 700 * time.Millisecond},
+	})
+	fwd := startForwarderVia(t, res, ForwarderConfig{NoCache: true, ExchangeTimeout: 400 * time.Millisecond})
+
+	slowDone := make(chan []byte, 1)
+	go func() {
+		resp, _ := rawQuery(t, fwd.Addr(), slowName, 3*time.Second)
+		slowDone <- resp
+	}()
+	time.Sleep(100 * time.Millisecond)
+	if ip := queryAWithTimeout(t, fwd.Addr(), uniqueName, 3*time.Second); ip != answerIP {
+		t.Fatalf("a fast query alongside a slow one resolved to %q", ip)
+	}
+	if slow := <-slowDone; slow == nil || slow[3]&0x0F != 2 {
+		t.Fatalf("the slow query should have got its own SERVFAIL; got %v", slow)
+	}
+	if ip := queryAWithTimeout(t, fwd.Addr(), uniqueName, 3*time.Second); ip != answerIP {
+		t.Fatalf("a later query resolved to %q", ip)
+	}
+	if n := res.connCount(); n != 1 {
+		t.Fatalf("upstream saw %d connections; want 1 (one slow answer must not tear down a stream that is answering)", n)
+	}
+}
+
+// TestForwarder_AStreamIsNeverReapedFromUnderAWaitingQuery: a query whose answer
+// takes longer than the idle period must not have its stream torn down as idle.
+// An earlier version restarted the idle clock only when a frame ARRIVED, so a query
+// written just before the timer fired was killed with the stream.
+func TestForwarder_AStreamIsNeverReapedFromUnderAWaitingQuery(t *testing.T) {
+	const slowName = "slow.anonctl.test"
+	res := startPipelinedResolver(t, resolverOptions{
+		answers: map[string]string{uniqueName: answerIP, slowName: "203.0.113.9"},
+		delay:   map[string]time.Duration{slowName: 300 * time.Millisecond},
+	})
+	fwd := startForwarderVia(t, res, ForwarderConfig{NoCache: true, IdleTimeout: 200 * time.Millisecond, ExchangeTimeout: 2 * time.Second})
+
+	if ip := queryAWithTimeout(t, fwd.Addr(), uniqueName, 3*time.Second); ip != answerIP {
+		t.Fatalf("first query resolved to %q", ip)
+	}
+	time.Sleep(150 * time.Millisecond) // the idle timer is now 50ms from firing
+	if ip := queryAWithTimeout(t, fwd.Addr(), slowName, 3*time.Second); ip != "203.0.113.9" {
+		t.Fatalf("the waiting query resolved to %q", ip)
+	}
+	if n := res.connCount(); n != 1 {
+		t.Fatalf("upstream saw %d connections; want 1 (the stream was reaped from under a waiting query)", n)
+	}
+}
+
+// TestForwarder_CloseTearsDownTheUpstreamStream: Close must not leave the upstream
+// stream (a Tor stream, in production) open until its idle timeout.
+func TestForwarder_CloseTearsDownTheUpstreamStream(t *testing.T) {
+	res := startPipelinedResolver(t, resolverOptions{answers: map[string]string{uniqueName: answerIP}})
+	fwd := startForwarderVia(t, res, ForwarderConfig{NoCache: true})
+	queryAWithTimeout(t, fwd.Addr(), uniqueName, 3*time.Second)
+	if res.openConns() != 1 {
+		t.Fatalf("expected one open upstream stream before Close; have %d", res.openConns())
+	}
+	fwd.Close()
+	deadline := time.Now().Add(time.Second)
+	for res.openConns() > 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := res.openConns(); n != 0 {
+		t.Fatalf("%d upstream stream(s) still open a second after Close", n)
 	}
 }
 
@@ -128,8 +253,8 @@ func TestForwarder_ClosesAnIdleStreamAndDialsAgain(t *testing.T) {
 // TestForwarder_ReusedStreamStillCarriesTheIsolationUsername keeps the property the
 // reuse could quietly have broken: the account's DNS shares ITS OWN circuit class,
 // which is what the `<account>@` isolation username buys (Tor IsolateSOCKSAuth).
-// Fewer dials must not mean an unauthenticated one, and the RE-DIAL is the dial
-// most likely to lose it, so both are checked.
+// Fewer dials must not mean an unauthenticated one, so the first dial and a later
+// one are both checked.
 func TestForwarder_ReusedStreamStillCarriesTheIsolationUsername(t *testing.T) {
 	res := startPipelinedResolver(t, resolverOptions{
 		answers:         map[string]string{uniqueName: answerIP},
@@ -160,12 +285,14 @@ func TestForwarder_ReusedStreamStillCarriesTheIsolationUsername(t *testing.T) {
 	defer fwd.Close()
 
 	queryAWithTimeout(t, fwd.Addr(), uniqueName, 5*time.Second)
-	time.Sleep(150 * time.Millisecond) // let the peer's close land, forcing the re-dial
+	time.Sleep(150 * time.Millisecond) // let the peer's close land, forcing a second dial
 	queryAWithTimeout(t, fwd.Addr(), uniqueName, 5*time.Second)
 
+	// Every dial, the retry's included, goes through the one SOCKS dialer built with
+	// the account's credentials, so a second dial of any kind proves the property.
 	users := fx.AuthUsernames()
 	if len(users) < 2 {
-		t.Fatalf("expected the re-dial to authenticate too; usernames seen: %v", users)
+		t.Fatalf("expected the second dial to authenticate too; usernames seen: %v", users)
 	}
 	for i, u := range users {
 		if u != "anon-01" {
@@ -201,6 +328,16 @@ type resolverOptions struct {
 	// receives (across all connections): an upstream slower than the deadline, then a
 	// healthy one.
 	dropFirst int
+	// silent names are read and never answered: an upstream that has stopped answering
+	// those, whatever it does for others.
+	silent map[string]bool
+	// delay answers these names after the given time, CONCURRENTLY with later queries
+	// on the same connection (a pipelining server does not hold one slow answer in front
+	// of the rest).
+	delay map[string]time.Duration
+	// closeOnQuery, when N > 0, makes the resolver drop the connection without
+	// answering when it reads its Nth query overall: a peer that dies mid-exchange.
+	closeOnQuery int
 }
 
 type pipelinedResolver struct {
@@ -269,6 +406,16 @@ func (r *pipelinedResolver) serve(c net.Conn) {
 		r.mu.Unlock()
 	}()
 	var held [][]byte
+	var wmu sync.Mutex // delayed answers write concurrently with the loop below
+	write := func(resp []byte) error {
+		out := make([]byte, 2+len(resp))
+		binary.BigEndian.PutUint16(out[:2], uint16(len(resp)))
+		copy(out[2:], resp)
+		wmu.Lock()
+		defer wmu.Unlock()
+		_, err := c.Write(out)
+		return err
+	}
 	batch := r.opts.batch
 	for {
 		_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -284,9 +431,20 @@ func (r *pipelinedResolver) serve(c net.Conn) {
 		r.mu.Lock()
 		r.seened = append(r.seened, name)
 		drop := len(r.seened) <= r.opts.dropFirst
+		die := r.opts.closeOnQuery > 0 && len(r.seened) == r.opts.closeOnQuery
 		r.mu.Unlock()
-		if drop {
+		if die {
+			return // the connection dies with this query unanswered
+		}
+		if drop || r.opts.silent[name] {
 			continue // read, never answered
+		}
+		if d, ok := r.opts.delay[name]; ok {
+			go func(q []byte) {
+				time.Sleep(d)
+				_ = write(r.answer(q))
+			}(msg)
+			continue
 		}
 		held = append(held, msg)
 		if batch > 1 && len(held) < batch {
@@ -299,11 +457,7 @@ func (r *pipelinedResolver) serve(c net.Conn) {
 			}
 		}
 		for _, q := range held {
-			resp := r.answer(q)
-			out := make([]byte, 2+len(resp))
-			binary.BigEndian.PutUint16(out[:2], uint16(len(resp)))
-			copy(out[2:], resp)
-			if _, err := c.Write(out); err != nil {
+			if err := write(r.answer(q)); err != nil {
 				return
 			}
 		}
