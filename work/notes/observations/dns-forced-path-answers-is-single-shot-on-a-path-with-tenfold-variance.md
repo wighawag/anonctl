@@ -71,6 +71,77 @@ If that is right, the probe's message is actively misleading: it asserts the un-
 
 The verify-side suggestion at the top of this note stands and becomes smaller: with the forwarder fixed, a single-shot probe is on a much tighter distribution, and a retry is belt-and-braces rather than the main defence.
 
+## CLOSED: what the follow-up measurements said
+
+All three fixes landed, plus the verify-side change, in five commits (2f1d1ec, 73a9639, a9e6300, 971c9f8, 3aad225), and `docs/adr/0013` records the decisions. What the measurements said is not uniformly what this note predicted, so here it is straight. **Everything below was measured by an agent WITHOUT root**, so none of it went through the account's nft redirect or inside `anonctl use`; the before/after on the account's real path is still to be taken (see "Live verification" below).
+
+**The hypothesis held, and was caught in the act.** Against the RELEASED 0.9.0 binary, through an endpoint that completes the SOCKS handshake and then goes quiet, the client got NOTHING for as long as it was willing to wait and the shim's journal recorded NOTHING either. With the endpoint simply dead, the same: no answer (the client timed out at 8s) and an empty log. So a failed resolution produced silence, exactly as argued, and silence is indistinguishable at the probe from an answer destroyed on the way back. Now: a dead endpoint gets SERVFAIL in about a millisecond and the log line `dns: endpoint unreachable: nothing accepted a connection at ... (is the anonymizer, e.g. Tor, running and listening there?)`; a hanging one gets SERVFAIL at the 10s deadline and `dns: deadline expired: ... (the endpoint is up and the circuit was slow ...)`.
+
+**But the note's reading of WHICH failure text the operator saw was wrong, and that matters more than it looks.** Their message was the un-NAT one, which is the branch where the `shim-reply` counter MOVED, and a forwarder that gives up silently emits nothing to move it. The two are reconciled by what that counter actually measures: the un-NAT branch fires on a counter proving only that A packet left during the window, which glibc's own retries can satisfy (and so can a late reply to the NSS probe that runs immediately before the round-trip probe). That is why the failure text now reports the observation and ranks candidates instead of asserting the mechanism.
+
+**A second-order trap, caught before it shipped.** Making the forwarder answer SERVFAIL instead of staying silent would, on its own, have made things WORSE in one place: `dns-forced-path-answers` would otherwise have started PASSING on a dead endpoint, because any rcode counted as ANSWERED. The verdict now reads the rcode, and the SERVFAIL carries its reason (as an RFC 8914 Extended DNS Error) so verify can say "your Tor is down" or "your circuit was slow" rather than just "failed".
+
+**The two numbers in this note and in my measurements are NOT like for like, and the gap between them is unexplained.** They were taken on the same host on the same day, about two hours apart, so this is not drift:
+
+```
+2.195s median   operator, inside `anonctl use anon-01`: getent ahostsv4 example.com
+                (glibc, ONE query, A only, through the nft redirect), 10 samples
+0.340s median   agent, unprivileged uid, straight at anon-01's shim DNS port
+                (127.0.0.1:19053, the same deployed 0.9.0 shim): A and AAAA in
+                parallel (TWO queries), 10 samples
+```
+
+The second does MORE work and is six times faster, so the measurement POINT is a likelier explanation than circuit weather, and nothing measured here supports the weather reading. If the account's real path is still ~2.2s while the shim's port answers in ~0.3s, then something between `getaddrinfo` and the forwarder (the NSS modules ahead of `dns` in this host's `hosts:` line, the nft redirect and conntrack, or glibc's own behaviour with `options edns0 trust-ad` and the search domain) costs more than the whole upstream exchange, and that would be a finding in its own right. An attempt to reproduce glibc's path without root (glibc in an unprivileged user+net+mount namespace, aimed through a unix-socket relay at the shim) was abandoned inside its own time bound: `getent` there returned "not found" in about a millisecond with the relay listening, most likely because the NSS path inside the namespace differs (nsncd's socket is still reachable and sees a remapped uid), so it measured nothing trustworthy. The operator's loop below is what settles it.
+
+**The change's effect at the forwarder's port.** Leg A is `anon-01`'s deployed 0.9.0 shim on `127.0.0.1:19053`, leg B each commit's own binary in the same circuit class (`-socks-user anon-01`, same tor, same upstream), samples interleaved with the leg order alternating, a fresh name per sample, ten samples each, medians:
+
+```
+reuse only (73a9639)   one lookup, A+AAAA                0.361s -> 0.153s
+with cache (a9e6300)   one lookup, A+AAAA                0.338s -> 0.237s
+with cache (a9e6300)   five lookups of one name           1.722s -> 0.214s
+```
+
+And on a deliberately slow endpoint (a SOCKS endpoint adding 250ms one-way), where the round trips a lookup spends are visible as wall time:
+
+```
+reuse only (73a9639)   one lookup, A+AAAA                1.036s -> 0.529s
+reuse only (73a9639)   burst of five distinct names       5.157s -> 2.723s
+```
+
+**A fix bought less than expected, and it is worth naming which.** Connection reuse ALONE on a fast warm circuit is worth tens to low hundreds of milliseconds, because a stream open through an established circuit is cheap. Its structural value is on a slow or cold circuit, where it halves the traversals a lookup needs. The order-of-magnitude change on the shape a real workload has (five lookups of one name: 1.722s to 0.214s) is the CACHE. Anyone repeating this on a fast circuit and finding reuse close to noise has not found a bug.
+
+**Measurement traps, since this note already contains one.** (1) `anonctl exec` runs the whole verify suite first, which is what produced this note's original 5.067s figures; time inside `use`, or query the shim's port directly and say that you did. (2) An A/B where leg A always goes first is not an A/B: both legs share one circuit class, so the second leg is systematically warmer. Alternate the order. (3) A driver that parses timings out of text turns a TIMEOUT into a non-number, and a median that sorts non-numbers silently reports zero; count failures as failures. (4) A benchmark shim that fails to bind because a previous one still holds the port leaves the OLD process answering, and the run silently becomes a same-binary control; check each shim's log line before trusting a leg.
+
+## Live verification, which is the operator's (needs root)
+
+Each step: the command, what good looks like, what bad looks like. Run them against the NEW shim, which means installing the new `anonctl-shim` and restarting the account's unit (`systemctl restart anonctl-shim@anon-01`): a running shim keeps its old binary until restarted, and a stale shim reproduces every old behaviour. Take the BEFORE loop first, while 0.9.0 is still running.
+
+1. **The benchmark, on the account's real path, before and after.**
+
+   ```
+   anonctl use anon-01
+   TIMEFORMAT=%3R; for i in $(seq 10); do time getent ahostsv4 example.com >/dev/null; done
+   ```
+
+   Good: the AFTER median is materially below the BEFORE one, and on the repeat samples (every one after the first, since the name is now cached) well under a second. Bad: the AFTER median is still ~2s. That would mean the cost is NOT in the forwarder (whose port answers in ~0.2 to 0.3s), and the next step is to split the path: time `getent` for the same name as `getent ahostsv4 <fresh-random-name>.example.com` (no cache hit possible), and compare with a direct query to 127.0.0.1:19053 from the same shell. Record both distributions here.
+
+2. **`anonctl verify anon-01` on a healthy account.**
+
+   Good: all assertions pass, and `dns-forced-path-answers` says the query went through the redirect and was ANSWERED, with nothing more. Bad: a red that was green on 0.9.0; or a pass whose detail says `It passed on attempt 2, NOT the first`, on a path that is fast and healthy. That line means the first attempt failed and the retry is what made it pass; the detail then carries what the first attempt saw. Run verify three times: that line may appear rarely (one cold circuit), but if it appears every time, the first query is failing for a reason worth finding, and the retry must not be allowed to hide it.
+
+3. **A deliberately dead endpoint.**
+
+   ```
+   systemctl stop tor          # or whatever serves the account's endpoint
+   anonctl verify anon-01
+   journalctl -u anonctl-shim@anon-01 -n 5
+   systemctl start tor
+   ```
+
+   Good: `dns-forced-path-answers` FAILS, says the account failed CLOSED, and says the anonymizer is DOWN or not listening (not "slow", and nothing about un-NAT or nft). The shim's journal carries `dns: endpoint unreachable: ... (SERVFAIL, fail-closed)`. Inside `anonctl use anon-01`, `getent ahostsv4 example.com` returns promptly with no address instead of hanging. Bad: the assertion passes (a SERVFAIL counted as working DNS), the text blames the ruleset, or the journal is silent (the shim was not restarted onto the new binary). And the one that must never happen: any address at all coming back for a name the account had not already resolved, which would be a fallback to a resolver other than the endpoint.
+
+**Noticed while measuring, and recorded separately.** `work/notes/observations/the-shims-dns-port-answers-any-local-uid.md`: the shim's DNS port answered queries from an ORDINARY unprivileged uid on this host, which is how every number above was measured without root. That is pre-existing, it is not what this work changed, and the new cache turns it into a recency oracle over the account's names. Also: the forwarder's TCP listener still serves the queries on ONE client connection one at a time, so a `use-vc` client's A and AAAA are serialised on it (RFC 7766 says a server SHOULD process pipelined queries concurrently). It does not affect this host, whose glibc queries over UDP, and it was left out of this change.
+
 ## Not asked for, but adjacent
 
 `exec` running the full verify suite per invocation is correct and it does make `exec` unsuitable for timing anything, and awkward for scripting a loop. Not a complaint, just the reason the first numbers in this note were wrong.
