@@ -325,10 +325,19 @@ func TestLiveDNSAnswerDestroyedAfterTheShimReplied(t *testing.T) {
 	if a.Ok {
 		t.Fatalf("dns-forced-path-answers must FAIL when the answer never arrives; got %+v", a)
 	}
-	// The detail must name the mechanism, not just the symptom: this is the report
-	// line that sent a real operator to the right place.
-	if !strings.Contains(a.Detail, "un-NAT") || !strings.Contains(a.Detail, "ANSWERED") {
-		t.Errorf("the failure must say the shim ANSWERED and the reply was un-NATed; got %q", a.Detail)
+	// The detail must report the OBSERVATION and offer the un-NAT mechanism as a
+	// candidate. It must NOT assert that mechanism as established fact: the counters
+	// cannot distinguish "this query's answer was destroyed" from "the shim never
+	// answered this query and the packet seen was another query's reply", and a message
+	// that picks one sent a real operator to `nft` for a failure inside the forwarder.
+	if !strings.Contains(a.Detail, "NO answer came back") {
+		t.Errorf("the failure must state what was measured (no answer reached the account); got %q", a.Detail)
+	}
+	if !strings.Contains(a.Detail, "un-NATs") {
+		t.Errorf("the un-NAT mechanism must still be offered as a candidate, since it is the measured real-host defect; got %q", a.Detail)
+	}
+	if !strings.Contains(a.Detail, "proves only that A packet left") {
+		t.Errorf("the failure must be explicit that the shim-reply counter proves only that A packet left during the window, not that this query was answered; got %q", a.Detail)
 	}
 }
 

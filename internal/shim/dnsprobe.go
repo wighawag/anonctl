@@ -156,6 +156,7 @@ func DNSProbe(server, name string) (answered bool, detail string) {
 	if err != nil {
 		return false, err.Error()
 	}
+	query = withEDNS0(query)
 	c, err := (&net.Dialer{Timeout: dnsProbeDeadline}).Dial("udp", server)
 	if err != nil {
 		return false, err.Error()
@@ -177,7 +178,49 @@ func DNSProbe(server, name string) (answered bool, detail string) {
 	if perr != nil {
 		return false, perr.Error()
 	}
-	return true, fmt.Sprintf("rcode=%d answers=%d", rcode, answers)
+	out := fmt.Sprintf("rcode=%d answers=%d", rcode, answers)
+	if code, text, ok := ExtendedDNSError(buf[:n]); ok {
+		out += fmt.Sprintf(" ede=%d:%s", code, edeTextToken(text))
+	}
+	return true, out
+}
+
+// withEDNS0 appends a bare EDNS0 OPT RR (no options, a 1232-byte UDP payload size) and
+// sets ARCOUNT. It exists for ONE reason: the shim only attaches the Extended DNS
+// Error that says WHY a resolution failed to a query that used EDNS (RFC 6891), and
+// that reason is the difference between "the endpoint is down" and "the circuit was
+// slow" in the verdict.
+//
+// It does not make the probe query stand out to the upstream resolver it is carried
+// to. An empty OPT is what most current stub resolvers send, glibc included when
+// resolv.conf says `options edns0` (as the reporting host's does), and it carries no
+// option, cookie or client subnet.
+func withEDNS0(query []byte) []byte {
+	out := make([]byte, len(query), len(query)+11)
+	copy(out, query)
+	binary.BigEndian.PutUint16(out[10:12], binary.BigEndian.Uint16(out[10:12])+1)
+	out = append(out, 0)                           // owner: root
+	out = binary.BigEndian.AppendUint16(out, 41)   // TYPE OPT
+	out = binary.BigEndian.AppendUint16(out, 1232) // UDP payload size
+	out = binary.BigEndian.AppendUint32(out, 0)    // extended rcode, version, flags
+	return binary.BigEndian.AppendUint16(out, 0)   // RDLENGTH: no options
+}
+
+// edeTextToken makes EDE extra text safe to embed in the probe's one-line output: the
+// text comes from whatever answered (an upstream resolver's own EDE is passed through
+// the shim untouched), so it is cut to one whitespace-free token of bounded length.
+func edeTextToken(text string) string {
+	out := make([]rune, 0, len(text))
+	for _, r := range text {
+		if r <= ' ' || r == 0x7f {
+			r = '_'
+		}
+		out = append(out, r)
+		if len(out) == 80 {
+			break
+		}
+	}
+	return string(out)
 }
 
 // DNSProbeResult renders a DNSProbe outcome as the single-line token the caller

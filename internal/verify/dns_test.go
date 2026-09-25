@@ -174,6 +174,87 @@ func TestDNSForcedPathAnswers_FailsOnAServfailFromTheShim(t *testing.T) {
 	}
 }
 
+// The REASON decides the operator's next move, so each one must read as itself and
+// never as the other: "your Tor is down" and "your circuit was slow" are opposite
+// instructions, and confusing them is the same class of error as the old un-NAT text.
+func TestDNSForcedPathAnswers_NamesTheServfailReason(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		detail  string
+		want    []string
+		notWant []string
+	}{
+		{"endpoint unreachable", "rcode=2 answers=0 ede=23:anonctl:endpoint-unreachable",
+			[]string{"DOWN", "not listening"}, []string{"SLOW", "cold circuit"}},
+		{"deadline expired", "rcode=2 answers=0 ede=22:anonctl:deadline-expired",
+			[]string{"SLOW", "cold circuit"}, []string{"DOWN"}},
+		{"endpoint refused", "rcode=2 answers=0 ede=23:anonctl:endpoint-refused",
+			[]string{"accepted", "could not reach the upstream resolver"}, []string{"DOWN"}},
+		{"no reason attached", "rcode=2 answers=0",
+			[]string{"upstream resolver itself"}, []string{"DOWN", "SLOW"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := healthyDNS()
+			ev.ForcedDetail, ev.ForcedRcode = tc.detail, 2
+			a := DNSForcedPathAnswersAssertion(ev)
+			if a.Ok {
+				t.Fatalf("must FAIL; got %+v", a)
+			}
+			if !strings.Contains(a.Detail, "failed CLOSED") {
+				t.Errorf("the detail must say the account failed closed (it is not a leak); got %q", a.Detail)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(a.Detail, w) {
+					t.Errorf("detail lacks %q: %q", w, a.Detail)
+				}
+			}
+			for _, w := range tc.notWant {
+				if strings.Contains(a.Detail, w) {
+					t.Errorf("detail must not say %q for this reason: %q", w, a.Detail)
+				}
+			}
+		})
+	}
+}
+
+// A slow circuit on every attempt is more than a cold circuit, and the text must say
+// so rather than telling the operator to re-run what already ran twice. And an
+// earlier attempt's DIFFERENT failure must not vanish behind the last one's.
+func TestDNSForcedPathAnswers_ReportsEveryAttempt(t *testing.T) {
+	ev := healthyDNS()
+	ev.ForcedDetail, ev.ForcedRcode = "rcode=2 answers=0 ede=22:anonctl:deadline-expired", 2
+	ev.ForcedAttempts = 2
+	ev.ForcedEarlier = []string{"attempt 1: rcode=2 answers=0 ede=23:anonctl:endpoint-unreachable"}
+	a := DNSForcedPathAnswersAssertion(ev)
+	for _, want := range []string{"2 separate attempts", "every attempt", "attempt 1:", "endpoint-unreachable"} {
+		if !strings.Contains(a.Detail, want) {
+			t.Errorf("detail lacks %q: %q", want, a.Detail)
+		}
+	}
+}
+
+// A PASS THAT NEEDED THE RETRY MUST SAY SO. The retry may separate one lost answer
+// from a broken path; it may not be the invisible reason a path passes. A pass on the
+// first attempt stays quiet about attempts, so the phrase is a signal, not noise.
+func TestDNSForcedPathAnswers_APassOnTheRetryIsReported(t *testing.T) {
+	ev := healthyDNS()
+	ev.ForcedAttempts = 2
+	ev.ForcedEarlier = []string{"attempt 1: rcode=2 answers=0 ede=22:anonctl:deadline-expired"}
+	a := DNSForcedPathAnswersAssertion(ev)
+	if !a.Ok {
+		t.Fatalf("an answered second attempt is a pass; got %+v", a)
+	}
+	for _, want := range []string{"attempt 2, NOT the first", "deadline-expired"} {
+		if !strings.Contains(a.Detail, want) {
+			t.Errorf("a pass on the retry must report it; detail lacks %q: %q", want, a.Detail)
+		}
+	}
+	ev.ForcedAttempts, ev.ForcedEarlier = 1, nil
+	if a := DNSForcedPathAnswersAssertion(ev); strings.Contains(a.Detail, "attempt") {
+		t.Errorf("a first-attempt pass must not mention attempts; got %q", a.Detail)
+	}
+}
+
 func TestProbeRcode_ReadsTheRcodeOrAdmitsItCannot(t *testing.T) {
 	for _, tc := range []struct {
 		detail string
@@ -216,9 +297,9 @@ func TestDNSForcedPathAnswers_DistinguishesTheThreePacketFates(t *testing.T) {
 			wantDetail: "redirect is not in effect",
 		},
 		{
-			name:       "the shim never answered",
+			name:       "the shim emitted nothing",
 			ev:         DNSEvidence{Nameserver: "1.1.1.1", ForcedReachedShim: true, ShimReplied: false},
-			wantDetail: "never answered",
+			wantDetail: "emitted NOTHING during the window",
 		},
 		{
 			// A host with no `nameserver` line is not a host without DNS: glibc falls back to

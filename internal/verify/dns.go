@@ -113,8 +113,22 @@ type DNSEvidence struct {
 	// same class of error as the inferred verdict this file was built to remove.
 	ForcedRcode int
 	// ForcedReachedShim / ShimReplied: the same query's packet-level fate.
+	//
+	// ShimReplied deserves its exact reading, because a failure message was once written
+	// on a stronger one: it is a counter proving only that A packet left the shim's DNS
+	// port during the window, which glibc's own retries can satisfy. That is not "this
+	// query was answered": a reply to an earlier query still in flight (a glibc retry, or
+	// the NSS probe that runs just before this one) lands in the same window and moves the
+	// same counter. The failure detail is written to that weaker, true reading.
 	ForcedReachedShim bool
 	ShimReplied       bool
+	// ForcedAttempts is how many times the round trip was measured before the verdict
+	// (see forcedRoundTripAttempts). It is reported in the detail, because "this failed
+	// twice" and "this failed once" justify different next steps.
+	ForcedAttempts int
+	// ForcedEarlier holds the probe detail of each attempt BEFORE the last, so a
+	// verdict drawn from the last attempt still reports what the earlier ones saw.
+	ForcedEarlier []string
 	// NameserverDefaulted records that the host declares no nameserver, so Nameserver
 	// is glibc's 127.0.0.1 fallback rather than a configured value. It is reported,
 	// not failed: that host's account DNS works, and loopback is the shape the
@@ -384,6 +398,15 @@ func DNSNSSNotBypassedAssertion(ev DNSEvidence) Assertion {
 // delivery and a host-owned input filter dropped it on that source address. The
 // failure detail therefore distinguishes the three packet-level fates, because
 // each has a different owner and a different fix.
+//
+// EACH DETAIL SAYS WHAT WAS MEASURED, AND ONLY THAT. The last fate's message used to
+// assert the un-NAT-and-drop mechanism as established fact, which sent a real
+// operator to `nft` and `conntrack` for a transient that was very likely inside
+// anonctl's own forwarder (its upstream exchange deadline fired, silently, and the
+// probe then waited out its whole window for an answer nobody would send:
+// work/notes/observations/dns-forced-path-answers-is-single-shot-on-a-path-with-tenfold-variance.md).
+// The counters cannot tell those apart, so the message now states the observation and
+// ranks the candidates instead of picking one.
 func DNSForcedPathAnswersAssertion(ev DNSEvidence) Assertion {
 	a := Assertion{Name: AssertDNSForcedPathAnswers}
 	server := ev.Nameserver
@@ -399,11 +422,19 @@ func DNSForcedPathAnswersAssertion(ev DNSEvidence) Assertion {
 		// into a green light for an account whose anonymizer is down. A SERVFAIL does prove
 		// the packet path works in both directions, which is worth saying; it also proves
 		// the lookup did not succeed.
-		a.Detail = fmt.Sprintf("a query from the account to %s went through the redirect into the shim, and the shim answered SERVFAIL (%s). The redirect and the shim are working and the account's DNS failed CLOSED, not open: the shim could not resolve over the endpoint. Check that the endpoint is up and reachable, then re-run verify", server, ev.ForcedDetail)
+		a.Detail = servfailDetail(server, ev)
 		return a
 	case ev.ForcedAnswered && ev.ForcedReachedShim:
 		a.Ok = true
 		a.Detail = fmt.Sprintf("a query from the account to %s went through the redirect into the shim and was ANSWERED (%s): the account has working, anonymized DNS", server, ev.ForcedDetail)
+		if ev.ForcedAttempts > 1 {
+			// A PASS THAT NEEDED THE RETRY SAYS SO. The retry exists to separate one lost
+			// answer or one cold circuit from a broken path; it must never be the silent
+			// reason a path passes. A healthy path passes on attempt 1, so an operator who
+			// sees this line on every run has a path failing its first query every time, and
+			// that is a finding, not a pass to be glad of.
+			a.Detail += fmt.Sprintf(". It passed on attempt %d, NOT the first: one answer was lost or one circuit was cold. If this appears on every run, the first query is failing for a reason worth finding%s", ev.ForcedAttempts, earlierPhrase(ev.ForcedEarlier))
+		}
 		return a
 	case ev.ForcedAnswered:
 		// AN ANSWER IS NOT A PASS ON ITS OWN. Requiring only ForcedAnswered was the last
@@ -422,15 +453,82 @@ func DNSForcedPathAnswersAssertion(ev DNSEvidence) Assertion {
 			a.Detail += ". " + hint
 		}
 	case !ev.ShimReplied:
-		a.Detail = fmt.Sprintf("a query from the account to %s reached the shim, which never answered: the shim is down, or the endpoint is unreachable and the query was dropped fail-closed (%s)", server, ev.ForcedDetail)
+		a.Detail = fmt.Sprintf("a query from the account to %s reached the shim, which emitted NOTHING during the window%s (%s). A current shim answers every query it receives within its own deadline, with an answer or with a SERVFAIL naming the reason, so in order of likelihood: (1) the shim process is not serving (down, restarting or wedged: `systemctl status anonctl-shim@<account>`); (2) the RUNNING shim predates this anonctl (not restarted after an upgrade) and dropped a query it could not resolve in silence, which cannot say whether the endpoint was unreachable or the circuit slow: `systemctl restart anonctl-shim@<account>`, re-run verify, and a current shim will name the reason%s",
+			server, attemptsPhrase(ev.ForcedAttempts), ev.ForcedDetail, earlierPhrase(ev.ForcedEarlier))
 	default:
-		a.Detail = fmt.Sprintf("the shim ANSWERED a query from the account to %s and the answer never arrived: conntrack un-NATs the reply back to source %s before delivering it, and something on the host's input path dropped it there (%s)",
-			ev.Nameserver, ev.Nameserver, ev.ForcedDetail)
+		// THE UN-NAT BRANCH, WORDED TO WHAT THE COUNTER PROVES. It used to assert the
+		// un-NAT-and-drop mechanism as fact. But it fires on a counter proving only that A
+		// packet left the shim's DNS port during the window, which glibc's own retries can
+		// satisfy (and so can a late reply to the NSS probe that runs just before this one).
+		// On the reporting host that sentence sent an operator to nft and conntrack for an
+		// event inside anonctl's own forwarder. So it reports the observation and ranks.
+		a.Detail = fmt.Sprintf("a query from the account to %s reached the shim and NO answer came back to the account within the window%s (%s). A packet did leave the shim's DNS port during the window, but that proves only that A packet left, not that this query was answered: glibc's own retries, and the lookup verify ran just before this one, can move the same counter. Which candidate is likelier depends on the RUNNING shim's version, and that is cheap to settle first: `systemctl restart anonctl-shim@<account>` and re-run verify. (1) If the shim is current, it answers every query within its deadline with an answer or a reasoned SERVFAIL, so a silent client means the reply was DESTROYED on the way back: conntrack un-NATs it to source %s before delivering it, and something on the host's input path drops it there. (2) If the shim predates this anonctl, it dropped a query it could not resolve in silence, because the endpoint was unreachable or because the circuit was slow, and it cannot say which. (3) Otherwise, something else on the account emitted DNS during the window%s",
+			server, attemptsPhrase(ev.ForcedAttempts), ev.ForcedDetail, ev.Nameserver, earlierPhrase(ev.ForcedEarlier))
 		if hint := replyDropHint(ev.Nameserver); hint != "" {
-			a.Detail += ". " + hint
+			a.Detail += ". For candidate (1) on this host: " + hint
 		}
 	}
 	return a
+}
+
+// The failure tokens the shim attaches to a SERVFAIL as an RFC 8914 Extended DNS
+// Error, and the probe reports verbatim in its detail. They are the contract between
+// the two binaries (internal/shim/dnsfailure.go writes them), so they are matched
+// exactly and never paraphrased.
+const (
+	shimFailEndpointUnreachable = "anonctl:endpoint-unreachable"
+	shimFailEndpointRefused     = "anonctl:endpoint-refused"
+	shimFailDeadline            = "anonctl:deadline-expired"
+	shimFailStreamBroken        = "anonctl:stream-broken"
+)
+
+// servfailDetail words a SERVFAIL from the shim by its REASON, because the reasons
+// call for opposite next moves: an unreachable endpoint means the anonymizer is down
+// ("your Tor is down"), a deadline means it is up and the circuit was slow ("your
+// circuit was slow"). Getting that wrong costs the operator the same hour the old
+// un-NAT sentence did.
+func servfailDetail(server string, ev DNSEvidence) string {
+	head := fmt.Sprintf("a query from the account to %s went through the redirect into the shim, and the shim answered SERVFAIL%s (%s). The redirect and the shim are working and the account's DNS failed CLOSED, not open: ", server, attemptsPhrase(ev.ForcedAttempts), ev.ForcedDetail)
+	var why string
+	switch {
+	case strings.Contains(ev.ForcedDetail, shimFailEndpointUnreachable):
+		why = "the shim could not open a connection to the ENDPOINT at all, so the anonymizer (e.g. Tor) is DOWN or is not listening at the address this account's shim is configured with. Start it or correct the address, then re-run verify"
+	case strings.Contains(ev.ForcedDetail, shimFailDeadline):
+		why = "the endpoint accepted the shim's connection and the lookup RAN OUT OF TIME, so the anonymizer is up and its circuit was SLOW, which a cold circuit after idle routinely is"
+		if ev.ForcedAttempts >= 2 {
+			why += ". It happened on every attempt, which is more than one cold circuit: look at the endpoint's own health (for Tor, its log: bootstrap state, circuit build failures, clock skew)"
+		} else {
+			why += ". Re-run verify"
+		}
+	case strings.Contains(ev.ForcedDetail, shimFailEndpointRefused):
+		why = "the endpoint is up and accepted the shim's connection, but could not reach the upstream resolver through it (for Tor: a circuit or an exit failed to connect). Re-run verify; if it persists, the configured upstream resolver may be unreachable from the anonymizer's exits"
+	case strings.Contains(ev.ForcedDetail, shimFailStreamBroken):
+		why = "the shim's stream to the upstream resolver died mid-exchange and a fresh one did not recover the query. Re-run verify"
+	default:
+		why = "no anonctl reason was attached, so the SERVFAIL came from the upstream resolver itself, which the shim passes through unchanged (or from a shim too old to name a reason). Re-run verify; if it persists, the upstream resolver is failing"
+	}
+	return head + why + earlierPhrase(ev.ForcedEarlier)
+}
+
+// earlierPhrase reports what the earlier attempts saw, when there were any, so a
+// verdict built on the last attempt does not hide a DIFFERENT failure on the first
+// (a slow circuit, then a dead endpoint, is two problems).
+func earlierPhrase(earlier []string) string {
+	if len(earlier) == 0 {
+		return ""
+	}
+	return ". Earlier attempt(s): " + strings.Join(earlier, "; ")
+}
+
+// attemptsPhrase reports how many times the round trip was measured, because the
+// number is what tells an operator whether to re-run verify or start reading the
+// ruleset. It is silent about a single attempt so evidence built by hand (and every
+// unit test) does not claim a measurement it did not make.
+func attemptsPhrase(attempts int) string {
+	if attempts < 2 {
+		return ""
+	}
+	return fmt.Sprintf(", on %d separate attempts (so this is not one lost answer or one cold circuit)", attempts)
 }
 
 // nameserverFamilyHint names the v6 case, where the forced DNS path cannot work

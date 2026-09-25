@@ -142,21 +142,60 @@ func dnsEvidence(ctx context.Context, p LiveParams) (DNSEvidence, error) {
 	ev.AccountEmittedQuery = counterKeyMoved(counters, dnsCounterAnonUDP53, dnsCounterAnonTCP53)
 	ev.NSSReachedShim = counterKeyMoved(counters, dnsCounterTowardShimUDP, dnsCounterTowardShimTCP)
 
-	// Probe 2: the round trip on the account's own socket.
-	roundTrip := uniqueDNSProbeName()
-	counters, err = measureWithDNSCounters(ctx, p, func(pctx context.Context) error {
-		answered, detail, rerr := forcedDNSRoundTripAsAnon(pctx, p, ev.Nameserver, roundTrip)
-		ev.ForcedAnswered, ev.ForcedDetail = answered, detail
-		ev.ForcedRcode = probeRcode(detail)
-		return rerr
-	})
-	if err != nil {
-		return ev, err
+	// Probe 2: the round trip on the account's own socket, ATTEMPTED TWICE before a
+	// verdict.
+	//
+	// WHY A SECOND ATTEMPT IS A MEASUREMENT AND NOT A LENIENCY. This assertion gates
+	// `use` and `exec`, so its false-negative rate is the rate at which an operator is
+	// locked out of a healthy account, and it is single-shot on a path whose honest
+	// variance was measured at tenfold (0.26s to 3.6s, median ~2.2s). One sample cannot
+	// separate "one answer was lost, or one circuit was cold" from "this path is
+	// broken", which is precisely the distinction the check exists to draw. Two failures
+	// draw it; one does not.
+	//
+	// It cannot make a broken path pass: a path that does not answer does not answer
+	// twice, and each attempt is a FULL re-measurement (its own counters, its own
+	// control window), so the evidence a verdict rests on always belongs to the attempt
+	// that produced it. On a healthy path it costs nothing at all, because the first
+	// attempt answers and the loop stops. What it costs on a broken one is one more
+	// window, which is the right way round.
+	var prevDetail string
+	for attempt := 1; attempt <= forcedRoundTripAttempts; attempt++ {
+		// A FRESH unique name per attempt, for the same reason the probe name is unique at
+		// all, and now for a second reason as well: the shim's own forwarder caches answers
+		// (including negative ones), so re-asking the SAME name could be answered from that
+		// cache in microseconds and would measure anonctl's cache rather than the path.
+		roundTrip := uniqueDNSProbeName()
+		counters, err = measureWithDNSCounters(ctx, p, func(pctx context.Context) error {
+			answered, detail, rerr := forcedDNSRoundTripAsAnon(pctx, p, ev.Nameserver, roundTrip)
+			ev.ForcedAnswered, ev.ForcedDetail = answered, detail
+			ev.ForcedRcode = probeRcode(detail)
+			return rerr
+		})
+		if err != nil {
+			// A probe that could not RUN is a loud error, on the first attempt as on the last:
+			// retrying a missing setpriv or an unplantable counter would only hide it.
+			return ev, err
+		}
+		if attempt > 1 {
+			ev.ForcedEarlier = append(ev.ForcedEarlier, fmt.Sprintf("attempt %d: %s", attempt-1, prevDetail))
+		}
+		prevDetail = ev.ForcedDetail
+		ev.ForcedAttempts = attempt
+		ev.ForcedReachedShim = counterKeyMoved(counters, dnsCounterTowardShimUDP, dnsCounterTowardShimTCP)
+		ev.ShimReplied = counterKeyMoved(counters, dnsCounterShimReply)
+		if ev.ForcedAnswered && ev.ForcedRcode != dnsRcodeServfail {
+			break
+		}
 	}
-	ev.ForcedReachedShim = counterKeyMoved(counters, dnsCounterTowardShimUDP, dnsCounterTowardShimTCP)
-	ev.ShimReplied = counterKeyMoved(counters, dnsCounterShimReply)
 	return ev, nil
 }
+
+// forcedRoundTripAttempts is how many times the forced round trip is measured before
+// a verdict. Two, not more: the point is to separate a lost answer or a cold circuit
+// from a broken path, and a third attempt buys no new distinction while adding
+// another window to every genuine failure.
+const forcedRoundTripAttempts = 2
 
 // HostResolvesHostsInProcess measures whether THIS HOST's glibc performs `hosts`
 // lookups in the CALLING PROCESS, rather than handing them to a daemon under

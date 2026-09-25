@@ -1,6 +1,7 @@
 package shim
 
 import (
+	"context"
 	"encoding/binary"
 	"net"
 	"strings"
@@ -144,5 +145,41 @@ func TestDNSProbe_SilentServerReadsAsNoAnswer(t *testing.T) {
 func TestDNSProbe_UsageErrorIsNotAnAnswer(t *testing.T) {
 	if answered, detail := DNSProbe("", ""); answered || !strings.Contains(detail, "usage") {
 		t.Errorf("missing args must report usage and NOT an answer; got %v %q", answered, detail)
+	}
+}
+
+// THE REASON CONTRACT, end to end: a probe that reaches a forwarder whose endpoint is
+// down gets an ANSWER (the path works) whose rcode is SERVFAIL and whose detail names
+// the reason in the token `anonctl verify` reads. Proven against the real forwarder,
+// not a hand-built reply, because the probe and the shim are two halves of one
+// contract and a unit test of either half alone cannot catch them drifting apart.
+func TestDNSProbe_ReportsTheShimsFailureReason(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fwd, err := StartForwarder(ctx, ForwarderConfig{
+		Listen:    "127.0.0.1:0",
+		ProxyAddr: "127.0.0.1:1", // nothing listening: the endpoint is DOWN
+		Upstream:  upstreamName + ":53",
+	})
+	if err != nil {
+		t.Fatalf("start forwarder: %v", err)
+	}
+	defer fwd.Close()
+
+	answered, detail := DNSProbe(fwd.Addr(), "probe.invalid.")
+	if !answered {
+		t.Fatalf("the forwarder answered SERVFAIL, which the probe must report as ANSWERED (the path works); got %q", detail)
+	}
+	for _, want := range []string{"rcode=2", "anonctl:endpoint-unreachable"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("probe detail %q lacks %q", detail, want)
+		}
+	}
+}
+
+func TestEDETextToken_IsOneBoundedToken(t *testing.T) {
+	got := edeTextToken("upstream said: no \n thanks" + strings.Repeat("x", 200))
+	if strings.ContainsAny(got, " \n\t") || len([]rune(got)) > 80 {
+		t.Errorf("edeTextToken produced %q: it must be one whitespace-free token of at most 80 runes", got)
 	}
 }
