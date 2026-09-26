@@ -31,6 +31,12 @@
 //     (b) ONLY the shim UID may reach the upstream endpoint; the anon UID's dial of
 //     the endpoint is dropped so it can never skip the shim or its `<account>@`
 //     isolation username.
+//   - closure (c), the converse of (a): ONLY the anon UID may open a flow to its
+//     own shim ports. Every other uid, root included, is refused a NEW flow to
+//     them, so no other local user can resolve names over this account's circuit,
+//     borrow its relay, or time its DNS cache (ADR-0014). It is the one place the
+//     filter base chain jumps on a DESTINATION rather than a uid; see below for
+//     why that does not reopen the unattributable-packet hole.
 //
 // WHY THE BASE CHAINS ONLY EVER MATCH A UID POSITIVELY (the box-wide invariant).
 // Both output base chains are evaluated for EVERY packet the host sends, so the
@@ -78,6 +84,23 @@
 // destination, and escape both tables. Measured end to end with the forcing and
 // baseline tables loaded together: zero packets left with an off-box destination
 // over a 20-second v4 and v6 dial.
+//
+// WHY CLOSURE (c) MAY JUMP ON A DESTINATION. Everything above says a base chain
+// must never adjudicate a packet it cannot attribute, and closure (c) exists to
+// refuse packets from uids anonctl does NOT govern, so it cannot be a positive
+// jump on one uid. It is instead a positive jump on the account's OWN shim ports
+// (addresses anonctl allocated and nothing else may bind), placed AFTER the two
+// uid jumps, so the anon and shim UIDs have already been accepted by their own
+// chains and never reach it. Inside, the single drop is qualified twice: `ct
+// state new` (a follow-on packet of an established flow, which is exactly the
+// unattributable class, is never judged) AND `meta skuid >= 0`, which matches
+// ANY attributable uid and nothing else, because the kernel breaks out of a rule
+// whose `meta skuid` load finds no socket owner. So it still drops only what it
+// has positively attributed, and it never says `skuid !=`. Measured in a
+// namespace with three uids: the anon UID's 200 MB bulk transfer through a guarded
+// port completed intact (its unattributable packets reached the guard and were
+// NOT dropped), while another uid and root were refused on all three ports, where
+// without the chain all three answered them.
 //
 // The table is named per-account (`anonctl_<account>`) so two accounts never
 // clobber each other's ruleset and Delete removes exactly one account's table,
@@ -186,6 +209,10 @@ const (
 	// shimFilterChain holds the shim UID's endpoint + world accepts (jumped to from
 	// filter_out).
 	shimFilterChain = "shim_filter"
+	// shimPortsChain is closure (c): it refuses a NEW flow to the account's own shim
+	// ports from any attributable uid that reached it (jumped to from filter_out by
+	// DESTINATION, after the anon and shim jumps, so neither of those UIDs gets here).
+	shimPortsChain = "shim_ports"
 )
 
 // Generate produces the fail-closed `inet` nftables ruleset text for one account,
@@ -216,12 +243,13 @@ func Generate(p Params) (string, error) {
 
 	w("# anonctl per-UID forced anonymized egress for account %q - inet table (IPv4 + IPv6), fail-closed.", p.Account)
 	w("# Generated from the validated recipe (work/notes/findings/manual-per-uid-tor-recipe.md).")
-	w("# Governs ONLY uid %d (anon) and uid %d (shim); every other uid is untouched.", p.AnonUID, p.ShimUID)
+	w("# Governs uid %d (anon) and uid %d (shim). Every other uid is untouched except in", p.AnonUID, p.ShimUID)
+	w("# ONE respect: it may not open a new flow to THIS account's own shim ports (closure c).")
 	w("# That claim is enforced STRUCTURALLY: both base chains are policy ACCEPT and hold")
-	w("# nothing but POSITIVE `meta skuid` jumps, so a packet belonging to another uid --")
-	w("# or to no attributable socket at all, which much of ordinary TCP output is --")
-	w("# takes no jump and is never adjudicated here. Every drop lives inside a chain")
-	w("# entered only by a positive UID match.")
+	w("# nothing but POSITIVE jumps (on a governed uid, or on this account's shim ports), so a")
+	w("# packet belonging to another uid elsewhere -- or to no attributable socket at all,")
+	w("# which much of ordinary TCP output is -- is never adjudicated here. Every drop lives")
+	w("# inside a chain entered only by a positive match, and drops only what it attributed.")
 	// Create-if-absent then delete makes the -f load atomic and idempotent: a
 	// re-Apply cleanly REPLACES this account's table and never touches another.
 	w("table inet %s {}", table)
@@ -284,6 +312,23 @@ func Generate(p Params) (string, error) {
 	w("        type filter hook output priority filter; policy accept;")
 	w("        meta skuid %d jump %s", p.ShimUID, shimFilterChain)
 	w("        %s", GoverningRule(p.AnonUID))
+	// Closure (c)'s destination jumps. They MUST come after the two uid jumps: the
+	// anon UID's own flows to these ports are accepted inside anon_filter, and the
+	// guard below relies on never seeing a governed UID's attributable packet.
+	w("        ip daddr 127.0.0.1 tcp dport { %d, %d } jump %s", p.RelayPort, p.DNSPort, shimPortsChain)
+	w("        ip daddr 127.0.0.1 udp dport %d jump %s", p.DNSPort, shimPortsChain)
+	w("    }")
+	w("")
+	// Closure (c). Reached only by a packet to this account's shim ports that the
+	// anon and shim chains did not already accept. `ct state new` confines the verdict
+	// to the first packet of a flow (a TCP SYN, a UDP datagram with no conntrack
+	// entry), which always carries its socket uid; `meta skuid >= 0` then matches any
+	// attributable uid and cannot match a packet with no socket owner. Falling off the
+	// end returns to filter_out and its policy accept, which is where the anon UID's
+	// unattributable follow-on packets go. A refused UDP send fails with EPERM at once;
+	// a refused TCP connect retransmits its SYN into the same drop and times out.
+	w("    chain %s {", shimPortsChain)
+	w("        ct state new meta skuid >= 0 drop")
 	w("    }")
 	w("")
 	// SHIM UID: the ONLY UID allowed to reach the endpoint, then the world. Entered

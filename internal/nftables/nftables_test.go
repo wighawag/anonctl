@@ -176,24 +176,76 @@ func TestGenerateFilterGovernsOnlyItsOwnUIDs(t *testing.T) {
 			"socket uid and so match neither form. Match the governed UIDs POSITIVELY instead:\n%s", out)
 	}
 
-	// The filter BASE chain must hold nothing but the two jumps: any verdict on a
-	// rule there would apply to traffic that has not been attributed to a governed
-	// UID. (The `type ... policy accept;` declaration is the chain header, not a
-	// rule, and is asserted separately above.)
+	// The filter BASE chain must hold nothing but jumps: any verdict on a rule there
+	// would apply to traffic that has not been attributed to a governed UID. (The
+	// `type ... policy accept;` declaration is the chain header, not a rule, and is
+	// asserted separately above.) Every jump is gated on a POSITIVE uid match, with
+	// ONE exception: closure (c)'s jumps are gated on this account's own shim ports
+	// and may only lead into shim_ports, whose own test pins what it may drop.
 	base := chainBody(t, out, "filter_out")
-	for _, rule := range nonEmptyRules(base) {
+	lastUIDJump, firstPortJump := -1, -1
+	for i, rule := range nonEmptyRules(base) {
 		if strings.HasPrefix(rule, "type ") {
 			continue
 		}
 		if !strings.Contains(rule, " jump ") {
-			t.Errorf("the filter base chain must only JUMP on a positive uid match; the rule %q\n"+
+			t.Errorf("the filter base chain must only JUMP on a positive match; the rule %q\n"+
 				"carries a verdict of its own, which would adjudicate unattributable traffic:\n%s", rule, base)
 		}
-		if !strings.HasPrefix(rule, "meta skuid ") {
-			t.Errorf("every rule in the filter base chain must be gated on a POSITIVE skuid match;\n"+
-				"got %q in:\n%s", rule, base)
+		switch {
+		case strings.HasPrefix(rule, "meta skuid "):
+			lastUIDJump = i
+		case strings.HasPrefix(rule, "ip daddr 127.0.0.1 ") && strings.HasSuffix(rule, " jump shim_ports"):
+			if firstPortJump < 0 {
+				firstPortJump = i
+			}
+		default:
+			t.Errorf("every rule in the filter base chain must be a POSITIVE skuid jump or closure (c)'s\n"+
+				"shim-port jump into shim_ports; got %q in:\n%s", rule, base)
 		}
 	}
+	if firstPortJump >= 0 && firstPortJump < lastUIDJump {
+		t.Errorf("closure (c)'s shim-port jumps must come AFTER the uid jumps, or the anon UID's own\n"+
+			"first packet to its shim reaches the guard before anon_filter can accept it:\n%s", base)
+	}
+}
+
+// TestGenerateShimPortsClosedToOtherUIDs pins closure (c) (ADR-0014): only the
+// anon UID may open a flow to its own shim ports. Before it, ANY local uid could
+// send the shim's DNS port a query and have it resolved over the account's circuit
+// under the account's isolation username, and since ADR-0013's cache, time the
+// answer to learn what the account had resolved recently.
+//
+// The drop is shaped so it can only fire on a packet it has ATTRIBUTED: `ct state
+// new` keeps it off follow-on packets (the unattributable class), and `meta skuid
+// >= 0` needs a socket owner to match at all. A bare `ct state new drop`, or any
+// `skuid !=`, would each reopen the box-wide hole the package doc describes.
+func TestGenerateShimPortsClosedToOtherUIDs(t *testing.T) {
+	out, err := nftables.Generate(sampleParams())
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	base := chainBody(t, out, "filter_out")
+	// Both transports the shim listens on: TCP for the relay and for glibc `use-vc`
+	// DNS, UDP for ordinary DNS. A UDP-only guard leaves the relay and TCP DNS open.
+	mustContain(t, base, "ip daddr 127.0.0.1 tcp dport { 19050, 19053 } jump shim_ports")
+	mustContain(t, base, "ip daddr 127.0.0.1 udp dport 19053 jump shim_ports")
+
+	guard := nonEmptyRules(chainBody(t, out, "shim_ports"))
+	if len(guard) != 1 || guard[0] != "ct state new meta skuid >= 0 drop" {
+		t.Fatalf("shim_ports must hold exactly one rule, a drop qualified by BOTH `ct state new` and an\n"+
+			"attributable `meta skuid >= 0`; got %q", guard)
+	}
+
+	// Parameterised on the account's own ports, never the defaults.
+	p := sampleParams()
+	p.RelayPort, p.DNSPort = 19060, 19063
+	out2, err := nftables.Generate(p)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	mustContain(t, out2, "ip daddr 127.0.0.1 tcp dport { 19060, 19063 } jump shim_ports")
+	mustContain(t, out2, "ip daddr 127.0.0.1 udp dport 19063 jump shim_ports")
 }
 
 // TestAnonClosureChainEndsInAnUnconditionalTerminalDrop is the counterweight to the
