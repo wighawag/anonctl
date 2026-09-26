@@ -2,13 +2,16 @@ package verify
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/wighawag/anoncore/endpoint"
 	"github.com/wighawag/anonctl/internal/lanexempt"
+	"github.com/wighawag/anonctl/internal/nftables"
 	"github.com/wighawag/anonctl/internal/shim"
 	"github.com/wighawag/anonctl/internal/systemd"
 )
@@ -428,10 +431,20 @@ func offBoxReachedAsAnon(ctx context.Context, p LiveParams, counterDaddr, l4 str
 // exemptReached) dials a DIRECT LAN host that answers well inside the window on a
 // healthy host. The Tor-round-trip checks (anonymized-exit, dns-remote) do NOT use
 // this helper and keep their generous curl/http timeouts.
+func probeAsAnon(ctx context.Context, p LiveParams, network, addr string) (bool, error) {
+	pctx, cancel := context.WithTimeout(ctx, probeExecBudget)
+	defer cancel()
+	reached, _, err := runSetprivProbe(pctx, p.AnonUID, network, addr)
+	return reached, err
+}
+
 // strangerUID picks the uid the shim-ports-closure probe sends as: `nobody`
 // (65534), unless the account or its shim happens to own that number, in which
 // case the next one down. Any uid other than those two is the population closure
 // (c) is about, and nobody is the one every host has and no service should own.
+// It does not check whether ANOTHER account governs the uid it picks; if one did,
+// that account's own table would redirect the TCP send and the check would fail
+// loudly rather than pass, which is the safe direction.
 func strangerUID(p LiveParams) int {
 	for u := 65534; ; u-- {
 		if u != p.AnonUID && u != p.ShimUID {
@@ -440,12 +453,16 @@ func strangerUID(p LiveParams) int {
 	}
 }
 
-// probeShimPortsAsStranger runs closure (c)'s two sends as strangerUID. A probe
-// that could not run at all comes back with an empty detail, which the pure
-// decision reads as "no refusal observed" and reports as an error, never a pass.
+// probeShimPortsAsStranger gathers closure (c)'s evidence: two sends as
+// strangerUID (a datagram to the DNS port, a connect to the relay), and whether
+// the LOADED table carries the closure. The table read is what makes a pass mean
+// "this rule refused it" rather than "something on this host refused uid 65534"
+// (a loopback policy for nobody, a cgroup egress deny). A probe that could not run
+// comes back as a "probe could not run" detail, which the pure decision reports as
+// an error, never a pass.
 func probeShimPortsAsStranger(ctx context.Context, p LiveParams) ShimPortsProbe {
 	uid := strangerUID(p)
-	o := ShimPortsProbe{UID: uid}
+	o := ShimPortsProbe{UID: uid, Account: p.Account, Endpoint: p.Endpoint}
 	run := func(network string, port int) (bool, string) {
 		pctx, cancel := context.WithTimeout(ctx, probeExecBudget)
 		defer cancel()
@@ -457,14 +474,13 @@ func probeShimPortsAsStranger(ctx context.Context, p LiveParams) ShimPortsProbe 
 	}
 	o.DNSReached, o.DNSDetail = run("udp4", p.DNSPort)
 	o.RelayReached, o.RelayDetail = run("tcp4", p.RelayPort)
+	listing, stderr, err := nftRun(ctx, "", "nft", "list", "table", "inet", nftables.TableName(p.Account))
+	if err != nil {
+		o.TableErr = fmt.Errorf("nft list table inet %s: %w (%s)", nftables.TableName(p.Account), err, strings.TrimSpace(stderr))
+	} else {
+		o.InTable = ShimPortsClosureLoaded(listing, p.RelayPort, p.DNSPort)
+	}
 	return o
-}
-
-func probeAsAnon(ctx context.Context, p LiveParams, network, addr string) (bool, error) {
-	pctx, cancel := context.WithTimeout(ctx, probeExecBudget)
-	defer cancel()
-	reached, _, err := runSetprivProbe(pctx, p.AnonUID, network, addr)
-	return reached, err
 }
 
 // UnitsAssertion decides `unit-binaries-present` from a Store: it reads the unit

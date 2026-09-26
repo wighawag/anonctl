@@ -1223,15 +1223,17 @@ func TestUnitsAssertionCatchesADriftedHostOwnedDeclaration(t *testing.T) {
 	}
 }
 
-// Closure (c)'s decision passes only on POSITIVE evidence of a kernel refusal on
-// both ports. The cases below are the shapes the shim `-probe` output takes, taken
-// from a namespace run with and without the guard (ADR-0014).
+// Closure (c)'s decision passes only on a kernel refusal SEEN on both ports AND the
+// rule present in the loaded table. The detail strings are the shim `-probe` output
+// shapes from a namespace run with and without the rule (ADR-0014).
 func TestShimPortsClosureAssertion(t *testing.T) {
 	const (
 		eperm   = "DROPPED:write udp 127.0.0.1:52053->127.0.0.1:19053: write: operation not permitted"
 		synDrop = "DROPPED:dial tcp 127.0.0.1:19050: i/o timeout"
 		refused = "DROPPED:dial tcp 127.0.0.1:19050: connect: connection refused"
 	)
+	good := ShimPortsProbe{UID: 65534, Account: "anon-01", Endpoint: "socks5h://127.0.0.1:9050", DNSDetail: eperm, RelayDetail: synDrop, InTable: true}
+	with := func(f func(o *ShimPortsProbe)) ShimPortsProbe { o := good; f(&o); return o }
 	for _, tc := range []struct {
 		name    string
 		o       ShimPortsProbe
@@ -1239,18 +1241,30 @@ func TestShimPortsClosureAssertion(t *testing.T) {
 		wantErr bool
 		wantIn  string
 	}{
-		{"both refused by the kernel", ShimPortsProbe{UID: 65534, DNSDetail: eperm, RelayDetail: synDrop}, true, false, "REFUSED"},
-		{"tcp refused with EPERM also counts", ShimPortsProbe{UID: 65534, DNSDetail: eperm, RelayDetail: "DROPPED:dial tcp 127.0.0.1:19050: connect: operation not permitted"}, true, false, "REFUSED"},
-		// The measured pre-0.11.0 shape: every uid reached both ports.
-		{"old table, both reached", ShimPortsProbe{UID: 65534, DNSReached: true, DNSDetail: "REACHED", RelayReached: true, RelayDetail: "REACHED"}, false, false, "anonctl update"},
-		{"dns open alone still fails", ShimPortsProbe{UID: 65534, DNSReached: true, DNSDetail: "REACHED", RelayDetail: synDrop}, false, false, "DNS port"},
-		// A refused connect means nothing dropped the SYN: the guard is missing, even
+		{"refused on both, rule loaded", good, true, false, "REFUSED"},
+		{"tcp refused with EPERM also counts", with(func(o *ShimPortsProbe) {
+			o.RelayDetail = "DROPPED:dial tcp 127.0.0.1:19050: connect: operation not permitted"
+		}), true, false, "REFUSED"},
+		// The measured pre-0.11.0 shape: every uid reached both ports. The fix names
+		// the real account and endpoint, not placeholders.
+		{"old table, both reached", with(func(o *ShimPortsProbe) {
+			o.DNSReached, o.DNSDetail, o.RelayReached, o.RelayDetail, o.InTable = true, "REACHED", true, "REACHED", false
+		}), false, false, "sudo anonctl update anon-01 --endpoint socks5h://127.0.0.1:9050"},
+		{"dns open alone still fails", with(func(o *ShimPortsProbe) { o.DNSReached, o.DNSDetail = true, "REACHED" }), false, false, "DNS port"},
+		// A refused connect means nothing dropped the SYN: the rule is missing, even
 		// though the relay was down. Reading it as inconclusive would hide that.
-		{"relay refused by the stack is a fail", ShimPortsProbe{UID: 65534, DNSDetail: eperm, RelayDetail: refused}, false, false, "nothing dropped it"},
-		// A probe that did not run, or a DNS send that failed for some other reason,
-		// proves nothing and must not pass.
-		{"probe could not run", ShimPortsProbe{UID: 65534, DNSDetail: "probe could not run: no setpriv", RelayDetail: synDrop}, false, true, ""},
-		{"relay outcome unexplained", ShimPortsProbe{UID: 65534, DNSDetail: eperm, RelayDetail: "DROPPED:something else"}, false, true, ""},
+		{"relay refused by the stack is a fail", with(func(o *ShimPortsProbe) { o.RelayDetail = refused }), false, false, "nothing dropped it"},
+		// Refused, but not by this rule: something else on the host refuses nobody,
+		// and other uids may still get through. Must not pass.
+		{"refused but rule not loaded", with(func(o *ShimPortsProbe) { o.InTable = false }), false, false, "missing from the loaded table"},
+		{"table unreadable", with(func(o *ShimPortsProbe) { o.TableErr = errors.New("nft: no such table") }), false, true, ""},
+		// A probe that did not run proves nothing, even if its error text happens to
+		// contain the words a refusal would: only a DROPPED: verdict counts.
+		{"probe could not run", with(func(o *ShimPortsProbe) { o.DNSDetail = "probe could not run: no setpriv" }), false, true, ""},
+		{"error text mimicking a refusal", with(func(o *ShimPortsProbe) {
+			o.DNSDetail = "probe could not run: setpriv: operation not permitted"
+		}), false, true, ""},
+		{"relay outcome unexplained", with(func(o *ShimPortsProbe) { o.RelayDetail = "DROPPED:something else" }), false, true, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := ShimPortsClosureAssertion(tc.o)
@@ -1264,6 +1278,42 @@ func TestShimPortsClosureAssertion(t *testing.T) {
 				t.Errorf("detail %q should mention %q", a.Detail, tc.wantIn)
 			}
 		})
+	}
+}
+
+// The table matcher runs against `nft list table` output, which the kernel
+// re-renders. This dump is the kernel's own rendering of a generated table, captured
+// in a namespace (tabs and all), so the test fails if the spelling ever drifts.
+func TestShimPortsClosureLoaded(t *testing.T) {
+	listing := "table inet anonctl_anon_x {\n" +
+		"\tchain filter_out {\n" +
+		"\t\ttype filter hook output priority filter; policy accept;\n" +
+		"\t\tmeta skuid 2001 jump shim_filter\n" +
+		"\t\tmeta skuid 2000 jump anon_filter\n" +
+		"\t\tip daddr 127.0.0.1 tcp dport { 19050, 19053 } jump shim_ports\n" +
+		"\t\tip daddr 127.0.0.1 udp dport 19053 jump shim_ports\n" +
+		"\t}\n" +
+		"\tchain shim_ports {\n" +
+		"\t\tmeta skuid >= 0 drop\n" +
+		"\t}\n}\n"
+	if !ShimPortsClosureLoaded(listing, 19050, 19053) {
+		t.Fatalf("the kernel's own rendering of closure (c) was not recognised")
+	}
+	if ShimPortsClosureLoaded(listing, 19060, 19063) {
+		t.Errorf("another account's ports must not match")
+	}
+	for _, drop := range []string{
+		"\t\tmeta skuid >= 0 drop\n",
+		"\t\tip daddr 127.0.0.1 udp dport 19053 jump shim_ports\n",
+		"\t\tip daddr 127.0.0.1 tcp dport { 19050, 19053 } jump shim_ports\n",
+	} {
+		if ShimPortsClosureLoaded(strings.Replace(listing, drop, "", 1), 19050, 19053) {
+			t.Errorf("a table missing %q must not count as carrying closure (c)", strings.TrimSpace(drop))
+		}
+	}
+	// The pre-0.11.0 rule, if a table ever carried it, is the leaky shape: not closure (c).
+	if ShimPortsClosureLoaded(strings.Replace(listing, "meta skuid >= 0 drop", "ct state new meta skuid >= 0 drop", 1), 19050, 19053) {
+		t.Errorf("the `ct state new` form lets pre-existing stranger flows through and must not count")
 	}
 }
 

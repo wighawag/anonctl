@@ -213,14 +213,14 @@ func shimProbePath() (string, error) {
 // exactly as `add`/`rm` require nft/useradd; the error names the missing tool.
 func runSetprivProbe(ctx context.Context, uid int, network, addr string) (reached bool, stderr string, err error) {
 	if _, err := exec.LookPath("setpriv"); err != nil {
-		return false, "", fmt.Errorf("need setpriv on PATH to run the anon-UID probe (as `add`/`rm` need nft): %w", err)
+		return false, "", fmt.Errorf("need setpriv on PATH to run the probe as uid %d (as `add`/`rm` need nft): %w", uid, err)
 	}
 	shimPath, err := shimProbePath()
 	if err != nil {
-		return false, "", fmt.Errorf("need the installed anonctl-shim binary to run the anon-UID probe (as `add`/`rm` need nft): %w", err)
+		return false, "", fmt.Errorf("need the installed anonctl-shim binary to run the probe as uid %d (as `add`/`rm` need nft): %w", uid, err)
 	}
 	if _, err := exec.LookPath(shimPath); err != nil {
-		return false, "", fmt.Errorf("need the installed shim probe binary %q to run the anon-UID probe: %w", shimPath, err)
+		return false, "", fmt.Errorf("need the installed shim probe binary %q to run the probe as uid %d: %w", shimPath, uid, err)
 	}
 	cmd := exec.CommandContext(ctx, "setpriv",
 		"--reuid", strconv.Itoa(uid), "--clear-groups",
@@ -242,11 +242,11 @@ func runSetprivProbe(ctx context.Context, uid int, network, addr string) (reache
 		// leak-drop-v6 PASS) always prints before this can trigger; if it still does,
 		// name the timeout truthfully.
 		if ctx.Err() == context.DeadlineExceeded {
-			return false, s, fmt.Errorf("the anon-UID probe timed out before printing a verdict (the shim dial to %s %s outran the probe deadline): %s", network, addr, strings.TrimSpace(s))
+			return false, s, fmt.Errorf("the probe as uid %d timed out before printing a verdict (the shim dial to %s %s outran the probe deadline): %s", uid, network, addr, strings.TrimSpace(s))
 		}
 		// Otherwise the process itself failed before printing (setpriv could not drop:
 		// not root, or the anon UID does not exist; or the shim probe did not execute).
-		return false, s, fmt.Errorf("the anon-UID probe could not run (setpriv could not drop to uid %d, or the shim probe did not execute): %v: %s", uid, runErr, strings.TrimSpace(s))
+		return false, s, fmt.Errorf("the probe as uid %d could not run (setpriv could not drop to it, or the shim probe did not execute): %v: %s", uid, runErr, strings.TrimSpace(s))
 	}
 	return strings.Contains(s, "REACHED"), s, nil
 }

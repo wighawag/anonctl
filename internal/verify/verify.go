@@ -71,6 +71,8 @@ import (
 
 	"github.com/wighawag/anoncore/endpoint"
 	"github.com/wighawag/anoncore/sudoprobe"
+
+	"github.com/wighawag/anonctl/internal/nftables"
 )
 
 // SchemaVersion is the version of the `--json` report CONTRACT. It evolves
@@ -117,7 +119,7 @@ const (
 	// AssertBypassEndpointClosure: the anon UID dialling the endpoint directly is
 	// DROPPED (recipe closure b).
 	AssertBypassEndpointClosure = "bypass-endpoint-closure"
-	// AssertShimPortsClosure: a uid that is NOT the account cannot open a flow to the
+	// AssertShimPortsClosure: a uid that is NOT the account cannot talk to the
 	// account's shim ports (closure c, ADR-0014), so no other local user can resolve
 	// names over its circuit, borrow its relay, or time its DNS cache.
 	AssertShimPortsClosure = "shim-ports-closure"
@@ -949,23 +951,49 @@ func BypassEndpointClosureAssertion(reached bool) Assertion {
 	return dropAssertion(AssertBypassEndpointClosure, "the anon UID dialling the upstream endpoint directly", reached)
 }
 
-// ShimPortsProbe is what the shim-ports-closure probe observed: one UDP datagram
-// to the account's shim DNS port and one TCP connect to its relay port, both sent
-// as UID, a uid anonctl does not govern. The Details are the shim `-probe` reason
-// strings (`DROPPED:<detail>`), which are how a refusal is told apart from a port
-// that is merely closed.
+// ShimPortsProbe is the shim-ports-closure evidence: one UDP datagram to the
+// account's shim DNS port and one TCP connect to its relay port, both sent as UID,
+// a uid anonctl does not govern, plus whether the account's LOADED table carries
+// closure (c). The Details are the shim `-probe` output (`REACHED` or
+// `DROPPED:<reason>`), or a "probe could not run" text.
 type ShimPortsProbe struct {
 	UID          int
+	Account      string
+	Endpoint     string
 	DNSReached   bool
 	DNSDetail    string
 	RelayReached bool
 	RelayDetail  string
+	// InTable is whether `nft list table` showed closure (c)'s rule and both jumps
+	// (ShimPortsClosureLoaded); TableErr is set when the table could not be read.
+	InTable  bool
+	TableErr error
 }
 
-// ShimPortsClosureAssertion is closure (c)'s PURE decision. It passes only on
-// POSITIVE evidence that the kernel refused both sends, never on mere absence of
-// an answer, because the failure it guards against (an old table without the
-// guard) is otherwise quiet:
+// ShimPortsClosureLoaded reports whether a `nft list table` dump of the account's
+// table carries closure (c): the shim_ports rule and BOTH filter_out jumps for these
+// ports, each as a whole line, spelled by the generator's own exported helpers so
+// the matcher cannot drift from what is emitted (the kernel prints them back
+// verbatim; measured).
+func ShimPortsClosureLoaded(listing string, relayPort, dnsPort int) bool {
+	lines := map[string]bool{}
+	for _, l := range strings.Split(listing, "\n") {
+		lines[strings.TrimSpace(l)] = true
+	}
+	want := append([]string{nftables.ShimPortsRule()}, nftables.ShimPortsJumps(relayPort, dnsPort)...)
+	for _, w := range want {
+		if !lines[w] {
+			return false
+		}
+	}
+	return true
+}
+
+// ShimPortsClosureAssertion is closure (c)'s PURE decision. It passes only when
+// the kernel was SEEN refusing both sends AND the loaded table carries the rule,
+// because either alone can mislead: a refusal can come from something else on the
+// host (a loopback policy for nobody, a cgroup egress deny), and a rule in the table
+// proves nothing about what the kernel does. How a refusal looks:
 //
 //   - UDP: a locally dropped datagram fails its send with EPERM ("operation not
 //     permitted"). A datagram that went out is REACHED even with no listener, so a
@@ -975,34 +1003,56 @@ type ShimPortsProbe struct {
 //     means the SYN reached the stack, i.e. nothing dropped it: that is a FAIL,
 //     not an inconclusive, even though the relay was not listening.
 //
-// Any other outcome is a probe that did not answer the question, and is an
-// error, never a pass.
+// Both only count inside the probe's own `DROPPED:` verdict, so the text of an
+// error from a probe that could not run can never be mistaken for one. Any other
+// outcome is a probe that did not answer the question, and is an error, never a
+// pass.
 func ShimPortsClosureAssertion(o ShimPortsProbe) Assertion {
 	a := Assertion{Name: AssertShimPortsClosure}
-	fix := "a table written before anonctl 0.11.0 has no closure (c): re-apply it with `anonctl update <account> --endpoint <url>`"
+	fix := fmt.Sprintf("a table written before anonctl 0.11.0 has no closure (c); re-apply it with `sudo anonctl update %s --endpoint %s`", o.Account, o.Endpoint)
+	dropped := func(detail string, reasons ...string) bool {
+		i := strings.Index(detail, "DROPPED:")
+		if i < 0 {
+			return false
+		}
+		for _, r := range reasons {
+			if strings.Contains(detail[i:], r) {
+				return true
+			}
+		}
+		return false
+	}
 	var open []string
 	if o.DNSReached {
 		open = append(open, "its DNS port (udp)")
 	}
 	if o.RelayReached {
 		open = append(open, "its relay port (tcp)")
-	} else if strings.Contains(o.RelayDetail, "connection refused") {
+	} else if dropped(o.RelayDetail, "connection refused") {
 		open = append(open, "its relay port (tcp: the SYN was answered by the stack, so nothing dropped it; the relay itself is not listening either)")
 	}
 	if len(open) > 0 {
 		a.Detail = fmt.Sprintf("uid %d, which is not the account, reached %s: any local user can use this account's circuit and time its DNS cache; %s", o.UID, strings.Join(open, " and "), fix)
 		return a
 	}
-	if !strings.Contains(o.DNSDetail, "operation not permitted") {
+	if !dropped(o.DNSDetail, "operation not permitted") {
 		a.Err = fmt.Errorf("the shim-ports probe as uid %d did not show a refusal on the DNS port: expected EPERM on the send, got %q", o.UID, strings.TrimSpace(o.DNSDetail))
 		return a
 	}
-	if !strings.Contains(o.RelayDetail, "timeout") && !strings.Contains(o.RelayDetail, "operation not permitted") {
+	if !dropped(o.RelayDetail, "timeout", "operation not permitted") {
 		a.Err = fmt.Errorf("the shim-ports probe as uid %d did not show a refusal on the relay port: expected a dropped SYN (timeout or EPERM), got %q", o.UID, strings.TrimSpace(o.RelayDetail))
 		return a
 	}
+	if o.TableErr != nil {
+		a.Err = fmt.Errorf("uid %d was refused on both shim ports, but the account's table could not be read to confirm closure (c) is what refused it: %w", o.UID, o.TableErr)
+		return a
+	}
+	if !o.InTable {
+		a.Detail = fmt.Sprintf("uid %d was refused on both shim ports, but NOT by closure (c), which is missing from the loaded table: something else on this host refuses that uid, and other local uids may still reach the shim; %s", o.UID, fix)
+		return a
+	}
 	a.Ok = true
-	a.Detail = fmt.Sprintf("uid %d, which is not the account, was REFUSED by the kernel on both the DNS and relay ports (closure c holds)", o.UID)
+	a.Detail = fmt.Sprintf("uid %d, which is not the account, was REFUSED by the kernel on both the DNS and relay ports, and closure (c) is in the loaded table", o.UID)
 	return a
 }
 
