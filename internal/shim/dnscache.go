@@ -34,7 +34,7 @@ import (
 //
 // WHO "ANYONE" IS. When this cache landed (0.10.0) the answer was any local uid,
 // because nothing filtered who could send to the port. Since 0.11.0 the account's
-// forcing table refuses a new flow to its shim ports from every uid but the
+// forcing table refuses traffic to its shim ports from every uid but the
 // account's own (closure c, docs/adr/0014), so the observer is back to the account
 // itself, which gains nothing, and to someone who can defeat or rewrite that table,
 // i.e. root, who already sees more (the shim's own connections, conntrack, the

@@ -216,10 +216,11 @@ func TestGenerateFilterGovernsOnlyItsOwnUIDs(t *testing.T) {
 // under the account's isolation username, and since ADR-0013's cache, time the
 // answer to learn what the account had resolved recently.
 //
-// The drop is shaped so it can only fire on a packet it has ATTRIBUTED: `ct state
-// new` keeps it off follow-on packets (the unattributable class), and `meta skuid
-// >= 0` needs a socket owner to match at all. A bare `ct state new drop`, or any
-// `skuid !=`, would each reopen the box-wide hole the package doc describes.
+// The drop is shaped so it can only fire on a packet it has ATTRIBUTED: `meta
+// skuid >= 0` needs a socket owner to match at all. A bare `drop`, or any `skuid
+// !=`, would each reopen the box-wide hole the package doc describes. And it must
+// NOT be narrowed to `ct state new`: that let a stranger's flow that predated the
+// table keep reaching the shim (measured; package doc).
 func TestGenerateShimPortsClosedToOtherUIDs(t *testing.T) {
 	out, err := nftables.Generate(sampleParams())
 	if err != nil {
@@ -232,9 +233,13 @@ func TestGenerateShimPortsClosedToOtherUIDs(t *testing.T) {
 	mustContain(t, base, "ip daddr 127.0.0.1 udp dport 19053 jump shim_ports")
 
 	guard := nonEmptyRules(chainBody(t, out, "shim_ports"))
-	if len(guard) != 1 || guard[0] != "ct state new meta skuid >= 0 drop" {
-		t.Fatalf("shim_ports must hold exactly one rule, a drop qualified by BOTH `ct state new` and an\n"+
-			"attributable `meta skuid >= 0`; got %q", guard)
+	if len(guard) != 1 || guard[0] != "meta skuid >= 0 drop" || guard[0] != nftables.ShimPortsRule() {
+		t.Fatalf("shim_ports must hold exactly one rule, a drop qualified ONLY by an attributable\n"+
+			"`meta skuid >= 0` (no `ct state`), spelled as ShimPortsRule; got %q", guard)
+	}
+	// The jumps verify matches against the loaded table are the ones emitted.
+	for _, j := range nftables.ShimPortsJumps(19050, 19053) {
+		mustContain(t, base, j)
 	}
 
 	// Parameterised on the account's own ports, never the defaults.

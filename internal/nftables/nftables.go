@@ -31,9 +31,9 @@
 //     (b) ONLY the shim UID may reach the upstream endpoint; the anon UID's dial of
 //     the endpoint is dropped so it can never skip the shim or its `<account>@`
 //     isolation username.
-//   - closure (c), the converse of (a): ONLY the anon UID may open a flow to its
-//     own shim ports. Every other uid, root included, is refused a NEW flow to
-//     them, so no other local user can resolve names over this account's circuit,
+//   - closure (c), the converse of (a): ONLY the anon UID may talk to its own
+//     shim ports. Every other uid, root included, is refused there, new flows and
+//     ones that predate the table alike, so no other local user can resolve names over this account's circuit,
 //     borrow its relay, or time its DNS cache (ADR-0014). It is the one place the
 //     filter base chain jumps on a DESTINATION rather than a uid; see below for
 //     why that does not reopen the unattributable-packet hole.
@@ -89,18 +89,29 @@
 // must never adjudicate a packet it cannot attribute, and closure (c) exists to
 // refuse packets from uids anonctl does NOT govern, so it cannot be a positive
 // jump on one uid. It is instead a positive jump on the account's OWN shim ports
-// (addresses anonctl allocated and nothing else may bind), placed AFTER the two
-// uid jumps, so the anon and shim UIDs have already been accepted by their own
-// chains and never reach it. Inside, the single drop is qualified twice: `ct
-// state new` (a follow-on packet of an established flow, which is exactly the
-// unattributable class, is never judged) AND `meta skuid >= 0`, which matches
-// ANY attributable uid and nothing else, because the kernel breaks out of a rule
-// whose `meta skuid` load finds no socket owner. So it still drops only what it
-// has positively attributed, and it never says `skuid !=`. Measured in a
-// namespace with three uids: the anon UID's 200 MB bulk transfer through a guarded
-// port completed intact (its unattributable packets reached the guard and were
-// NOT dropped), while another uid and root were refused on all three ports, where
-// without the chain all three answered them.
+// (ports anonctl allocated to this account's shim; while the shim holds them nothing
+// else can bind them, and if it is down, a stranger service that took one would
+// have its own clients refused here), placed AFTER the two uid jumps, so the anon
+// and shim UIDs have already been accepted by their own chains and never reach it.
+// Inside, the single drop is `meta skuid >= 0 drop`, which matches ANY
+// attributable uid and nothing else, because the kernel breaks out of a rule whose
+// `meta skuid` load finds no full socket with an owner. That one qualifier is the
+// whole protection for unattributable packets, and it never says `skuid !=`.
+//
+// It is deliberately NOT also qualified by `ct state new`, although that reads
+// like extra safety. It adds none (the skuid match already excludes the
+// unattributable class) and it opens a hole: a stranger's flow that existed before
+// the table was (re)applied stays `established` in conntrack and keeps reaching the
+// shim, as does a stranger that binds a source port matching a live entry of the
+// account's own direct queries. Measured: a stranger's connected UDP socket
+// answered by the shim under the old table kept getting through after the atomic
+// replace with `ct state new`, and was refused (EPERM) without it.
+//
+// Measured in a namespace with three uids, the real shim, and this exact text: the
+// anon UID's 200 MB bulk transfer through a guarded port completed intact (its
+// unattributable packets reached the chain and fell through undropped), its DNS
+// through the redirect was answered, while another uid and root were refused on
+// all three ports, where without the chain all three answered them.
 //
 // The table is named per-account (`anonctl_<account>`) so two accounts never
 // clobber each other's ruleset and Delete removes exactly one account's table,
@@ -209,11 +220,29 @@ const (
 	// shimFilterChain holds the shim UID's endpoint + world accepts (jumped to from
 	// filter_out).
 	shimFilterChain = "shim_filter"
-	// shimPortsChain is closure (c): it refuses a NEW flow to the account's own shim
-	// ports from any attributable uid that reached it (jumped to from filter_out by
+	// shimPortsChain is closure (c): it refuses any attributable packet to the
+	// account's own shim ports from a uid that reached it (jumped to from filter_out by
 	// DESTINATION, after the anon and shim jumps, so neither of those UIDs gets here).
 	shimPortsChain = "shim_ports"
 )
+
+// ShimPortsRule is closure (c)'s one rule, exactly as the kernel prints it back in
+// `nft list table`. Exported for the same reason as GoverningRule: `verify` matches
+// it against the LOADED table (a refusal observed by its probe could come from
+// something else on the host), and building it here keeps that matcher from
+// drifting away from what is emitted.
+func ShimPortsRule() string {
+	return "meta skuid >= 0 drop"
+}
+
+// ShimPortsJumps are closure (c)'s two filter_out jumps for these ports, exactly as
+// the kernel prints them back. See ShimPortsRule.
+func ShimPortsJumps(relayPort, dnsPort int) []string {
+	return []string{
+		fmt.Sprintf("ip daddr 127.0.0.1 tcp dport { %d, %d } jump %s", relayPort, dnsPort, shimPortsChain),
+		fmt.Sprintf("ip daddr 127.0.0.1 udp dport %d jump %s", dnsPort, shimPortsChain),
+	}
+}
 
 // Generate produces the fail-closed `inet` nftables ruleset text for one account,
 // ready to feed to `nft -f -`. It is pure (no root, no I/O) so it is unit-tested
@@ -244,7 +273,7 @@ func Generate(p Params) (string, error) {
 	w("# anonctl per-UID forced anonymized egress for account %q - inet table (IPv4 + IPv6), fail-closed.", p.Account)
 	w("# Generated from the validated recipe (work/notes/findings/manual-per-uid-tor-recipe.md).")
 	w("# Governs uid %d (anon) and uid %d (shim). Every other uid is untouched except in", p.AnonUID, p.ShimUID)
-	w("# ONE respect: it may not open a new flow to THIS account's own shim ports (closure c).")
+	w("# ONE respect: it may not talk to THIS account's own shim ports (closure c).")
 	w("# That claim is enforced STRUCTURALLY: both base chains are policy ACCEPT and hold")
 	w("# nothing but POSITIVE jumps (on a governed uid, or on this account's shim ports), so a")
 	w("# packet belonging to another uid elsewhere -- or to no attributable socket at all,")
@@ -315,20 +344,21 @@ func Generate(p Params) (string, error) {
 	// Closure (c)'s destination jumps. They MUST come after the two uid jumps: the
 	// anon UID's own flows to these ports are accepted inside anon_filter, and the
 	// guard below relies on never seeing a governed UID's attributable packet.
-	w("        ip daddr 127.0.0.1 tcp dport { %d, %d } jump %s", p.RelayPort, p.DNSPort, shimPortsChain)
-	w("        ip daddr 127.0.0.1 udp dport %d jump %s", p.DNSPort, shimPortsChain)
+	for _, j := range ShimPortsJumps(p.RelayPort, p.DNSPort) {
+		w("        %s", j)
+	}
 	w("    }")
 	w("")
 	// Closure (c). Reached only by a packet to this account's shim ports that the
-	// anon and shim chains did not already accept. `ct state new` confines the verdict
-	// to the first packet of a flow (a TCP SYN, a UDP datagram with no conntrack
-	// entry), which always carries its socket uid; `meta skuid >= 0` then matches any
-	// attributable uid and cannot match a packet with no socket owner. Falling off the
-	// end returns to filter_out and its policy accept, which is where the anon UID's
-	// unattributable follow-on packets go. A refused UDP send fails with EPERM at once;
-	// a refused TCP connect retransmits its SYN into the same drop and times out.
+	// anon and shim chains did not already accept. `meta skuid >= 0` matches any
+	// attributable uid and cannot match a packet with no socket owner, so the anon
+	// UID's unattributable follow-on packets fall off the end, back to filter_out's
+	// policy accept. No `ct state new`: see the package doc for the hole it opens. A
+	// refused UDP send fails with EPERM at once; a refused TCP connect retransmits its
+	// SYN into the same drop and times out; an existing stranger flow dies at its next
+	// attributable packet.
 	w("    chain %s {", shimPortsChain)
-	w("        ct state new meta skuid >= 0 drop")
+	w("        %s", ShimPortsRule())
 	w("    }")
 	w("")
 	// SHIM UID: the ONLY UID allowed to reach the endpoint, then the world. Entered
