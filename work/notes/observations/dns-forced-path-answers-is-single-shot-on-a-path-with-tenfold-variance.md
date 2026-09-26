@@ -145,3 +145,23 @@ Each step: the command, what good looks like, what bad looks like. Run them agai
 ## Not asked for, but adjacent
 
 `exec` running the full verify suite per invocation is correct and it does make `exec` unsuitable for timing anything, and awkward for scripting a loop. Not a complaint, just the reason the first numbers in this note were wrong.
+
+## Live verification, taken on telemaque 2026-09-26 (closes this note)
+
+Taken by the operator with root, on the account's real path: `getent ahostsv4 example.com` ten times inside `anonctl use anon-01`, BEFORE on the deployed 0.9.0, AFTER on 0.11.0 with the account's table re-applied by `anonctl update` (which also restarted its shim onto the new binary).
+
+```
+BEFORE 0.9.0:   0.345 0.491 0.521 0.528 0.509 0.462 0.409 0.405 0.404 0.422   median 0.44s
+AFTER  0.11.0:  0.544 0.002 0.002 0.002 0.002 0.002 0.002 0.001 0.001 0.001   median 0.002s
+```
+
+What they say, including where they disagree with this note:
+
+- **Repeat lookups are solved.** After the first, every sample is 1 to 2 ms, which is the unforced figure this note opened with (2 to 18 ms). That is the ADR-0013 cache answering. The first AFTER sample, 0.544s, is a lookup on a shim restarted moments earlier: a fresh stream dial plus a cache miss, and it lands inside the BEFORE range.
+- **The 2.2s this note was built on did not reproduce, on the SAME binary, path and method.** BEFORE today, still 0.9.0, still `getent` inside `use`, has a median of 0.44s with a spread of 0.35 to 0.53, five times faster than on 2026-09-25 and far tighter. It is also close to the ~0.34s the agent measured at the forwarder's port. So the explanation this note leaned on at the end (that the gap between 2.2s and 0.34s was the MEASUREMENT POINT, i.e. NSS, the redirect or glibc adding seconds) is not supported: through the whole path, today costs about what the port cost then. The better reading is that 2026-09-25's circuits were slow, and that the per-lookup variance this note measured is also day-to-day variance. It was never a fixed property of the path, and it does not need a host-side finding.
+- **Not measured: a FRESH name on a warm stream.** The benchmark repeats one name, so after the first lookup it measures the cache. What a page load of new hosts pays is the miss cost with the stream already up, which the port-level numbers above put at ~0.15 to 0.24s against the per-query dial it replaced. That is expected rather than shown on the real path.
+- **The gate.** `anonctl verify anon-01` three times in a row: 16 of 16 each time (`shim-ports-closure` included), and `dns-forced-path-answers` passed on the FIRST attempt every time (no "passed on attempt 2" line), which is step 2 above. The failure that started this note has not recurred.
+- **Closure (c) on the real host** (ADR-0014, shipped in the same release): from the operator's own uid, `anonctl-shim -dns-probe 127.0.0.1:19053 example.com` failed at once with `operation not permitted`; the same command inside the account was ANSWERED.
+- **Step 3 above (a deliberately dead endpoint) was not run.** Stopping the system tor would take every Tor user on the box down with it. The SERVFAIL path it would exercise is covered by the unit tests and by the namespace runs in ADR-0014, not by a live run on this host.
+
+Closed: the fixes shipped, the gate is stable, and the remaining open question (the fresh-name cost on the real path) is a nice-to-know rather than a defect.
