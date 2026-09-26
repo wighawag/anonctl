@@ -165,3 +165,11 @@ What they say, including where they disagree with this note:
 - **Step 3 above (a deliberately dead endpoint) was not run.** Stopping the system tor would take every Tor user on the box down with it. The SERVFAIL path it would exercise is covered by the unit tests and by the namespace runs in ADR-0014, not by a live run on this host.
 
 Closed: the fixes shipped, the gate is stable, and the remaining open question (the fresh-name cost on the real path) is a nice-to-know rather than a defect.
+
+**Addendum, the same day: the fresh-name cost, measured.** Ten DIFFERENT names (`wikipedia.org github.com mozilla.org debian.org kernel.org python.org rust-lang.org gnu.org archlinux.org nixos.org`), one lookup each, inside `anonctl use anon-01` on 0.11.0, so none can be a cache hit:
+
+```
+0.542 0.262 0.305 0.260 0.266 0.323 0.230 0.278 0.274 0.302   median 0.28s (0.23 to 0.32 after the first)
+```
+
+The first is the one that pays for a stream dial: the stream had been idle past its 30s teardown since the previous run. The other nine are the true miss cost on a warm stream, 0.23 to 0.32s, against the 0.44s median every 0.9.0 lookup paid (a fresh stream each time). That is roughly a third off for a name the account has not seen, on top of repeats dropping to 1 to 2 ms. It sits a little above the ~0.15 to 0.24s measured at the port, which is what the full path adds. One sitting, different names from the BEFORE run, and circuits vary day to day, so read the one-third as indicative rather than exact. The second account (`anon`) also verified 16/16 on 0.11.0, `shim-ports-closure` included.
