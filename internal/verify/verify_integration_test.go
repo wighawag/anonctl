@@ -390,6 +390,7 @@ func TestLiveLeakAndClosuresAgainstRealRuleset(t *testing.T) {
 	for _, name := range []string{
 		verify.AssertLeakDropV4, verify.AssertLeakDropV6,
 		verify.AssertBypassLoopbackClosure, verify.AssertBypassEndpointClosure,
+		verify.AssertShimPortsClosure,
 		verify.AssertICMPDrop, verify.AssertNonTCPUDPDrop,
 		verify.AssertNoUIDTransitionEgress,
 	} {

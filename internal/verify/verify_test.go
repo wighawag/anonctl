@@ -1222,3 +1222,56 @@ func TestUnitsAssertionCatchesADriftedHostOwnedDeclaration(t *testing.T) {
 		t.Errorf("the detail must name the marker that put this host in the mode, for whoever did not set it up; got %q", drifted.Detail)
 	}
 }
+
+// Closure (c)'s decision passes only on POSITIVE evidence of a kernel refusal on
+// both ports. The cases below are the shapes the shim `-probe` output takes, taken
+// from a namespace run with and without the guard (ADR-0014).
+func TestShimPortsClosureAssertion(t *testing.T) {
+	const (
+		eperm   = "DROPPED:write udp 127.0.0.1:52053->127.0.0.1:19053: write: operation not permitted"
+		synDrop = "DROPPED:dial tcp 127.0.0.1:19050: i/o timeout"
+		refused = "DROPPED:dial tcp 127.0.0.1:19050: connect: connection refused"
+	)
+	for _, tc := range []struct {
+		name    string
+		o       ShimPortsProbe
+		wantOk  bool
+		wantErr bool
+		wantIn  string
+	}{
+		{"both refused by the kernel", ShimPortsProbe{UID: 65534, DNSDetail: eperm, RelayDetail: synDrop}, true, false, "REFUSED"},
+		{"tcp refused with EPERM also counts", ShimPortsProbe{UID: 65534, DNSDetail: eperm, RelayDetail: "DROPPED:dial tcp 127.0.0.1:19050: connect: operation not permitted"}, true, false, "REFUSED"},
+		// The measured pre-0.11.0 shape: every uid reached both ports.
+		{"old table, both reached", ShimPortsProbe{UID: 65534, DNSReached: true, DNSDetail: "REACHED", RelayReached: true, RelayDetail: "REACHED"}, false, false, "anonctl update"},
+		{"dns open alone still fails", ShimPortsProbe{UID: 65534, DNSReached: true, DNSDetail: "REACHED", RelayDetail: synDrop}, false, false, "DNS port"},
+		// A refused connect means nothing dropped the SYN: the guard is missing, even
+		// though the relay was down. Reading it as inconclusive would hide that.
+		{"relay refused by the stack is a fail", ShimPortsProbe{UID: 65534, DNSDetail: eperm, RelayDetail: refused}, false, false, "nothing dropped it"},
+		// A probe that did not run, or a DNS send that failed for some other reason,
+		// proves nothing and must not pass.
+		{"probe could not run", ShimPortsProbe{UID: 65534, DNSDetail: "probe could not run: no setpriv", RelayDetail: synDrop}, false, true, ""},
+		{"relay outcome unexplained", ShimPortsProbe{UID: 65534, DNSDetail: eperm, RelayDetail: "DROPPED:something else"}, false, true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := ShimPortsClosureAssertion(tc.o)
+			if a.Name != AssertShimPortsClosure {
+				t.Fatalf("name = %q, want %q", a.Name, AssertShimPortsClosure)
+			}
+			if a.Ok != tc.wantOk || (a.Err != nil) != tc.wantErr {
+				t.Fatalf("got Ok=%v Err=%v, want Ok=%v err=%v (detail %q)", a.Ok, a.Err, tc.wantOk, tc.wantErr, a.Detail)
+			}
+			if tc.wantIn != "" && !strings.Contains(a.Detail, tc.wantIn) {
+				t.Errorf("detail %q should mention %q", a.Detail, tc.wantIn)
+			}
+		})
+	}
+}
+
+func TestStrangerUIDNeverTheAccountOrShim(t *testing.T) {
+	if u := strangerUID(LiveParams{AnonUID: 2000, ShimUID: 2001}); u != 65534 {
+		t.Errorf("default stranger = %d, want 65534 (nobody)", u)
+	}
+	if u := strangerUID(LiveParams{AnonUID: 65534, ShimUID: 65533}); u != 65532 {
+		t.Errorf("stranger must skip both governed uids; got %d", u)
+	}
+}

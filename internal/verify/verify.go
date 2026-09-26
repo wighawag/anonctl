@@ -30,6 +30,9 @@
 //   - bypass-endpoint-closure: the anon UID dialling the upstream endpoint
 //     directly is DROPPED (recipe closure b) so it can never skip the shim or its
 //     `<account>@` isolation username.
+//   - shim-ports-closure: a uid that is NOT the account is refused a flow to the
+//     account's shim DNS and relay ports (closure c, ADR-0014), the converse of
+//     closure (a).
 //   - icmp-drop: an ICMP echo (`ping`) from the anon UID to an off-box address is
 //     DROPPED (it does not emit an ICMP packet carrying the real source IP). Tails
 //     leak-catalogue row 4; it falls through to the anon UID's terminal `drop`.
@@ -114,6 +117,10 @@ const (
 	// AssertBypassEndpointClosure: the anon UID dialling the endpoint directly is
 	// DROPPED (recipe closure b).
 	AssertBypassEndpointClosure = "bypass-endpoint-closure"
+	// AssertShimPortsClosure: a uid that is NOT the account cannot open a flow to the
+	// account's shim ports (closure c, ADR-0014), so no other local user can resolve
+	// names over its circuit, borrow its relay, or time its DNS cache.
+	AssertShimPortsClosure = "shim-ports-closure"
 	// AssertSplitTunnelTight: with a LAN exemption active, the exempted host:port
 	// is reachable but everything else stays redirected-or-dropped.
 	AssertSplitTunnelTight = "split-tunnel-tight"
@@ -940,6 +947,63 @@ func BypassLoopbackClosureAssertion(reached bool) Assertion {
 // endpoint egressed (true == the closure is broken == fail).
 func BypassEndpointClosureAssertion(reached bool) Assertion {
 	return dropAssertion(AssertBypassEndpointClosure, "the anon UID dialling the upstream endpoint directly", reached)
+}
+
+// ShimPortsProbe is what the shim-ports-closure probe observed: one UDP datagram
+// to the account's shim DNS port and one TCP connect to its relay port, both sent
+// as UID, a uid anonctl does not govern. The Details are the shim `-probe` reason
+// strings (`DROPPED:<detail>`), which are how a refusal is told apart from a port
+// that is merely closed.
+type ShimPortsProbe struct {
+	UID          int
+	DNSReached   bool
+	DNSDetail    string
+	RelayReached bool
+	RelayDetail  string
+}
+
+// ShimPortsClosureAssertion is closure (c)'s PURE decision. It passes only on
+// POSITIVE evidence that the kernel refused both sends, never on mere absence of
+// an answer, because the failure it guards against (an old table without the
+// guard) is otherwise quiet:
+//
+//   - UDP: a locally dropped datagram fails its send with EPERM ("operation not
+//     permitted"). A datagram that went out is REACHED even with no listener, so a
+//     dead shim cannot fake a pass.
+//   - TCP: a locally dropped SYN retransmits into the same drop, so the connect
+//     TIMES OUT (some kernels report EPERM instead; both count). A refused connect
+//     means the SYN reached the stack, i.e. nothing dropped it: that is a FAIL,
+//     not an inconclusive, even though the relay was not listening.
+//
+// Any other outcome is a probe that did not answer the question, and is an
+// error, never a pass.
+func ShimPortsClosureAssertion(o ShimPortsProbe) Assertion {
+	a := Assertion{Name: AssertShimPortsClosure}
+	fix := "a table written before anonctl 0.11.0 has no closure (c): re-apply it with `anonctl update <account> --endpoint <url>`"
+	var open []string
+	if o.DNSReached {
+		open = append(open, "its DNS port (udp)")
+	}
+	if o.RelayReached {
+		open = append(open, "its relay port (tcp)")
+	} else if strings.Contains(o.RelayDetail, "connection refused") {
+		open = append(open, "its relay port (tcp: the SYN was answered by the stack, so nothing dropped it; the relay itself is not listening either)")
+	}
+	if len(open) > 0 {
+		a.Detail = fmt.Sprintf("uid %d, which is not the account, reached %s: any local user can use this account's circuit and time its DNS cache; %s", o.UID, strings.Join(open, " and "), fix)
+		return a
+	}
+	if !strings.Contains(o.DNSDetail, "operation not permitted") {
+		a.Err = fmt.Errorf("the shim-ports probe as uid %d did not show a refusal on the DNS port: expected EPERM on the send, got %q", o.UID, strings.TrimSpace(o.DNSDetail))
+		return a
+	}
+	if !strings.Contains(o.RelayDetail, "timeout") && !strings.Contains(o.RelayDetail, "operation not permitted") {
+		a.Err = fmt.Errorf("the shim-ports probe as uid %d did not show a refusal on the relay port: expected a dropped SYN (timeout or EPERM), got %q", o.UID, strings.TrimSpace(o.RelayDetail))
+		return a
+	}
+	a.Ok = true
+	a.Detail = fmt.Sprintf("uid %d, which is not the account, was REFUSED by the kernel on both the DNS and relay ports (closure c holds)", o.UID)
+	return a
 }
 
 // ICMPDropAssertion is the Tails leak-catalogue row-4 decision: an ICMP echo

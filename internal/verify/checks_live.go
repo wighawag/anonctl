@@ -234,6 +234,14 @@ func LiveChecks(ctx context.Context, p LiveParams) []Check {
 			reached, err := offBoxReachedAsAnon(ctx, p, p.EndpointHost, "tcp", p.EndpointPort, "tcp4", endpointAddr)
 			return escapedLeakProbeAssertion(AssertBypassEndpointClosure, "the anon UID dialling the upstream endpoint directly", reached, err)
 		}},
+		{Name: AssertShimPortsClosure, Run: func(ctx context.Context) Assertion {
+			// Closure (c): the converse of (a). Every other probe runs AS the account;
+			// this one runs as a uid anonctl does NOT govern, because the question is who
+			// ELSE can talk to the shim. It sends straight to the shim's own ports (no
+			// redirect is involved for an ungoverned uid) and reads the kernel's verdict
+			// off the send itself, so it needs no counter.
+			return ShimPortsClosureAssertion(probeShimPortsAsStranger(ctx, p))
+		}},
 		{Name: AssertICMPDrop, Run: func(ctx context.Context) Assertion {
 			// Tails leak-catalogue row 4: an ICMP echo from the anon UID to an off-box
 			// address must be DROPPED. It falls through to the terminal `drop`, so a ping
@@ -420,6 +428,38 @@ func offBoxReachedAsAnon(ctx context.Context, p LiveParams, counterDaddr, l4 str
 // exemptReached) dials a DIRECT LAN host that answers well inside the window on a
 // healthy host. The Tor-round-trip checks (anonymized-exit, dns-remote) do NOT use
 // this helper and keep their generous curl/http timeouts.
+// strangerUID picks the uid the shim-ports-closure probe sends as: `nobody`
+// (65534), unless the account or its shim happens to own that number, in which
+// case the next one down. Any uid other than those two is the population closure
+// (c) is about, and nobody is the one every host has and no service should own.
+func strangerUID(p LiveParams) int {
+	for u := 65534; ; u-- {
+		if u != p.AnonUID && u != p.ShimUID {
+			return u
+		}
+	}
+}
+
+// probeShimPortsAsStranger runs closure (c)'s two sends as strangerUID. A probe
+// that could not run at all comes back with an empty detail, which the pure
+// decision reads as "no refusal observed" and reports as an error, never a pass.
+func probeShimPortsAsStranger(ctx context.Context, p LiveParams) ShimPortsProbe {
+	uid := strangerUID(p)
+	o := ShimPortsProbe{UID: uid}
+	run := func(network string, port int) (bool, string) {
+		pctx, cancel := context.WithTimeout(ctx, probeExecBudget)
+		defer cancel()
+		reached, out, err := runSetprivProbe(pctx, uid, network, net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			return false, "probe could not run: " + err.Error()
+		}
+		return reached, out
+	}
+	o.DNSReached, o.DNSDetail = run("udp4", p.DNSPort)
+	o.RelayReached, o.RelayDetail = run("tcp4", p.RelayPort)
+	return o
+}
+
 func probeAsAnon(ctx context.Context, p LiveParams, network, addr string) (bool, error) {
 	pctx, cancel := context.WithTimeout(ctx, probeExecBudget)
 	defer cancel()
