@@ -17,10 +17,10 @@ The argument for it was DNS latency, and the measurements behind ADR-0013 have a
 
 `work/notes/observations/the-shims-dns-port-answers-any-local-uid.md` measured that the shim's DNS port answers ANY local uid. A SOCKS front door with the same property is not a DNS oracle, it is an OPEN PROXY into that account's circuit class for every other uid on the box, including another anon slot. That is exactly the cross-slot linkage the per-account design exists to prevent: slot B could make its own connections look like slot A's to every exit and destination, and nothing in either account's forcing would notice. So:
 
-1. **A uid or peer-credential check on the socket.** Only the account's own uid may use its front door. On loopback TCP that means an input rule keyed on the originating uid, which must be MEASURED against the real packet path rather than reasoned about (ADR-0011's standing rule); a unix socket with `SO_PEERCRED` is the stronger shape if the clients that matter can use one.
+1. **A uid or peer-credential check on the socket.** Only the account's own uid may use its front door. Since 0.11.0 the forcing table has the mechanism (closure c, `docs/adr/0014`): an OUTPUT-side drop of a new flow from any other attributable uid, measured against the real packet path. A front door on a new loopback port must join that chain's port set (and closure (a)'s accept, and ADR-0008's per-account port blocklist) in the same change, or it is born open; a unix socket with `SO_PEERCRED` remains the stronger shape if the clients that matter can use one.
 2. **The isolation username pinned SERVER-SIDE.** The shim must use the account's own `<account>@` username on the upstream dial whatever the client sends, and must never forward a client-supplied username or password. A front door that passed the client's credentials through would let the account (or anything reaching the port) choose its circuit class, including another account's.
 
-Neither condition is optional, and neither is satisfied by anything in the tree today.
+Neither condition is optional. The first now has its mechanism in the tree (ADR-0014) but a new port is not covered until it is added; the second is not satisfied by anything in the tree.
 
 ## What not to do
 

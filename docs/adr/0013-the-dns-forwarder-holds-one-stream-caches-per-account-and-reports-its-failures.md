@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (0.10.0).
+Accepted (0.10.0). Amended by ADR-0014 (0.11.0): the DNS port no longer answers other local uids, which shrinks the cache's timing side channel described below to the account and root.
 
 ## Context
 
@@ -24,7 +24,7 @@ Two of the changes below alter what the ENDPOINT can observe, which is why they 
 
 **SERVFAIL is never cached, in either direction.** Not an upstream resolver's SERVFAIL (a statement about that moment, which held would turn one bad second into minutes of an account that cannot resolve a name), and not the forwarder's own (made only after an upstream error, and never passed to the cache, which is filled only from answers that came through the endpoint). It is named explicitly ahead of the general rcode rule that also excludes it, because it is the one exclusion whose absence would be a fail-closed bug dressed as a performance one: a cached "could not resolve" outlives the outage that produced it. Both directions are tested.
 
-**The cache's one honest cost is a local timing side channel, stated at the choice site.** Anyone who can send a query to the forwarder's DNS port can time the answer and learn whether the account has recently resolved a name. That port answers ANY local uid (measured, pre-existing, and recorded as its own observation), so on a multi-user host the observer is not only root. `ForwarderConfig.NoCache` exists as the place an operator-facing switch would land.
+**The cache's one honest cost is a local timing side channel, stated at the choice site.** Anyone who can send a query to the forwarder's DNS port can time the answer and learn whether the account has recently resolved a name. That port answered ANY local uid (measured, pre-existing, and recorded as its own observation), so on a multi-user host the observer was not only root; ADR-0014 closes the port to every uid but the account's own. `ForwarderConfig.NoCache` exists as the place an operator-facing switch would land.
 
 **A failed resolution is answered, with a CLASSIFIED reason, and never with silence** (`internal/shim/dnsfailure.go`). The client gets SERVFAIL, carrying no records, under its own message ID, on both listeners. The reason is classified because the two common causes call for opposite next moves:
 

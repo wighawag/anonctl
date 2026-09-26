@@ -30,3 +30,14 @@ A uid-filtered input rule on the shim's DNS port: accept from the account's uid 
 It is also the precondition that blocks `work/notes/ideas/per-account-socks-front-door-for-exit-side-resolution.md`: a SOCKS front door with this property would be an open proxy into the account's circuit class for every other uid, including another anon slot.
 
 There is also a version of this that is not about DNS at all: the relay port has the same property (any local uid can send it a connection). Whether that is exploitable depends on `SO_ORIGINAL_DST` returning something useful for a connection that was never redirected, which is a separate measurement.
+
+## Closed in 0.11.0 (`docs/adr/0014`)
+
+Fixed in the ruleset as closure (c): the account's forcing table refuses a NEW flow to its shim relay and DNS ports from any attributable uid other than the account's (and its shim's). Both of the reasons above for doing it as its own task held, and shaped the fix:
+
+- **The knob was not `meta skuid` on INPUT.** Measured in the namespace: three datagrams from uid 3000 to the DNS port all arrived at the input hook (`iif lo udp dport 19053` counted 3), and `meta skuid 3000` there matched NONE of them, while the same match on OUTPUT matched all three. Loopback orphans the packet from its socket before local delivery, so the originating uid is gone by input. The fix is on OUTPUT instead, in the account's own `filter_out`: a positive jump on the account's shim ports (after the two uid jumps), into a chain whose one rule is `ct state new meta skuid >= 0 drop`. That keeps the package's standing invariant that nothing adjudicates an unattributable packet, without a `skuid !=`. Measured rather than reasoned about, in a user+network namespace with the real shim and the ruleset exactly as `Generate` emits it: before, a stranger uid and root reached all three ports and got DNS answers; after, UDP fails with EPERM and TCP connects time out on a dropped SYN, while the account's own traffic (direct, through the DNS redirect, and a 200 MB bulk transfer whose unattributable packets reach the chain) is untouched. The table is in the ADR.
+- **The measurement path now needs the account's uid, deliberately.** Benchmark from inside `anonctl use <account>` or under `setpriv --reuid <anon-uid>` as root. That is the "deliberate way in" this note asked for, and ADR-0014 says so.
+
+`verify` has a new assertion, `shim-ports-closure`, which sends as `nobody` and passes only on a kernel refusal on both ports. It goes red on an account whose table predates 0.11.0 until `anonctl update` re-applies it.
+
+The last paragraph above is answered too: the relay port is covered by the same chain, so the `SO_ORIGINAL_DST` question no longer needs its own measurement to be safe.

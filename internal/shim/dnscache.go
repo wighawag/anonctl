@@ -29,17 +29,19 @@ import (
 // is where someone will read it: A LOCAL CACHE IS A TIMING SIDE CHANNEL. Anyone who
 // can send a query to this forwarder's DNS port can time the answer and learn
 // whether the account has recently resolved a given name, without resolving it
-// themselves. That port is a loopback port with no uid filter on its input path
-// (the forcing governs EGRESS from the account, not who may talk to the shim), so
-// on a shared box the observer is not only root: any local uid can ask. What it
-// buys them is a recency oracle over names, bounded by the TTLs below; what it
-// costs to remove is every repeat lookup going back over the circuit. Root and the
-// operator can already see more than this by other means (the shim's own
-// connections, conntrack, the account's processes), so the exposure that is new is
-// to an unprivileged local uid on a multi-user host. If that matters for a
-// deployment, the answer is a uid-filtered input rule on the shim's DNS port, which
-// would also close the pre-existing ability of any local uid to use the account's
-// circuit for its own lookups; the cache did not create that.
+// themselves. What it buys them is a recency oracle over names, bounded by the TTLs
+// below; what it costs to remove is every repeat lookup going back over the circuit.
+//
+// WHO "ANYONE" IS. When this cache landed (0.10.0) the answer was any local uid,
+// because nothing filtered who could send to the port. Since 0.11.0 the account's
+// forcing table refuses a new flow to its shim ports from every uid but the
+// account's own (closure c, docs/adr/0014), so the observer is back to the account
+// itself, which gains nothing, and to someone who can defeat or rewrite that table,
+// i.e. root, who already sees more (the shim's own connections, conntrack, the
+// account's processes). That closure is IN THE RULESET, not here: a shim run
+// without anonctl's table in front of it (a test, a hand-started binary, an account
+// whose table predates 0.11.0 and was never re-applied) is open to every local uid
+// again, and `verify`'s shim-ports-closure is what notices.
 
 const (
 	// dnsCacheMaxEntries bounds the cache. Answers are small (a few hundred bytes),
@@ -214,7 +216,8 @@ func dnsCacheKey(query []byte) (string, bool) {
 // WHY THE WIRE FORM AND NOT THE DOTTED STRING. A label may legally contain a dot, so
 // the single label `example.com` and the two labels `example` + `com` render to the
 // same dotted string and would share an entry. Anyone who can reach the forwarder's
-// DNS port (any local uid, measured) could then plant the NXDOMAIN for the one-label
+// DNS port (any local uid when this was written; see closure (c) above for who that
+// is now, and why the key must not rely on it) could then plant the NXDOMAIN for the one-label
 // name, capped at five minutes and renewable at will, under the key the account's
 // real lookups use, and the account could not resolve that name at all. The wire
 // form cannot collide: two names share a key only if they ARE the same name.
